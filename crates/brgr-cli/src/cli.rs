@@ -766,6 +766,8 @@ pub(crate) enum HarnessCommand {
         #[arg(long)]
         prompt: Option<String>,
     },
+    /// List each registered harness, its executable, version, and health.
+    List,
     /// Report whether one registered harness is still healthy.
     Status {
         /// Defaults to the configured default harness, else the only one registered.
@@ -776,8 +778,16 @@ pub(crate) enum HarnessCommand {
 #[derive(Args)]
 pub(crate) struct AddHarnessArgs {
     pub(crate) executable: PathBuf,
+    /// Directory for the authorized scratch run. Optional: when omitted, brgr
+    /// creates a temporary git repository with one commit, runs the scratch
+    /// there, and deletes that directory afterwards. When given, the directory
+    /// must already exist and sit outside the brgr control home; it does not
+    /// have to be a git repository. brgr does not create, commit in, or delete
+    /// this directory (the harness itself may write files during the scratch
+    /// run).
     #[arg(long)]
     pub(crate) workspace: Option<PathBuf>,
+    /// Prompt for the authorized scratch run. Optional: defaults to `say ok`.
     #[arg(long)]
     pub(crate) prompt: Option<String>,
     #[arg(long)]

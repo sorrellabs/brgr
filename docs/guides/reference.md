@@ -452,9 +452,18 @@ that exact manifest supports model selection. Do not infer support for flags
 absent from the installed executable's help.
 See [agent-authored manifests](custom-harness-registration.md) for a
 documented CLI whose prompt shape needs a custom declarative recipe.
-For an already approved executable, `brgr harness add EXECUTABLE --workspace
-SCRATCH --prompt "small authorized probe"` is the combined probe, contract-test,
-scratch, activation, and health-check escape hatch. `--presentation-only`
+`brgr harness list` (and `brgr harness list --json`) shows each registered
+harness id, executable, version, and health; it reuses the harness array
+`brgr doctor` already computes.
+For an already approved executable, `brgr harness add EXECUTABLE` is the
+combined probe, contract-test, scratch, activation, and health-check escape
+hatch. `--prompt` defaults to `say ok`. When `--workspace` is omitted, brgr
+creates a temporary git repository with one commit, runs the scratch there,
+and deletes that directory afterwards. When `--workspace DIR` is given, the
+directory must already exist and sit outside the brgr control home; it does
+not have to be a git repository, and brgr does not create, commit in, or
+delete it (the harness itself may write files during the scratch run).
+`--presentation-only`
 registers the optional Herdr adapter without claiming a managed scratch run.
 Process activations created before this scratch requirement remain on disk but
 cannot start a new task; re-add each approved executable with an authorized

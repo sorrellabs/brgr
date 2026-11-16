@@ -657,9 +657,20 @@ impl Registry {
     /// Returns [`RegistryError`] when the manifest cannot be read.
     pub fn recertify_action_for(&self, harness_id: &str) -> Result<String, RegistryError> {
         validate_harness_id(harness_id)?;
-        let manifest: HarnessManifest =
-            serde_json::from_slice(&fs::read(self.manifest_path(harness_id))?)?;
-        Ok(recertify_action(&manifest))
+        Ok(recertify_action(&self.stored_manifest(harness_id)?))
+    }
+
+    /// The stored recipe for a harness, without checking health. Diagnostics
+    /// use it to name the executable and version probe.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RegistryError`] when the manifest cannot be read.
+    pub fn stored_manifest(&self, harness_id: &str) -> Result<HarnessManifest, RegistryError> {
+        validate_harness_id(harness_id)?;
+        Ok(serde_json::from_slice(&fs::read(
+            self.manifest_path(harness_id),
+        )?)?)
     }
 
     /// The manifest an agent authored for a harness, when that is how it was

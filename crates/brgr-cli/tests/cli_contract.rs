@@ -5904,6 +5904,105 @@ fn harness_add_prints_the_registered_symlink_it_stored() {
     assert_eq!(printed, activation_receipt(&home));
 }
 
+#[test]
+fn harness_list_shows_each_registered_harness_id_executable_version_and_health() {
+    let temp = TempDir::new().unwrap();
+    let home = temp.path().join("brgr");
+    let fixture = brgr_fixture();
+    add_fixture(&home, &fixture, &temp.path().join("scratch"));
+
+    let listed = json_output(&run(&home, &["harness", "list"], &[]));
+    let harnesses = listed
+        .as_array()
+        .expect("harness list is a JSON array of registered harnesses");
+    assert_eq!(harnesses.len(), 1, "{listed}");
+    assert_eq!(harnesses[0]["id"], "local.fixture");
+    assert_eq!(
+        harnesses[0]["executable"].as_str().unwrap(),
+        fixture.to_str().unwrap()
+    );
+    assert_eq!(harnesses[0]["version"], "fixture v-fixture");
+    assert_eq!(harnesses[0]["health"], "healthy");
+
+    let doctor = run(&home, &["doctor"], &[]);
+    let report: Value = serde_json::from_slice(&doctor.stdout).unwrap();
+    assert_eq!(listed, report["harnesses"]);
+}
+
+#[test]
+fn harness_add_without_workspace_creates_and_removes_a_temporary_git_scratch() {
+    let temp = TempDir::new().unwrap();
+    let home = temp.path().join("brgr");
+    let executable = temp.path().join("fixture");
+    fs::write(
+        &executable,
+        "#!/bin/sh\n\
+case \"$1\" in\n\
+  --version) printf 'fixture v-fixture\\n'; exit 0;;\n\
+  --help)\n\
+    printf '%s\\n' '-p, --print' '--mode=<value>' '--no-session' '--no-mcp' '--model' '--thinking'\n\
+    exit 0;;\n\
+esac\n\
+printf '%s\\n' \"$PWD\" > \"$0.workspace\"\n\
+/usr/bin/git rev-parse --is-inside-work-tree > \"$0.git\"\n\
+/usr/bin/git rev-parse HEAD > \"$0.head\"\n\
+printf '%s\\n' '{\"type\":\"message_end\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"ok\"}]}}'\n\
+printf '%s\\n' '{\"type\":\"agent_end\",\"stopReason\":\"completed\"}'\n",
+    )
+    .unwrap();
+    fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+
+    let receipt = json_output(&run(
+        &home,
+        &["harness", "add", executable.to_str().unwrap()],
+        &[],
+    ));
+    assert!(
+        receipt["scratch_result_digest"].as_str().is_some(),
+        "{receipt}"
+    );
+
+    let marker = |suffix: &str| {
+        let mut name = executable.file_name().unwrap().to_os_string();
+        name.push(suffix);
+        executable.with_file_name(name)
+    };
+    let workspace = fs::read_to_string(marker(".workspace")).unwrap();
+    let workspace = workspace.trim();
+    assert!(
+        !Path::new(workspace).exists(),
+        "temporary scratch {workspace} was left behind"
+    );
+    assert_eq!(fs::read_to_string(marker(".git")).unwrap().trim(), "true");
+    let head = fs::read_to_string(marker(".head")).unwrap();
+    assert!(
+        head.trim().len() >= 40 && head.trim().bytes().all(|byte| byte.is_ascii_hexdigit()),
+        "{head}"
+    );
+}
+
+#[test]
+fn harness_add_help_documents_workspace_and_prompt() {
+    let output = brgr_command()
+        .args(["harness", "add", "--help"])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("--workspace"), "{stdout}");
+    assert!(stdout.contains("--prompt"), "{stdout}");
+    let lower = stdout.to_ascii_lowercase();
+    assert!(
+        lower.contains("optional") || lower.contains("omit") || lower.contains("default"),
+        "{stdout}"
+    );
+    assert!(lower.contains("git"), "{stdout}");
+    assert!(
+        lower.contains("does not") || lower.contains("not modify") || lower.contains("delete"),
+        "{stdout}"
+    );
+}
+
 /// A re-certification while the certified path still exists (the CLI was
 /// updated in place) keeps the symlink the harness was registered through,
 /// so a later upgrade that deletes the versioned directory can still follow it.
@@ -6613,14 +6712,6 @@ fn named_process_harness_cannot_activate_without_authorized_scratch() {
     let temp = TempDir::new().unwrap();
     let home = temp.path().join("brgr");
     let fixture = brgr_fixture();
-    let denied = run(&home, &["harness", "add", fixture.to_str().unwrap()], &[]);
-    assert!(!denied.status.success());
-    assert!(
-        !home
-            .join("registry/activations/local.fixture.json")
-            .exists()
-    );
-
     let unsafe_scratch = home.join("store");
     fs::create_dir_all(&unsafe_scratch).unwrap();
     let overlapping = run(
