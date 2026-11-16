@@ -72,7 +72,7 @@ headless. The separate `local.omp-herdr` route retains its legacy
 |---|---|---|
 | 1 | Claude Code, Codex CLI, Cursor CLI, Devin CLI | Each release runs a real round through it first, and a failure stops the release |
 | 2 | Command Code, OMP, OpenCode, Cline | The recipe and screen rules are kept up, and it runs for real when its recipe changes. Bugs get fixed but do not stop a release |
-| 3 | GitHub Copilot CLI, Gemini CLI, Pi | The recipe and contract tests only, with fixes on report |
+| 3 | GitHub Copilot CLI, Gemini CLI, Pi, GJC | The recipe and contract tests only, with fixes on report |
 
 Devin CLI is a worker only: it cannot be an owner.
 
@@ -139,7 +139,7 @@ observation, and none expose a verified effort observation.
 ### Pane mode
 
 Generated recipes declare native TUI launches for Claude Code, Codex, Gemini
-CLI, GitHub Copilot CLI, Pi, Cursor, Devin, Cline, OMP, OpenCode, and
+CLI, GitHub Copilot CLI, Pi, Cursor, Devin, Cline, OMP, OpenCode, GJC, and
 Command Code. Codex runs every installed hook for a worker as well; brgr's
 own hook recognises a task worktree by the session's working directory and
 does nothing there, while the user's other hooks still run. Codex has no
@@ -203,7 +203,7 @@ aliases, choosing or clearing each harness's default model, and viewing harness
 health and tiers. Models come from the harness catalog when readable; otherwise
 enter an exact model name. Each completed change is saved immediately to the
 same config file as `brgr config set model MODEL --harness ID`. Esc or Back cancels the pending change;
-Ctrl+C exits. The editor skips the fixture and removed GJC harnesses. It requires
+Ctrl+C exits. The editor skips the fixture harness. It requires
 a terminal and refuses `--json`; agents and scripts should use
 commands such as `brgr config alias list` and
 `brgr config set model MODEL --harness ID` instead.

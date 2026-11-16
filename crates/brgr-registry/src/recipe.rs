@@ -169,6 +169,34 @@ pub(crate) const RECIPES: &[Recipe] = &[
         ..GENERIC
     },
     Recipe {
+        names: &["gjc"],
+        id: "local.gjc",
+        required_flags: &["--mode=<value>", "--no-session", "--no-mcp", "-p, --print"],
+        catalog: Some((&["--list-models=${model.id}"], Catalog::ProviderTable)),
+        argv: &[
+            "-p",
+            "--mode=json",
+            "--no-session",
+            "--no-mcp",
+            "@${input.prompt_file}",
+        ],
+        model_argv: MODEL,
+        effort_argv: &["--thinking", "${route.effort}"],
+        env_allow: &BASE_ENV,
+        source: Source::JsonlAssistantFinal,
+        capabilities: &JSON_CAPS,
+        full: Some(&[]),
+        edits: None,
+        read_only: None,
+        interactive: Some(Interactive {
+            kind: "gjc",
+            argv: &[],
+            effort_print_only: false,
+            model_print_only_with: None,
+        }),
+        ..GENERIC
+    },
+    Recipe {
         names: &["omp"],
         id: "local.omp",
         required_flags: &[
@@ -718,7 +746,7 @@ pub(crate) fn generate_manifest(
     validate_harness_id(&id)?;
     if matches!(
         id.as_str(),
-        "local.fixture" | "local.omp" | "local.omp-herdr"
+        "local.fixture" | "local.gjc" | "local.omp" | "local.omp-herdr"
     ) {
         return Err(RegistryError::UnsupportedHarness);
     }

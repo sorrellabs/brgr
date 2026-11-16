@@ -460,6 +460,7 @@ fn composer_on_screen(screen: &str) -> bool {
 fn editor_ready(screen: &str, kind: &str) -> bool {
     let brand = match kind {
         "claude" => "Claude Code",
+        "gjc" => "GJC",
         "command-code" => "Command",
         _ => "",
     };
@@ -822,7 +823,7 @@ pub(super) fn start_native(
             || status.is_none()
             || matches!(status.as_deref(), Some("unknown"))
             || working_but_idle
-            || run.kind.as_str() == "command-code")
+            || matches!(run.kind.as_str(), "gjc" | "command-code"))
             && (prompt || detected_ready)
             && !menu_on_screen(herdr, pane);
         if settle.held(ready, Instant::now()) {

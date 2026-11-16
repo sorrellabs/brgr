@@ -47,7 +47,7 @@ accept or reject.
 brgr calls each registered worker CLI a *harness*, and supports them in
 [tiers](https://github.com/sorrellabs/brgr/blob/main/docs/guides/reference.md#harness-tiers). Tier 1 is Claude Code, Codex
 CLI, Cursor CLI and Devin CLI. Tier 2 is Command Code, OMP, OpenCode and Cline.
-Tier 3 is GitHub Copilot CLI, Gemini CLI and Pi. The agent that starts workers,
+Tier 3 is GitHub Copilot CLI, Gemini CLI, Pi and GJC. The agent that starts workers,
 the *owner*, can be a Codex, Claude Code or Cursor session.
 
 Run `brgr config edit` in a terminal to manage aliases and per-harness default

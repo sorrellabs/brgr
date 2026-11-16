@@ -18,6 +18,7 @@ pub(crate) const TIERS: &[(&str, u8)] = &[
     ("local.copilot", 3),
     ("local.gemini", 3),
     ("local.pi", 3),
+    ("local.gjc", 3),
 ];
 
 #[derive(Clone, Debug)]
@@ -67,7 +68,7 @@ pub(crate) enum Screen<'a> {
 }
 
 pub(crate) fn visible(id: &str) -> bool {
-    !matches!(id, "local.fixture" | "local.gjc")
+    id != "local.fixture"
 }
 
 /// Match the alias command's fallback policy; malformed registry data is not
@@ -439,9 +440,17 @@ mod tests {
             ]
         );
         let list = menu(&config, &harnesses, Screen::Harnesses);
-        assert_eq!(list.len(), 2);
+        assert_eq!(list.len(), 3);
         assert!(list[0].label.contains("healthy — tier 1"));
         assert_eq!(list[0].choice, Choice::Back);
+        assert!(list[1].label.contains("local.gjc"));
+        assert!(list[1].label.contains("tier 3"));
+        assert_eq!(list[1].choice, Choice::Back);
+        assert!(
+            list.iter()
+                .all(|item| !item.label.contains("local.fixture")),
+            "the test fixture stays out of the editor"
+        );
         assert_eq!(
             menu(
                 &config,

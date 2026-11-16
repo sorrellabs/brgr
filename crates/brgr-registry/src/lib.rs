@@ -90,10 +90,6 @@ const PROBE_DEADLINE: Duration = Duration::from_secs(15);
 /// a working harness could not be registered.
 const SCRATCH_DEADLINE: Duration = Duration::from_mins(3);
 
-/// A harness whose support was removed. An installation may still have it
-/// registered; it stays readable but never runs.
-pub const REMOVED_HARNESS_ID: &str = "local.gjc";
-
 #[derive(Clone, Debug)]
 pub struct Registry {
     root: PathBuf,
@@ -213,10 +209,7 @@ impl Registry {
                 }
                 let stem = path.file_stem().unwrap_or_default().to_string_lossy();
                 validate_harness_id(&stem)?;
-                // It cannot run, and there is nothing for the owner to repair.
-                if stem != REMOVED_HARNESS_ID {
-                    ids.insert(stem.into_owned());
-                }
+                ids.insert(stem.into_owned());
             }
         }
         Ok(ids.into_iter().collect())
@@ -230,9 +223,6 @@ impl Registry {
     /// Returns [`RegistryError`] when probing fails, required documented flags
     /// are absent, or activation data cannot be persisted.
     pub async fn add(&self, executable: &Path) -> Result<ActivationReceipt, RegistryError> {
-        if executable.file_name().and_then(|value| value.to_str()) == Some("gjc") {
-            return Err(RegistryError::RemovedGjcSupport);
-        }
         let (manifest, probe) = self.draft_with_probe(executable).await?;
         if manifest.id != "local.omp-herdr" || manifest.adapter != OMP_ROLE_ADAPTER_V1 {
             return Err(RegistryError::ScratchRunRequired(manifest.id));
@@ -249,9 +239,6 @@ impl Registry {
     /// Returns an error if probing fails or a bounded fresh run cannot be
     /// described without guessing flags.
     pub async fn draft(&self, executable: &Path) -> Result<HarnessManifest, RegistryError> {
-        if executable.file_name().and_then(|value| value.to_str()) == Some("gjc") {
-            return Err(RegistryError::RemovedGjcSupport);
-        }
         self.draft_with_probe(executable)
             .await
             .map(|(manifest, _)| manifest)
@@ -532,9 +519,6 @@ impl Registry {
         harness_id: &str,
     ) -> Result<(HarnessManifest, ActivationReceipt), RegistryError> {
         validate_harness_id(harness_id)?;
-        if harness_id == REMOVED_HARNESS_ID {
-            return Err(RegistryError::RemovedGjcSupport);
-        }
         let manifest_bytes = fs::read(self.manifest_path(harness_id))?;
         let manifest: HarnessManifest = serde_json::from_slice(&manifest_bytes)?;
         let receipt: ActivationReceipt =
@@ -1027,7 +1011,8 @@ async fn probe_custom_contract(manifest: &HarnessManifest) -> Result<ProbeEviden
     if manifest.adapter != PROCESS_ADAPTER_V1
         || matches!(
             manifest.id.as_str(),
-            "local.omp"
+            "local.gjc"
+                | "local.omp"
                 | "local.omp-herdr"
                 | "local.cursor-cli"
                 | "local.command-code"
@@ -3022,19 +3007,87 @@ mod tests {
         }
     }
 
+    /// GJC v0.21.0 help documents `-p` and `--model`; the recipe drafts from it.
+    #[test]
+    fn gjc_v0_21_0_drafts_from_its_own_help() {
+        let manifest = generate_manifest(
+            "gjc",
+            PathBuf::from("/bin/echo"),
+            &help_fixture("gjc-0.21.0.txt"),
+        )
+        .unwrap();
+        manifest.validate().unwrap();
+        assert_eq!(manifest.id, "local.gjc");
+        assert_eq!(
+            manifest.launch.argv,
+            [
+                "-p",
+                "--mode=json",
+                "--no-session",
+                "--no-mcp",
+                "@${input.prompt_file}",
+            ]
+        );
+        assert_eq!(manifest.launch.model_argv, ["--model", "${route.model}"]);
+        assert_eq!(
+            manifest.launch.effort_argv,
+            ["--thinking", "${route.effort}"]
+        );
+        assert_eq!(
+            manifest.launch.interactive.as_ref().unwrap().herdr_kind,
+            "gjc"
+        );
+        assert!(manifest.permission_arguments(None).unwrap().is_empty());
+    }
+
+    /// GJC is a supported tier-3 harness: `--version`/`--help` probe, then one
+    /// bounded fresh run against a fixture executable, not the real `gjc`
+    /// (issue #408).
     #[tokio::test]
-    async fn executable_named_gjc_is_refused_for_add_and_draft() {
+    async fn executable_named_gjc_probes_version_and_help_then_completes_one_bounded_fresh_run() {
         let root = tempfile::tempdir().unwrap();
         let executable = root.path().join("gjc");
-        fixture_executable(&executable);
+        write_fast_script(
+            &executable,
+            "#!/bin/sh\ncase \"$1\" in\n --version) echo 'gjc/0.21.0';;\n --help) echo '--mode=<value> --no-session --no-mcp -p, --print --model=<value> --thinking=<value>';;\n *) printf '%s\\n' '{\"type\":\"message_end\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"ok\"}]}}' '{\"type\":\"agent_end\",\"stopReason\":\"completed\"}';;\nesac\n",
+        );
         let registry = Registry::open(root.path().join("registry")).unwrap();
-        assert!(matches!(
-            registry.draft(&executable).await,
-            Err(RegistryError::RemovedGjcSupport)
-        ));
+        let draft = registry
+            .draft(&executable)
+            .await
+            .expect("gjc must draft, not be refused as removed");
+        assert_eq!(draft.id, "local.gjc");
+        assert_eq!(draft.probe.version_argv, ["--version"]);
+        assert_eq!(draft.probe.help_argv, ["--help"]);
         assert!(matches!(
             registry.add(&executable).await,
-            Err(RegistryError::RemovedGjcSupport)
+            Err(RegistryError::ScratchRunRequired(_))
         ));
+        registry.contract_test(&draft).await.unwrap();
+        let receipt = registry
+            .activate_with_scratch(&draft, &scratch_workspace(&root), "ok", None, None)
+            .await
+            .unwrap();
+        assert!(receipt.scratch_result_digest.is_some());
+        assert_eq!(registry.health(&draft.id).unwrap(), Health::Healthy);
+        let loaded = registry.load_healthy(&draft.id).unwrap();
+        let result = ProcessRunner::run(
+            &loaded,
+            brgr_runner::RunRequest {
+                workspace: root.path(),
+                prompt: "second",
+                criteria: None,
+                instructions: None,
+                model: None,
+                effort: None,
+                permission: None,
+                deadline: Duration::from_mins(1),
+                cancel_path: None,
+                pid_path: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.result, b"ok");
     }
 }
