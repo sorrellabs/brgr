@@ -206,6 +206,8 @@ fn scratch_git_workspace() -> Result<tempfile::TempDir> {
         "user.email=brgr@invalid",
         "-c",
         "commit.gpgsign=false",
+        "-c",
+        "core.hooksPath=/dev/null",
         "commit",
         "-m",
         "scratch",
