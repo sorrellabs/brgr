@@ -707,13 +707,14 @@ pub(super) fn send_first_prompt(
         || send_prompt(herdr, name, pane, run, text, paths),
         || {
             let status = herdr.status(pane).ok();
-            match screens::resolve(herdr, pane, run, paths, status.as_deref())? {
+            match screens::resolve(herdr, pane, run, paths, status.as_deref(), &mut watch)? {
                 Screen::Resolve { rule, .. } => watch.pressed(rule),
                 Screen::Unknown(text) => watch.observe(&Screen::Unknown(text)),
                 Screen::Clear => {
                     watch.reset();
                     Ok(())
                 }
+                Screen::Answered { .. } => Ok(()),
             }
         },
     )
@@ -761,7 +762,7 @@ pub(super) fn start_native(
             bail!("native TUI exited before accepting the task");
         }
         let status = herdr.status(pane).ok();
-        match screens::resolve(herdr, pane, run, paths, status.as_deref())? {
+        match screens::resolve(herdr, pane, run, paths, status.as_deref(), &mut watch)? {
             Screen::Resolve { rule, .. } => {
                 watch.pressed(rule)?;
                 settle.reset();
@@ -777,6 +778,11 @@ pub(super) fn start_native(
                 watch.observe(&Screen::Unknown(text))?;
             }
             Screen::Clear => watch.reset(),
+            Screen::Answered { .. } => {
+                settle.reset();
+                thread::sleep(POLL);
+                continue;
+            }
         }
         let detected_ready = herdr.call(&["agent", "get", pane]).is_ok_and(|value| {
             value.pointer("/result/agent/agent").and_then(Value::as_str) == Some(run.kind.as_str())

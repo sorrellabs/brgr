@@ -24,6 +24,10 @@ use crate::{Paths, cli::PaneRunArgs};
 /// read again. Without it the same prompt is answered twice.
 const REDRAW: Duration = Duration::from_millis(1500);
 
+/// How long an answered screen may stand unchanged before its rule is pressed
+/// again. Long against any redraw; five presses still fit inside `SCREEN_DEADLINE`.
+const REPRESS_AFTER: Duration = Duration::from_secs(30);
+
 /// How long a screen no rule covers may stand before the run fails.
 pub(super) const SCREEN_DEADLINE: Duration = Duration::from_mins(3);
 
@@ -50,6 +54,8 @@ pub(super) enum Screen {
     },
     /// A menu or dialog no rule answers; carries its first lines.
     Unknown(String),
+    /// A dialog a rule already answered that still stands unchanged; nothing was pressed.
+    Answered { rule: &'static str },
 }
 
 /// Classifies a pane's visible text. Pure: it never reads or presses anything.
@@ -381,24 +387,33 @@ pub(super) fn resolve(
     run: &PaneRunArgs,
     paths: &Paths,
     status: Option<&str>,
+    watch: &mut ScreenWatch,
 ) -> Result<Screen> {
     let workspace = run.workspace.as_path();
     if status == Some("working") {
+        watch.forget_answer();
         return Ok(Screen::Clear);
     }
     let Some(screen) = herdr.screen(pane) else {
-        return Ok(Screen::Clear);
+        return Ok(Screen::Clear); // unreadable is not "changed": keep the answer
     };
     let outcome = classify(&screen, workspace);
-    if let Screen::Resolve { rule, keys } = &outcome {
-        let mut call = vec!["pane", "send-keys", pane];
-        call.extend(keys.iter().copied());
-        herdr.call(&call).map_err(|failure| {
-            anyhow::anyhow!("brgr could not answer the {rule} screen: {failure}")
-        })?;
-        eprintln!("brgr pane mode · {rule}: pressed {}", keys.join(" "));
-        record(&log_path(paths, run), pane, rule, keys);
-        std::thread::sleep(REDRAW);
+    match &outcome {
+        Screen::Resolve { rule, keys } => {
+            if watch.standing(rule, &screen, Instant::now()) {
+                return Ok(Screen::Answered { rule });
+            }
+            let mut call = vec!["pane", "send-keys", pane];
+            call.extend(keys.iter().copied());
+            herdr.call(&call).map_err(|failure| {
+                anyhow::anyhow!("brgr could not answer the {rule} screen: {failure}")
+            })?;
+            eprintln!("brgr pane mode · {rule}: pressed {}", keys.join(" "));
+            record(&log_path(paths, run), pane, rule, keys);
+            std::thread::sleep(REDRAW);
+            watch.note_answer(rule, screen, Instant::now());
+        }
+        _ => watch.forget_answer(), // Clear or Unknown: the screen changed
     }
     Ok(outcome)
 }
@@ -468,12 +483,20 @@ fn record(path: &Path, pane: &str, rule: &str, keys: &[&str]) {
     }
 }
 
+/// The screen a rule last answered on this pane.
+struct Answer {
+    rule: &'static str,
+    screen: String, // the full text `herdr.screen` returned, compared exactly
+    at: Instant,    // taken after the REDRAW sleep
+}
+
 /// Bounds how long a screen no rule covers may stand.
 pub(super) struct ScreenWatch {
     kind: String,
     limit: Duration,
     since: Option<Instant>,
     presses: Vec<(&'static str, u32)>,
+    answered: Option<Answer>,
 }
 
 /// How many times one rule may answer the same standing screen before the run
@@ -491,7 +514,25 @@ impl ScreenWatch {
             limit,
             since: None,
             presses: Vec::new(),
+            answered: None,
         }
+    }
+
+    /// True while `screen` is the one `rule` answered less than `REPRESS_AFTER` ago.
+    fn standing(&self, rule: &str, screen: &str, now: Instant) -> bool {
+        self.answered.as_ref().is_some_and(|answer| {
+            answer.rule == rule
+                && answer.screen == screen
+                && now.saturating_duration_since(answer.at) < REPRESS_AFTER
+        })
+    }
+
+    fn note_answer(&mut self, rule: &'static str, screen: String, at: Instant) {
+        self.answered = Some(Answer { rule, screen, at });
+    }
+
+    fn forget_answer(&mut self) {
+        self.answered = None;
     }
 
     /// Records a key press for `rule`. Fails when it keeps being needed.
@@ -520,9 +561,10 @@ impl ScreenWatch {
             Screen::Clear => {
                 self.since = None;
                 self.presses.clear();
+                self.answered = None;
                 Ok(())
             }
-            Screen::Resolve { .. } => {
+            Screen::Resolve { .. } | Screen::Answered { .. } => {
                 self.since = None;
                 Ok(())
             }
@@ -537,6 +579,7 @@ impl ScreenWatch {
     pub(super) fn reset(&mut self) {
         self.since = None;
         self.presses.clear();
+        self.answered = None;
     }
 
     /// Stops the unknown-screen clock but keeps the press counts, for an
@@ -1229,7 +1272,8 @@ esac
     fn resolve_presses_the_rule_keys_on_the_pane() {
         let (temp, herdr) = fake_herdr(OPENCODE_UPDATED);
         let (paths, run) = run_args(&temp);
-        let outcome = resolve(&herdr, "w1:p2", &run, &paths, Some("idle")).unwrap();
+        let mut watch = ScreenWatch::with_limit("claude", Duration::from_hours(1));
+        let outcome = resolve(&herdr, "w1:p2", &run, &paths, Some("idle"), &mut watch).unwrap();
         assert!(matches!(outcome, Screen::Resolve { .. }));
         let keys = std::fs::read_to_string(temp.path().join("keys")).unwrap();
         assert_eq!(keys.trim(), "pane send-keys w1:p2 esc");
@@ -1245,12 +1289,164 @@ esac
         let screen = "agent output\n› 1. Update now\n  2. Skip\n";
         let (temp, herdr) = fake_herdr(screen);
         let (paths, run) = run_args(&temp);
+        let mut watch = ScreenWatch::with_limit("claude", Duration::from_hours(1));
         assert_eq!(
-            resolve(&herdr, "w1:p2", &run, &paths, Some("working")).unwrap(),
+            resolve(&herdr, "w1:p2", &run, &paths, Some("working"), &mut watch).unwrap(),
             Screen::Clear
         );
         assert!(!temp.path().join("keys").exists());
         assert!(!log_path(&paths, &run).exists());
+    }
+
+    #[test]
+    fn a_standing_answered_screen_is_not_answered_again() {
+        let screen =
+            "Accessing workspace:\n\n/repo/task\n\n❯ No, exit\n  Yes, I trust this folder\n";
+        let (temp, herdr) = fake_herdr(screen);
+        let (paths, run) = run_args(&temp);
+        let mut watch = ScreenWatch::with_limit("claude", Duration::from_hours(1));
+        resolve(&herdr, "w1:p2", &run, &paths, Some("idle"), &mut watch).unwrap();
+        let second = resolve(&herdr, "w1:p2", &run, &paths, Some("idle"), &mut watch).unwrap();
+        assert_eq!(
+            second,
+            Screen::Answered {
+                rule: "workspace-trust"
+            }
+        );
+        let keys = std::fs::read_to_string(temp.path().join("keys")).unwrap();
+        assert_eq!(keys.trim(), "pane send-keys w1:p2 down enter");
+        let log = std::fs::read_to_string(log_path(&paths, &run)).unwrap();
+        assert_eq!(log.lines().count(), 1);
+    }
+
+    #[test]
+    fn a_changed_screen_under_the_same_rule_is_answered_again() {
+        let screen =
+            "Accessing workspace:\n\n/repo/task\n\n❯ No, exit\n  Yes, I trust this folder\n";
+        let (temp, herdr) = fake_herdr(screen);
+        let (paths, run) = run_args(&temp);
+        let mut watch = ScreenWatch::with_limit("claude", Duration::from_hours(1));
+        resolve(&herdr, "w1:p2", &run, &paths, Some("idle"), &mut watch).unwrap();
+        std::fs::write(
+            temp.path().join("screen"),
+            "Accessing workspace:\n\n/repo/task\n\n  No, exit\n❯ Yes, I trust this folder\n",
+        )
+        .unwrap();
+        let second = resolve(&herdr, "w1:p2", &run, &paths, Some("idle"), &mut watch).unwrap();
+        assert_eq!(
+            second,
+            Screen::Resolve {
+                rule: "workspace-trust",
+                keys: vec!["enter"],
+            }
+        );
+        let keys = std::fs::read_to_string(temp.path().join("keys")).unwrap();
+        let lines: Vec<_> = keys.trim().lines().collect();
+        assert_eq!(lines.len(), 2);
+        assert!(lines[1].ends_with("enter"), "{keys}");
+    }
+
+    #[test]
+    fn a_working_agent_lets_the_same_screen_be_answered_again() {
+        let screen =
+            "Accessing workspace:\n\n/repo/task\n\n❯ No, exit\n  Yes, I trust this folder\n";
+        let (temp, herdr) = fake_herdr(screen);
+        let (paths, run) = run_args(&temp);
+        let mut watch = ScreenWatch::with_limit("claude", Duration::from_hours(1));
+        resolve(&herdr, "w1:p2", &run, &paths, Some("idle"), &mut watch).unwrap();
+        let middle = resolve(&herdr, "w1:p2", &run, &paths, Some("working"), &mut watch).unwrap();
+        assert_eq!(middle, Screen::Clear);
+        resolve(&herdr, "w1:p2", &run, &paths, Some("idle"), &mut watch).unwrap();
+        let keys = std::fs::read_to_string(temp.path().join("keys")).unwrap();
+        assert_eq!(keys.trim().lines().count(), 2);
+    }
+
+    #[test]
+    fn an_answered_screen_is_pressed_again_only_after_the_hold() {
+        let screen =
+            "Accessing workspace:\n\n/repo/task\n\n❯ No, exit\n  Yes, I trust this folder\n";
+        let mut watch = ScreenWatch::with_limit("claude", Duration::from_hours(1));
+        let t0 = Instant::now();
+        watch.note_answer("workspace-trust", screen.to_owned(), t0);
+        assert!(watch.standing(
+            "workspace-trust",
+            screen,
+            t0 + REPRESS_AFTER.checked_sub(Duration::from_millis(1)).unwrap()
+        ));
+        assert!(!watch.standing("workspace-trust", screen, t0 + REPRESS_AFTER));
+        assert!(!watch.standing("workspace-trust", "other", t0));
+    }
+
+    #[test]
+    fn an_unknown_menu_after_an_answer_is_reported_not_pressed() {
+        let screen =
+            "Accessing workspace:\n\n/repo/task\n\n❯ No, exit\n  Yes, I trust this folder\n";
+        let (temp, herdr) = fake_herdr(screen);
+        let (paths, run) = run_args(&temp);
+        let mut watch = ScreenWatch::with_limit("claude", Duration::from_hours(1));
+        resolve(&herdr, "w1:p2", &run, &paths, Some("idle"), &mut watch).unwrap();
+        std::fs::write(
+            temp.path().join("screen"),
+            "Choose a theme\n› 1. Dark\n  2. Light\n",
+        )
+        .unwrap();
+        let second = resolve(&herdr, "w1:p2", &run, &paths, Some("idle"), &mut watch).unwrap();
+        assert!(matches!(second, Screen::Unknown(_)));
+        let keys = std::fs::read_to_string(temp.path().join("keys")).unwrap();
+        assert_eq!(keys.trim().lines().count(), 1);
+    }
+
+    #[test]
+    fn an_update_menu_after_an_answered_notice_is_skipped_not_confirmed() {
+        let (temp, herdr) = fake_herdr("Setup done.\nPress Enter to continue\n");
+        let (paths, run) = run_args(&temp);
+        let mut watch = ScreenWatch::with_limit("claude", Duration::from_hours(1));
+        resolve(&herdr, "w1:p2", &run, &paths, Some("idle"), &mut watch).unwrap();
+        std::fs::write(
+            temp.path().join("screen"),
+            "Update available\nPress Enter to continue\n› 1. Update now\n  2. Skip\n",
+        )
+        .unwrap();
+        let second = resolve(&herdr, "w1:p2", &run, &paths, Some("idle"), &mut watch).unwrap();
+        assert_eq!(
+            second,
+            Screen::Resolve {
+                rule: "update-offer-skip",
+                keys: vec!["down", "enter"],
+            }
+        );
+        let keys = std::fs::read_to_string(temp.path().join("keys")).unwrap();
+        let lines: Vec<_> = keys.trim().lines().collect();
+        assert_eq!(lines.len(), 2);
+        assert!(lines[1].ends_with("down enter"), "{keys}");
+    }
+
+    #[test]
+    fn a_hold_does_not_spend_the_press_budget_or_start_the_deadline() {
+        let mut watch = ScreenWatch::with_limit("claude", Duration::ZERO);
+        watch
+            .observe(&Screen::Answered {
+                rule: "workspace-trust",
+            })
+            .unwrap();
+        assert!(watch.since.is_none());
+    }
+
+    #[test]
+    fn a_clear_screen_or_reset_forgets_the_answer() {
+        let screen =
+            "Accessing workspace:\n\n/repo/task\n\n❯ No, exit\n  Yes, I trust this folder\n";
+        let mut watch = ScreenWatch::with_limit("claude", Duration::from_hours(1));
+        let t0 = Instant::now();
+        watch.note_answer("workspace-trust", screen.to_owned(), t0);
+        watch.observe(&Screen::Clear).unwrap();
+        assert!(!watch.standing("workspace-trust", screen, Instant::now()));
+        watch.note_answer("workspace-trust", screen.to_owned(), Instant::now());
+        watch.reset();
+        assert!(!watch.standing("workspace-trust", screen, Instant::now()));
+        watch.note_answer("workspace-trust", screen.to_owned(), Instant::now());
+        watch.restart_clock();
+        assert!(watch.standing("workspace-trust", screen, Instant::now()));
     }
 
     #[test]

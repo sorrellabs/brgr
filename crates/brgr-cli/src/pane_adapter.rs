@@ -486,7 +486,7 @@ fn settle(
     let mut announced = false;
     loop {
         let status = herdr.status(name)?;
-        match screens::resolve(herdr, pane, run, notices.paths, Some(&status))? {
+        match screens::resolve(herdr, pane, run, notices.paths, Some(&status), &mut watch)? {
             Screen::Resolve { rule, .. } => watch.pressed(rule)?,
             Screen::Unknown(text) => {
                 if !announced {
@@ -510,6 +510,7 @@ fn settle(
                 "working" => watch.reset(),
                 _ => watch.observe_blocked(herdr.screen(pane).as_deref())?,
             },
+            Screen::Answered { .. } => {}
         }
         thread::sleep(POLL);
     }
@@ -539,7 +540,7 @@ fn poll_unclassified(
         watch.restart_clock();
         return Ok(());
     }
-    match screens::resolve(herdr, pane, run, notices.paths, Some(status))? {
+    match screens::resolve(herdr, pane, run, notices.paths, Some(status), watch)? {
         Screen::Resolve { rule, .. } => {
             if *blocked {
                 notices.withdraw();
@@ -557,7 +558,7 @@ fn poll_unclassified(
             }
             watch.observe(&Screen::Unknown(text))?;
         }
-        Screen::Clear => watch.restart_clock(),
+        Screen::Clear | Screen::Answered { .. } => watch.restart_clock(),
     }
     Ok(())
 }
@@ -644,32 +645,36 @@ fn drive(
             // classifies some harnesses (Fixture, Command Code), which report
             // `unknown` for their whole life, and their own output can look
             // like a menu.
-            "blocked" => match screens::resolve(herdr, pane, run, notices.paths, Some(&status))? {
-                Screen::Resolve { rule, .. } => {
-                    notices.withdraw();
-                    blocked = false;
-                    set_phase(notices.paths, run, "working");
-                    watch.pressed(rule)?;
-                    thread::sleep(POLL);
-                    continue;
-                }
-                Screen::Unknown(text) => {
-                    if !blocked {
-                        notices.blocked(&run.kind, pane, "while working");
-                        blocked = true;
-                        set_phase(notices.paths, run, "awaiting_input");
+            "blocked" => {
+                match screens::resolve(herdr, pane, run, notices.paths, Some(&status), &mut watch)?
+                {
+                    Screen::Resolve { rule, .. } => {
+                        notices.withdraw();
+                        blocked = false;
+                        set_phase(notices.paths, run, "working");
+                        watch.pressed(rule)?;
+                        thread::sleep(POLL);
+                        continue;
                     }
-                    watch.observe(&Screen::Unknown(text))?;
-                }
-                Screen::Clear => {
-                    if !blocked {
-                        notices.blocked(&run.kind, pane, "while working");
-                        blocked = true;
-                        set_phase(notices.paths, run, "awaiting_input");
+                    Screen::Unknown(text) => {
+                        if !blocked {
+                            notices.blocked(&run.kind, pane, "while working");
+                            blocked = true;
+                            set_phase(notices.paths, run, "awaiting_input");
+                        }
+                        watch.observe(&Screen::Unknown(text))?;
                     }
-                    watch.observe_blocked(herdr.screen(pane).as_deref())?;
+                    Screen::Clear => {
+                        if !blocked {
+                            notices.blocked(&run.kind, pane, "while working");
+                            blocked = true;
+                            set_phase(notices.paths, run, "awaiting_input");
+                        }
+                        watch.observe_blocked(herdr.screen(pane).as_deref())?;
+                    }
+                    Screen::Answered { .. } => {}
                 }
-            },
+            }
             // The report is the completion signal. The runner removed any old
             // one before starting, and Herdr may never have shown this agent
             // working: Cursor went straight from unknown to idle once it had
