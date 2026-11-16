@@ -582,7 +582,14 @@ fn start_worker(
         start_agent(herdr, name, pane, run, notices)?;
     }
     let label = recorded_label(notices.paths, run.task, run.revision);
-    herdr.keep_pane_name(pane, label.as_deref());
+    let harness = Store::open(&notices.paths.store)
+        .ok()
+        .and_then(|store| store.task(run.task).ok())
+        .map_or_else(|| run.kind.clone(), |spec| spec.route.harness_id);
+    let agent = label
+        .is_some()
+        .then(|| name::agent_name(&harness, &run.task.to_string()));
+    herdr.keep_pane_name(pane, label.as_deref(), agent.as_deref());
     Ok(())
 }
 
@@ -1249,10 +1256,24 @@ impl Herdr {
         }
     }
 
+    /// Herdr's agents sidebar shows the agent name, not the pane label. Display
+    /// only, same as `name_pane`: a missing command or a rejected name is one
+    /// stderr line. `name` is already Herdr-safe; the pane label is not used.
+    fn name_agent(&self, pane: &str, name: Option<&str>) {
+        if let Some(name) = name
+            && let Err(failure) = self.call(&["agent", "rename", pane, name])
+        {
+            eprintln!("brgr pane mode · could not name agent {pane}: {failure}");
+        }
+    }
+
     /// Herdr overwrites the label when the agent registers, after `agent start`
     /// has already returned. Put the template back for a short bounded window.
-    fn keep_pane_name(&self, pane: &str, label: Option<&str>) {
+    /// The agent name is set here too: the sidebar entry exists only after start.
+    /// An empty pane name template sends neither call.
+    fn keep_pane_name(&self, pane: &str, label: Option<&str>, agent: Option<&str>) {
         self.name_pane(pane, label);
+        self.name_agent(pane, agent);
         let (attempts, delay) = if cfg!(debug_assertions) {
             (3, Duration::from_millis(1))
         } else {
@@ -1261,6 +1282,7 @@ impl Herdr {
         for _ in 0..attempts {
             thread::sleep(delay);
             self.name_pane(pane, label);
+            self.name_agent(pane, agent);
         }
     }
 

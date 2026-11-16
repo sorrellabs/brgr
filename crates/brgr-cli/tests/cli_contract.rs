@@ -1301,6 +1301,12 @@ PY
       exit 1
     fi
     echo '{"result":{"type":"ok"}}';;
+  'agent rename')
+    if [ -e "$d/agent-rename-fails" ]; then
+      echo '{"error":{"code":"invalid_name","message":"the agent name is invalid"}}' >&2
+      exit 1
+    fi
+    echo '{"result":{"type":"ok"}}';;
   'pane close') echo closed > "$d/closed"; echo '{"result":{"type":"ok"}}';;
   *) exit 2;;
 esac
@@ -1613,6 +1619,38 @@ fn the_pane_name_is_set_again_after_the_agent_has_started() {
     );
 }
 
+/// Herdr's agents sidebar shows the agent name, not the pane label. The name
+/// is a sanitized harness short and task prefix so Herdr 0.9.5 will accept it.
+/// The pane label stays the rendered template.
+#[test]
+fn the_agent_name_is_a_sanitized_harness_and_task_prefix() {
+    let fixture = pane_fixture();
+    let ran = fixture.run(&[]);
+    assert_eq!(ran["outcome"], "candidate", "{ran}");
+    let task = ran["task_id"].as_str().unwrap();
+    let calls = fixture.state("calls.log");
+    let start = calls
+        .find("agent start")
+        .or_else(|| calls.find("pane run w9:p2"))
+        .unwrap_or_else(|| panic!("the agent was never started: {calls}"));
+    let rename = format!("agent rename w9:p2 claude-{}", &task[..8]);
+    let named = calls
+        .find(&rename)
+        .unwrap_or_else(|| panic!("the agent was not named {rename:?}: {calls}"));
+    assert!(
+        named > start,
+        "the agent was named before it existed: {calls}"
+    );
+    assert!(
+        calls.contains("pane rename w9:p2 claude-code/anthropic: Explain the build"),
+        "the pane label changed: {calls}"
+    );
+    assert!(
+        !calls.contains("agent rename w9:p2 claude-code/anthropic: Explain the build"),
+        "the agent was named with the pane label: {calls}"
+    );
+}
+
 /// An empty template is the off switch: no rename, and the creation arguments
 /// are the ones brgr used before naming existed.
 #[test]
@@ -1627,6 +1665,7 @@ fn an_empty_pane_name_template_leaves_pane_creation_unchanged() {
     assert_eq!(ran["outcome"], "candidate", "{ran}");
     let calls = fixture.state("calls.log");
     assert!(!calls.contains("pane rename"), "{calls}");
+    assert!(!calls.contains("agent rename"), "{calls}");
     assert!(
         calls.contains("pane split --pane w9:p1 --direction right"),
         "{calls}"
@@ -1664,6 +1703,23 @@ fn a_failed_pane_rename_does_not_fail_the_run() {
     let fixture = pane_fixture();
     fs::create_dir_all(&fixture.state).unwrap();
     fs::write(fixture.state.join("rename-fails"), "").unwrap();
+    let ran = fixture.run(&[]);
+    assert_eq!(ran["outcome"], "candidate", "{ran}");
+    let task = ran["task_id"].as_str().unwrap();
+    let result = json_output(&run(
+        &fixture.home,
+        &["result", task],
+        &[("BRGR_OWNER_ID", "codex:pane-test")],
+    ));
+    assert_eq!(result["artifacts"][0]["text"], "PANE_REPORT_OK", "{result}");
+}
+
+/// Naming is display only: a Herdr that refuses the agent name does not cost the run.
+#[test]
+fn a_failed_agent_rename_does_not_fail_the_run() {
+    let fixture = pane_fixture();
+    fs::create_dir_all(&fixture.state).unwrap();
+    fs::write(fixture.state.join("agent-rename-fails"), "").unwrap();
     let ran = fixture.run(&[]);
     assert_eq!(ran["outcome"], "candidate", "{ran}");
     let task = ran["task_id"].as_str().unwrap();
