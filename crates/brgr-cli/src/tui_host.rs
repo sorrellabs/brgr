@@ -7,6 +7,7 @@ use std::fmt::Write as _;
 use std::{
     collections::BTreeMap,
     fs,
+    os::unix::process::CommandExt as _,
     path::{Path, PathBuf},
     process::{Command, Stdio},
 };
@@ -29,6 +30,11 @@ pub(crate) struct NativeLaunch {
     /// `--model` flag. Absent in old launch files and for all other harnesses.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) opencode_model: Option<String>,
+    /// argv[0] Herdr matches on when the registered file's name is not the
+    /// harness kind. Absent in old launch files and when the file is already
+    /// named for its kind.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) argv0: Option<String>,
 }
 
 /// What a terminal program reads to decide whether it may use colour. They
@@ -77,6 +83,41 @@ pub(crate) struct NativeState {
     pub(crate) exit_code: Option<i32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) startup_error: Option<String>,
+}
+
+/// argv[0] Herdr uses to identify the agent. The registered file is still
+/// executed; only the name it appears under changes when it is not already
+/// the harness kind.
+pub(crate) fn launch_argv0(executable: &Path, kind: &str) -> Option<String> {
+    match executable.file_name() {
+        Some(name) if name == kind => None,
+        _ => Some(kind.to_owned()),
+    }
+}
+
+fn argv0_is_harness_kind(value: &str) -> bool {
+    !value.is_empty()
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+}
+
+fn native_command(launch: &NativeLaunch) -> Result<Command> {
+    if let Some(argv0) = &launch.argv0
+        && !argv0_is_harness_kind(argv0)
+    {
+        bail!("native launch argv0 must be a harness kind");
+    }
+    let mut command = Command::new(&launch.executable);
+    command
+        .args(&launch.argv)
+        .current_dir(&launch.workspace)
+        .env_clear()
+        .envs(&launch.environment);
+    if let Some(argv0) = &launch.argv0 {
+        command.arg0(argv0);
+    }
+    Ok(command)
 }
 
 pub(crate) fn run(path: &Path) -> Result<()> {
@@ -135,11 +176,7 @@ pub(crate) fn run(path: &Path) -> Result<()> {
         )?;
         return Err(error);
     }
-    let mut child = Command::new(&launch.executable)
-        .args(&launch.argv)
-        .current_dir(&launch.workspace)
-        .env_clear()
-        .envs(&launch.environment)
+    let mut child = native_command(&launch)?
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
@@ -313,5 +350,132 @@ mod tests {
         )
         .unwrap();
         assert!(launch.pane_environment.is_empty());
+        assert!(launch.argv0.is_none());
+    }
+
+    fn sh_launch(argv0: Option<&str>) -> NativeLaunch {
+        NativeLaunch {
+            executable: PathBuf::from("/bin/sh"),
+            digest: String::new(),
+            argv: vec!["-c".into(), r#"printf %s "$0""#.into()],
+            workspace: PathBuf::from("/"),
+            environment: BTreeMap::new(),
+            pane_environment: Vec::new(),
+            state: PathBuf::from("/s"),
+            opencode_model: None,
+            argv0: argv0.map(str::to_owned),
+        }
+    }
+
+    #[test]
+    fn a_versioned_executable_runs_under_its_harness_kind() {
+        assert_eq!(
+            launch_argv0(Path::new("/x/claude/versions/2.1.325"), "claude").as_deref(),
+            Some("claude")
+        );
+    }
+
+    #[test]
+    fn an_executable_already_named_for_its_kind_keeps_its_path_as_argv0() {
+        assert_eq!(
+            launch_argv0(Path::new("/opt/brgr/bin/codex"), "codex"),
+            None
+        );
+        assert_eq!(
+            launch_argv0(Path::new("/opt/brgr/bin/opencode"), "opencode"),
+            None
+        );
+    }
+
+    fn program_and_args(command: &Command) -> (String, Vec<String>) {
+        (
+            command.get_program().to_string_lossy().into_owned(),
+            command
+                .get_args()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect(),
+        )
+    }
+
+    fn captured_stdout(mut command: Command) -> Vec<u8> {
+        let output = command
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output.stdout
+    }
+
+    #[test]
+    fn the_host_starts_the_registered_file_with_the_requested_argv0() {
+        let named = sh_launch(Some("claude"));
+        let command = native_command(&named).unwrap();
+        let (program, args) = program_and_args(&command);
+        assert_eq!(program, "/bin/sh");
+        assert_eq!(args, named.argv);
+        assert_eq!(captured_stdout(command), b"claude");
+
+        let unnamed = sh_launch(None);
+        let command = native_command(&unnamed).unwrap();
+        let (program, args) = program_and_args(&command);
+        assert_eq!(program, "/bin/sh");
+        assert_eq!(args, unnamed.argv);
+        assert_eq!(captured_stdout(command), b"/bin/sh");
+    }
+
+    #[test]
+    fn a_launch_file_with_an_unsafe_argv0_is_refused() {
+        for argv0 in ["../x", "", "a/b"] {
+            assert!(
+                native_command(&sh_launch(Some(argv0))).is_err(),
+                "{argv0:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_launch_written_before_argv0_still_reads() {
+        let launch: NativeLaunch = serde_json::from_str(
+            r#"{"executable":"/bin/echo","digest":"x","argv":[],"workspace":"/","environment":{},"state":"/s"}"#,
+        )
+        .unwrap();
+        assert!(launch.argv0.is_none());
+        let json = serde_json::to_string(&launch).unwrap();
+        assert!(
+            !json.contains("argv0"),
+            "a launch with argv0: None serializes without the key: {json}"
+        );
+    }
+
+    #[test]
+    fn a_changed_executable_is_refused_before_spawn_even_with_argv0() {
+        let temp = tempfile::tempdir().unwrap();
+        let executable = temp.path().join("worker");
+        fs::write(&executable, b"not-the-registered-bytes").unwrap();
+        let state = temp.path().join("state.json");
+        let path = temp.path().join("launch.json");
+        let launch = NativeLaunch {
+            executable,
+            digest: "sha256:deadbeef".into(),
+            argv: vec!["-c".into(), "echo spawned".into()],
+            workspace: temp.path().to_owned(),
+            environment: BTreeMap::new(),
+            pane_environment: Vec::new(),
+            state,
+            opencode_model: None,
+            argv0: Some("claude".into()),
+        };
+        fs::write(&path, serde_json::to_vec(&launch).unwrap()).unwrap();
+        let error = run(&path).unwrap_err().to_string();
+        assert!(
+            error.contains("registered native executable changed before TUI launch"),
+            "{error}"
+        );
     }
 }

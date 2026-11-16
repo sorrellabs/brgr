@@ -274,6 +274,7 @@ mod tests {
             pane_environment: vec![],
             state: PathBuf::new(),
             opencode_model: Some("openai/gpt-5.2#high".into()),
+            argv0: None,
         }
     }
 

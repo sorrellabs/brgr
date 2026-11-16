@@ -634,13 +634,15 @@ fn prepare_native_config(run: &PaneRunArgs, paths: &Paths) -> Result<(PathBuf, P
             &mut argv,
         )?;
     }
+    let executable = run
+        .native_executable
+        .clone()
+        .context("native executable is absent")?;
     write_json_atomic(
         &config,
         &crate::tui_host::NativeLaunch {
-            executable: run
-                .native_executable
-                .clone()
-                .context("native executable is absent")?,
+            argv0: crate::tui_host::launch_argv0(&executable, &run.kind),
+            executable,
             digest: launch
                 .executable_digest
                 .context("native executable digest is absent")?,
@@ -1152,5 +1154,50 @@ mod tests {
     fn other_harnesses_are_read_the_same_after_start() {
         assert!(ready_after_start(CODEX_IDLE_COMPOSER, "codex"));
         assert!(ready_after_start(CLAUDE_WORKING_NO_BANNER, "codex"));
+    }
+
+    /// After Herdr detects a Claude worker, it can report `idle` for a dialog
+    /// no rule covers. Sending the first prompt must still wait.
+    #[test]
+    fn an_unknown_screen_blocks_sending_the_first_prompt_even_when_herdr_reports_idle() {
+        let screen = "Choose a theme\n› 1. Dark\n  2. Light\n";
+        assert!(matches!(
+            screens::classify(screen, Path::new("/repo/task")),
+            Screen::Unknown(_)
+        ));
+        let temp = tempfile::tempdir().unwrap();
+        let binary = temp.path().join("herdr");
+        fs::write(temp.path().join("screen"), screen).unwrap();
+        crate::fast_script::write_fast_script(
+            &binary,
+            r#"#!/bin/sh
+d=$(/usr/bin/dirname "$0")
+case "$1 $2" in
+ 'pane read') /bin/cat "$d/screen";;
+ 'agent get') printf '%s\n' '{"result":{"agent":{"agent":"claude","agent_status":"idle"}}}';;
+ *) exit 8;;
+esac
+"#,
+        );
+        let herdr = Herdr {
+            binary: binary.into_os_string(),
+            session: None,
+        };
+        assert!(
+            !native_ready(&herdr, "w1:p2", "claude", true),
+            "an unknown Claude dialog must not count as ready for the first prompt while idle"
+        );
+
+        // start_native resets settle on Unknown, then may still see Herdr idle
+        // plus detected_ready. The reset is what keeps the first prompt unsent.
+        let start = Instant::now();
+        let mut settle = ReadySettle::default();
+        settle.reset();
+        assert!(!settle.held(true, start));
+        settle.reset();
+        assert!(
+            !settle.held(true, start + READY_SETTLE),
+            "an unknown screen that keeps resetting never reaches the settle window"
+        );
     }
 }
