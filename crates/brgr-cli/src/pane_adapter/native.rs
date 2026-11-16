@@ -434,21 +434,13 @@ pub(super) fn native_ready(herdr: &Herdr, pane: &str, kind: &str, alive: bool) -
             alive
                 && herdr
                     .screen(pane)
-                    .is_some_and(|screen| editor_ready(&screen, kind))
+                    .is_some_and(|screen| ready_after_start(&screen, kind))
         }
     }
 }
 
-fn editor_ready(screen: &str, kind: &str) -> bool {
+fn composer_on_screen(screen: &str) -> bool {
     if screen.contains("trust this folder") {
-        return false;
-    }
-    let brand = match kind {
-        "claude" => "Claude Code",
-        "command-code" => "Command",
-        _ => "",
-    };
-    if !brand.is_empty() && !screen.contains(brand) {
         return false;
     }
     screen.lines().any(|line| {
@@ -463,6 +455,36 @@ fn editor_ready(screen: &str, kind: &str) -> bool {
             })
         })
     })
+}
+
+fn editor_ready(screen: &str, kind: &str) -> bool {
+    let brand = match kind {
+        "claude" => "Claude Code",
+        "command-code" => "Command",
+        _ => "",
+    };
+    if !brand.is_empty() && !screen.contains(brand) {
+        return false;
+    }
+    composer_on_screen(screen)
+}
+
+fn turn_in_progress(screen: &str, kind: &str) -> bool {
+    if kind != "claude" {
+        return false;
+    }
+    if screen.contains("esc to interrupt") {
+        return true;
+    }
+    screen.lines().any(|line| {
+        line.match_indices("… (").any(|(index, marker)| {
+            line[index + marker.len()..].starts_with(|c: char| c.is_ascii_digit())
+        })
+    })
+}
+
+fn ready_after_start(screen: &str, kind: &str) -> bool {
+    composer_on_screen(screen) && !turn_in_progress(screen, kind)
 }
 
 pub(crate) fn deliver_owner_notice(
@@ -819,6 +841,62 @@ pub(super) fn start_native(
     Ok(())
 }
 
+/// Labelled synthetic: the bottom of a real Claude worker pane with the
+/// spinner rows removed, so the start banner has scrolled away and the
+/// composer is idle. A finished-worker capture was not available.
+#[cfg(test)]
+pub(super) const CLAUDE_IDLE_NO_BANNER: &str = "\
+  Read README.md
+  ⎿  Done
+
+  Smoke test complete.
+
+
+
+
+
+
+
+
+
+
+
+
+────────
+❯
+────────
+  src brgr/task-1cf44e8d Fable5.2·M ctx█░░░ 10% 5h28% 7d31% $1.44
+  ⏵⏵ bypass permissions on (shift+tab to cycle)
+";
+
+/// 22-row screen captured from worker pane `w4:p2` (task `1cf44e8d`): a Claude
+/// worker mid-turn after its start banner has scrolled away.
+#[cfg(test)]
+pub(super) const CLAUDE_WORKING_NO_BANNER: &str = "\
+  Read README.md
+  ⎿  Done
+
+  Smoke test complete.
+
+
+
+
+
+
+
+
+
+
+✻ Warping… (1m 33s · ↓ 5.4k tokens · thinking more)
+  ⎿  Tip: Use /btw to ask a quick side question without interrupting Claude's current work
+
+────────
+❯
+────────
+  src brgr/task-1cf44e8d Fable5.2·M ctx█░░░ 10% 5h28% 7d31% $1.44
+  ⏵⏵ bypass permissions on (shift+tab to cycle)
+";
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1041,5 +1119,37 @@ mod tests {
             &screen.replace("915c0be5", "915c0be5-extra"),
             workspace
         ));
+    }
+
+    #[test]
+    fn a_claude_composer_is_ready_after_its_banner_has_scrolled_away() {
+        assert!(composer_on_screen(CLAUDE_IDLE_NO_BANNER));
+        assert!(ready_after_start(CLAUDE_IDLE_NO_BANNER, "claude"));
+    }
+
+    #[test]
+    fn a_claude_turn_in_progress_is_not_ready_after_start() {
+        assert!(!ready_after_start(CLAUDE_WORKING_NO_BANNER, "claude"));
+        let interrupting = "working\nesc to interrupt\n────────\n❯ \n────────\n";
+        assert!(!ready_after_start(interrupting, "claude"));
+    }
+
+    #[test]
+    fn the_first_prompt_still_waits_for_the_claude_banner() {
+        assert!(!editor_ready(CLAUDE_IDLE_NO_BANNER, "claude"));
+        assert!(editor_ready("Claude Code v2.1.325\n❯ \n", "claude"));
+    }
+
+    #[test]
+    fn a_folder_trust_prompt_is_not_ready_after_start() {
+        let screen =
+            "Accessing workspace:\n\n/repo/task one/\n\n❯ No, exit\nYes, I trust this folder\n";
+        assert!(!ready_after_start(screen, "claude"));
+    }
+
+    #[test]
+    fn other_harnesses_are_read_the_same_after_start() {
+        assert!(ready_after_start(CODEX_IDLE_COMPOSER, "codex"));
+        assert!(ready_after_start(CLAUDE_WORKING_NO_BANNER, "codex"));
     }
 }
