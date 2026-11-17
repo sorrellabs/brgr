@@ -43,6 +43,7 @@ mod tui;
 mod tui_host;
 mod watch;
 mod worker_identity;
+mod worker_line;
 mod workflow;
 mod workspace;
 mod worktree_prune;
@@ -61,7 +62,7 @@ use brgr_protocol::{AttemptId, DecisionVerdict, OwnerId, TaskId, TaskSpec};
 use brgr_runner::HarnessManifest;
 use brgr_store::{RunnerIdentity, Store};
 use clap::Parser;
-use cli::{ArtifactCommand, Cli, Command, ConfigCommand, PluginCommand};
+use cli::{ArtifactCommand, Cli, Command, ConfigCommand, HookEvent, PluginCommand};
 use config::Config;
 use harness_commands::{cleanup, doctor, harness, integrate};
 use omp_adapter::{OmpOptions, run_omp_adapter};
@@ -296,6 +297,7 @@ async fn main() -> Result<()> {
     let outcome = Box::pin(execute(&paths, cli.command, cli.json)).await;
     if !internal {
         failure_banner::print(&paths);
+        crate::worker_line::refresh(&paths);
         handoff_condition::print(&paths);
         pane_adapter::balance_all(&paths);
     }
@@ -317,6 +319,14 @@ async fn plugin_command(paths: &Paths, command: PluginCommand) -> Result<()> {
         PluginCommand::Codex => herdr_plugin::codex(paths).await,
         PluginCommand::Worker => herdr_plugin::worker(paths).await,
     }
+}
+
+async fn run_hook(paths: &Paths, event: HookEvent) -> Result<()> {
+    if hook::hook(paths, event).await.is_err() {
+        eprintln!("brgr hook could not read the inbox; run `brgr doctor`");
+        println!("{{}}");
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_lines)] // One arm per clap command, including Tui.
@@ -368,14 +378,12 @@ async fn execute(paths: &Paths, command: Command, json_output: bool) -> Result<(
         Command::Plugin { command } => plugin_command(paths, command).await,
         Command::Cleanup { command } => cleanup(paths, command, json_output),
         Command::Supervise { launch } => supervise(paths, &launch, json_output).await,
-        Command::Hook { event } => {
-            if hook::hook(paths, event).await.is_err() {
-                eprintln!("brgr hook could not read the inbox; run `brgr doctor`");
-                println!("{{}}");
-            }
-            Ok(())
-        }
-        Command::Context { source, chain } => context_signal::run(paths, source.as_str(), &chain),
+        Command::Hook { event } => run_hook(paths, event).await,
+        Command::Context {
+            source,
+            workers,
+            chain,
+        } => context_signal::run(paths, source.as_str(), workers, &chain),
         command @ (Command::Notify { .. } | Command::NotifyWorkflow { .. }) => {
             deliver_notice(paths, command).await
         }

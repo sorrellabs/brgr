@@ -81,6 +81,17 @@ pub struct BoardTaskRow {
     pub decision_verdict: Option<DecisionVerdict>,
 }
 
+/// Per-session worker counts for a bound owner's status line. Never includes
+/// task ids, owner ids, objectives, or message text.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SessionCounts {
+    pub session_id: String,
+    pub running: u32,
+    pub candidates: u32,
+    pub failed: u32,
+    pub asking: u32,
+}
+
 /// Existing-database reader for the Herdr board. Never applies schema and never
 /// opens artifact storage.
 pub struct BoardStore {
@@ -186,6 +197,22 @@ impl BoardStore {
         };
         load_board_rows(connection, bounded, session)
     }
+
+    /// One row per bound session that has at least one non-zero count.
+    ///
+    /// Classification of each latest revision matches [`crate::Store::revision_settlement`].
+    /// `asking` is the subset of `running` whose active attempt has an unanswered
+    /// `worker_to_owner` question. Malformed result envelopes are skipped.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a database failure.
+    pub fn session_counts(&self) -> Result<Vec<SessionCounts>, StoreError> {
+        let Some(connection) = self.connection.as_ref() else {
+            return Ok(Vec::new());
+        };
+        load_session_counts(connection)
+    }
 }
 
 fn load_board_rows(
@@ -268,6 +295,109 @@ fn map_projected_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ProjectedBoard
         decision_result_id: row.get(19)?,
         verdict: row.get(20)?,
     })
+}
+
+fn load_session_counts(connection: &Connection) -> Result<Vec<SessionCounts>, StoreError> {
+    let transaction = connection.unchecked_transaction()?;
+    let rows = load_session_counts_in_transaction(&transaction)?;
+    transaction.commit()?;
+    Ok(rows)
+}
+
+fn load_session_counts_in_transaction(
+    transaction: &Transaction<'_>,
+) -> Result<Vec<SessionCounts>, StoreError> {
+    let mut statement = transaction.prepare(
+        "WITH latest AS (
+             SELECT task_id, MAX(revision) AS revision FROM tasks GROUP BY task_id
+         ),
+         scoped AS (
+             SELECT b.session_id, t.task_id, t.revision
+             FROM tasks t
+             JOIN latest l ON l.task_id = t.task_id AND l.revision = t.revision
+             JOIN owner_bindings b ON b.owner_id = t.owner_id
+         ),
+         facts AS (
+             SELECT s.session_id, s.task_id,
+               (SELECT a.attempt_id FROM attempts a
+                 WHERE a.task_id = s.task_id AND a.revision = s.revision
+                   AND a.state <> 'terminal'
+                 LIMIT 1) AS active_attempt,
+               (SELECT r.result_id FROM results r
+                 WHERE r.task_id = s.task_id AND r.revision = s.revision
+                 ORDER BY r.rowid DESC LIMIT 1) AS result_id
+             FROM scoped s
+         ),
+         classified AS (
+             SELECT f.session_id, f.task_id, f.active_attempt, f.result_id,
+               r.attempt_id AS result_attempt,
+               CASE WHEN json_valid(r.envelope_json)
+                         AND json_type(r.envelope_json, '$.outcome') = 'text'
+                    THEN CAST(json_extract(r.envelope_json, '$.outcome') AS TEXT)
+               END AS outcome
+             FROM facts f LEFT JOIN results r ON r.result_id = f.result_id
+         )
+         SELECT session_id,
+           SUM(is_running), SUM(is_candidate), SUM(is_failed), SUM(is_asking)
+         FROM (
+           SELECT c.session_id,
+             CASE WHEN c.active_attempt IS NOT NULL OR c.result_id IS NULL
+                       OR (c.outcome <> 'candidate' AND EXISTS (
+                             SELECT 1 FROM pre_spawn_retry_grants g
+                             WHERE g.attempt_id = c.result_attempt))
+                  THEN 1 ELSE 0 END AS is_running,
+             CASE WHEN c.active_attempt IS NULL AND c.outcome = 'candidate'
+                       AND NOT EXISTS (
+                             SELECT 1 FROM decisions d WHERE d.result_id = c.result_id)
+                  THEN 1 ELSE 0 END AS is_candidate,
+             CASE WHEN c.active_attempt IS NULL
+                       AND c.outcome IN ('failed', 'lost')
+                       AND NOT EXISTS (
+                             SELECT 1 FROM pre_spawn_retry_grants g
+                             WHERE g.attempt_id = c.result_attempt)
+                       AND NOT EXISTS (
+                             SELECT 1 FROM inbox_items i
+                             WHERE i.result_id = c.result_id AND i.acknowledged = 1)
+                  THEN 1 ELSE 0 END AS is_failed,
+             CASE WHEN c.active_attempt IS NOT NULL AND EXISTS (
+                         SELECT 1 FROM task_messages q
+                         WHERE q.task_id = c.task_id
+                           AND q.attempt_id = c.active_attempt
+                           AND q.direction = 'worker_to_owner'
+                           AND q.kind = 'question'
+                           AND NOT EXISTS (
+                                 SELECT 1 FROM task_messages r2
+                                 WHERE r2.in_reply_to = q.message_id AND r2.kind = 'reply')
+                           AND NOT EXISTS (
+                                 SELECT 1 FROM withdrawn_questions w
+                                 WHERE w.message_id = q.message_id))
+                  THEN 1 ELSE 0 END AS is_asking
+           FROM classified c
+         )
+         GROUP BY session_id
+         HAVING SUM(is_running) + SUM(is_candidate) + SUM(is_failed) > 0",
+    )?;
+    let mapped = statement.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, i64>(1)?,
+            row.get::<_, i64>(2)?,
+            row.get::<_, i64>(3)?,
+            row.get::<_, i64>(4)?,
+        ))
+    })?;
+    mapped
+        .map(|entry| {
+            let (session_id, running, candidates, failed, asking) = entry?;
+            Ok(SessionCounts {
+                session_id,
+                running: u32::try_from(running).map_err(|_| StoreError::NumericOverflow)?,
+                candidates: u32::try_from(candidates).map_err(|_| StoreError::NumericOverflow)?,
+                failed: u32::try_from(failed).map_err(|_| StoreError::NumericOverflow)?,
+                asking: u32::try_from(asking).map_err(|_| StoreError::NumericOverflow)?,
+            })
+        })
+        .collect()
 }
 
 fn parse_board_row(row: ProjectedBoardRow) -> Option<BoardTaskRow> {

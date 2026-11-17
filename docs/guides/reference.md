@@ -599,6 +599,16 @@ byte for byte, and leaves a status line you changed since. A leading `~/` in a
 chained command is expanded by brgr, since Cursor only promises it for the
 command path. Codex needs no change to its config beyond the hooks it already has.
 
+To also show this Claude Code session's own workers, install with
+`brgr integrate claude install --context --workers` (`--workers` needs
+`--context`). The status line then adds a worker segment after the usage text
+(for example `⚙3 ✓1 ✗0`), or on the next line when a chained status line already
+draws, and `?N` only when a worker is asking. The counts are this bound session's. Cursor's installer never
+turns this on. If you later install an older brgr that does not accept
+`--workers`, run `brgr integrate claude uninstall` first, or `install --context`
+without `--workers`: the written command includes that flag, and an older
+`__context` would reject it, so the status line would stop drawing.
+
 The note, or the handoff with `--auto`, happens once per crossing, and again after
 30 minutes if the head is still over, or after it has dropped 15 points below the
 limit and come back. It does not happen when:

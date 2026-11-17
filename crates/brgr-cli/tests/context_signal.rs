@@ -10,6 +10,9 @@ use serde_json::Value;
 use tempfile::TempDir;
 
 const CLAUDE: &str = include_str!("../../../testdata/fixtures/statusline/claude-2.1.293.json");
+const BEFORE_RESPONSE: &str = include_str!(
+    "../../../testdata/fixtures/statusline/claude-2.1.293-before-first-response.synthetic.json"
+);
 const SESSION: &str = "0a91ffd2-1a5e-4c75-b65a-54cc4b3b1fa0";
 
 fn context(home: &Path, chain: &[&str], input: &str) -> std::process::Output {
@@ -270,4 +273,222 @@ fn a_worker_sessions_hook_records_the_rollout_for_its_task() {
     );
     assert!(output.status.success());
     assert_eq!(fs::read_to_string(&record).unwrap().lines().count(), 1);
+}
+
+fn write_counts(home: &Path, running: u32, candidates: u32, failed: u32, asking: u32) {
+    let dir = home.join("statusline");
+    fs::create_dir_all(&dir).unwrap();
+    let at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    fs::write(
+        dir.join(format!("{SESSION}.json")),
+        serde_json::json!({
+            "schema": "brgr-statusline/v1",
+            "session": SESSION,
+            "at": at,
+            "running": running,
+            "candidates": candidates,
+            "failed": failed,
+            "asking": asking,
+        })
+        .to_string(),
+    )
+    .unwrap();
+}
+
+#[test]
+fn without_the_workers_flag_a_cache_file_changes_nothing() {
+    let temp = TempDir::new().unwrap();
+    let home = temp.path().join("home");
+    write_counts(&home, 3, 1, 0, 1);
+    let output = context(&home, &[], CLAUDE);
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        "ctx 6% · 5h 7% · 7d 43%"
+    );
+}
+
+#[test]
+fn workers_are_appended_to_the_plain_usage_line() {
+    let temp = TempDir::new().unwrap();
+    let home = temp.path().join("home");
+    write_counts(&home, 3, 1, 0, 1);
+    let output = context(&home, &["--workers"], CLAUDE);
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        "ctx 6% · 5h 7% · 7d 43% · brgr ⚙3 ✓1 ✗0 ?1"
+    );
+}
+
+#[test]
+fn workers_omits_the_question_mark_when_nobody_asks() {
+    let temp = TempDir::new().unwrap();
+    let home = temp.path().join("home");
+    write_counts(&home, 3, 1, 0, 0);
+    let output = context(&home, &["--workers"], CLAUDE);
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        "ctx 6% · 5h 7% · 7d 43% · brgr ⚙3 ✓1 ✗0"
+    );
+}
+
+#[test]
+fn workers_draws_nothing_when_the_cache_is_missing() {
+    let temp = TempDir::new().unwrap();
+    let output = context(&temp.path().join("home"), &["--workers"], CLAUDE);
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        "ctx 6% · 5h 7% · 7d 43%"
+    );
+}
+
+#[test]
+fn the_status_line_never_opens_or_creates_the_store() {
+    let temp = TempDir::new().unwrap();
+    let home = temp.path().join("home");
+    write_counts(&home, 1, 0, 0, 0);
+    let output = context(&home, &["--workers"], CLAUDE);
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        "ctx 6% · 5h 7% · 7d 43% · brgr ⚙1 ✓0 ✗0"
+    );
+    assert!(!home.join("store").exists());
+}
+
+#[test]
+fn workers_follow_the_chained_status_line_on_their_own_line() {
+    let temp = TempDir::new().unwrap();
+    let home = temp.path().join("home");
+    write_counts(&home, 2, 0, 1, 0);
+    let seen = temp.path().join("seen.json");
+    let output = context(
+        &home,
+        &[
+            "--workers",
+            "--",
+            "sh",
+            "-c",
+            &format!("cat > {}; echo drawn", seen.display()),
+        ],
+        CLAUDE,
+    );
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "drawn\nbrgr ⚙2 ✓0 ✗1\n"
+    );
+    assert_eq!(fs::read_to_string(&seen).unwrap(), CLAUDE);
+}
+
+#[test]
+fn a_chained_status_line_without_a_trailing_newline_still_gets_its_own_line() {
+    let temp = TempDir::new().unwrap();
+    let home = temp.path().join("home");
+    write_counts(&home, 1, 0, 0, 0);
+    let output = context(
+        &home,
+        &["--workers", "--", "sh", "-c", "printf drawn"],
+        CLAUDE,
+    );
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "drawn\nbrgr ⚙1 ✓0 ✗0\n"
+    );
+}
+
+#[test]
+fn all_zero_counts_keep_the_status_line_unchanged_even_with_workers() {
+    let temp = TempDir::new().unwrap();
+    let home = temp.path().join("home");
+    write_counts(&home, 0, 0, 0, 0);
+    let output = context(&home, &["--workers"], CLAUDE);
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        "ctx 6% · 5h 7% · 7d 43%"
+    );
+}
+
+#[test]
+fn workers_are_drawn_alone_before_the_first_response() {
+    let temp = TempDir::new().unwrap();
+    let home = temp.path().join("home");
+    write_counts(&home, 3, 1, 0, 1);
+    let output = context(&home, &["--workers"], BEFORE_RESPONSE);
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        "brgr ⚙3 ✓1 ✗0 ?1"
+    );
+}
+
+#[test]
+fn the_chained_output_is_byte_identical_when_there_is_nothing_to_show() {
+    let temp = TempDir::new().unwrap();
+    let home = temp.path().join("home");
+    let seen = temp.path().join("seen.json");
+    let output = context(
+        &home,
+        &[
+            "--workers",
+            "--",
+            "sh",
+            "-c",
+            &format!("cat > {}; printf 'drawn'", seen.display()),
+        ],
+        CLAUDE,
+    );
+    assert!(output.status.success());
+    assert_eq!(output.stdout, b"drawn");
+    assert_eq!(fs::read_to_string(&seen).unwrap(), CLAUDE);
+}
+
+#[test]
+fn another_sessions_cache_is_never_drawn() {
+    let temp = TempDir::new().unwrap();
+    let home = temp.path().join("home");
+    let dir = home.join("statusline");
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(
+        dir.join("other-session.json"),
+        serde_json::json!({
+            "schema": "brgr-statusline/v1",
+            "session": "other-session",
+            "at": 1_794_873_600_u64,
+            "running": 9,
+            "candidates": 8,
+            "failed": 7,
+            "asking": 6,
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let output = context(&home, &["--workers"], CLAUDE);
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        "ctx 6% · 5h 7% · 7d 43%"
+    );
+}
+
+#[test]
+fn a_workers_flag_after_the_separator_belongs_to_the_chained_command() {
+    let temp = TempDir::new().unwrap();
+    let home = temp.path().join("home");
+    write_counts(&home, 3, 1, 0, 1);
+    let output = context(
+        &home,
+        &["--", "sh", "-c", "printf %s \"$1\"", "x", "--workers"],
+        CLAUDE,
+    );
+    assert!(output.status.success());
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "--workers");
 }

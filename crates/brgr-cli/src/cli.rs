@@ -276,6 +276,9 @@ pub(crate) enum Command {
         /// Which harness's status line this is; both give the same input shape.
         #[arg(long, value_enum, default_value_t = ContextSource::Claude)]
         source: ContextSource,
+        /// Also draw this session's own workers after the usage text.
+        #[arg(long)]
+        workers: bool,
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         chain: Vec<String>,
     },
@@ -849,6 +852,9 @@ pub(crate) enum ClaudeCommand {
         /// file it links to, after saving a copy. Needed for handoff conditions.
         #[arg(long)]
         context: bool,
+        /// Also show this session's own workers in the status line.
+        #[arg(long, requires = "context")]
+        workers: bool,
     },
     Status,
     Uninstall,

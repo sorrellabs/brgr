@@ -3060,3 +3060,514 @@ fn acknowledge_sweep_leaves_a_later_revision_failure_unacknowledged() {
     assert_eq!(pending.len(), 1, "{pending:?}");
     assert_eq!(pending[0].result.result_id, failed_two.result_id);
 }
+
+fn session_counts_at(root: &std::path::Path) -> Vec<SessionCounts> {
+    BoardStore::open_existing(root)
+        .unwrap()
+        .session_counts()
+        .unwrap()
+}
+
+fn counts_for(rows: &[SessionCounts], session: &str) -> SessionCounts {
+    rows.iter()
+        .find(|row| row.session_id == session)
+        .cloned()
+        .unwrap_or(SessionCounts {
+            session_id: session.to_owned(),
+            running: 0,
+            candidates: 0,
+            failed: 0,
+            asking: 0,
+        })
+}
+
+fn owned_task(owner: &str, request: &str) -> TaskSpec {
+    let mut item = task();
+    item.owner_id = OwnerId::new(owner).unwrap();
+    item.create_request_id = request.to_owned();
+    item
+}
+
+fn admit(store: &mut Store, spec: &TaskSpec) {
+    store
+        .record_task(spec, spec.create_request_id.as_str())
+        .unwrap();
+}
+
+fn bind_session(store: &Store, spec: &TaskSpec, session: &str) {
+    store.bind_owner(&spec.owner_id, session, 1).unwrap();
+}
+
+fn claimed(store: &Store, spec: &TaskSpec) -> AttemptId {
+    let attempt = AttemptId::new();
+    store
+        .claim_attempt(spec.task_id, spec.revision, attempt)
+        .unwrap();
+    attempt
+}
+
+fn running_attempt(store: &Store, spec: &TaskSpec) -> AttemptId {
+    let attempt = claimed(store, spec);
+    store
+        .set_attempt_state(attempt, AttemptState::Starting)
+        .unwrap();
+    store
+        .set_attempt_state(attempt, AttemptState::Running)
+        .unwrap();
+    attempt
+}
+
+fn terminal(
+    store: &mut Store,
+    spec: &TaskSpec,
+    attempt: AttemptId,
+    outcome: TerminalOutcome,
+) -> ResultEnvelope {
+    let envelope = if outcome == TerminalOutcome::Candidate {
+        sealed_result(store, spec, attempt)
+    } else {
+        ResultEnvelope {
+            outcome,
+            artifacts: vec![],
+            error: Some("fixture".to_owned()),
+            ..result(spec, attempt)
+        }
+    };
+    store
+        .commit_terminal_result(&spec.owner_id, &envelope)
+        .unwrap();
+    envelope
+}
+
+fn accept_candidate(store: &Store, spec: &TaskSpec, envelope: &ResultEnvelope, session: &str) {
+    store
+        .record_decision(&Decision {
+            schema: SCHEMA_V1.to_owned(),
+            decision_id: DecisionId::new(),
+            owner_id: spec.owner_id.clone(),
+            task_id: spec.task_id,
+            revision: spec.revision,
+            result_id: envelope.result_id,
+            result_digest: Store::result_digest(envelope).unwrap(),
+            session_id: Some(session.to_owned()),
+            binding_epoch: Some(1),
+            verdict: DecisionVerdict::Accepted,
+            reason: "ok".to_owned(),
+        })
+        .unwrap();
+}
+
+fn ask(store: &Store, spec: &TaskSpec, attempt: AttemptId) -> MessageDraft {
+    let draft = MessageDraft::new(
+        spec.task_id,
+        attempt,
+        MessageDirection::WorkerToOwner,
+        MessageKind::Question,
+        "question".to_owned(),
+        None,
+    );
+    store.post_message(&draft).unwrap();
+    draft
+}
+
+fn expected_bucket(settlement: Settlement) -> (u32, u32, u32) {
+    match settlement {
+        Settlement::Open(
+            OpenReason::AttemptActive | OpenReason::NoResult | OpenReason::RetryGranted,
+        ) => (1, 0, 0),
+        Settlement::Open(OpenReason::Undecided) => (0, 1, 0),
+        Settlement::Open(OpenReason::Unacknowledged(
+            TerminalOutcome::Failed | TerminalOutcome::Lost,
+        )) => (0, 0, 1),
+        Settlement::Open(OpenReason::Unacknowledged(_))
+        | Settlement::Decided
+        | Settlement::Acknowledged(_) => (0, 0, 0),
+    }
+}
+
+fn pin_settlement(
+    store: &mut Store,
+    n: &mut u32,
+    totals: &mut (u32, u32, u32),
+    settlement: Settlement,
+    build: impl FnOnce(&mut Store, &TaskSpec),
+) {
+    *n += 1;
+    let spec = owned_task("codex:pin", &format!("pin-{n}"));
+    admit(store, &spec);
+    bind_session(store, &spec, "pin-session");
+    build(store, &spec);
+    assert_eq!(
+        store
+            .revision_settlement(spec.task_id, spec.revision)
+            .unwrap(),
+        settlement,
+        "{settlement:?}"
+    );
+    let add = expected_bucket(settlement);
+    totals.0 += add.0;
+    totals.1 += add.1;
+    totals.2 += add.2;
+}
+
+fn claimed_terminal(
+    store: &mut Store,
+    spec: &TaskSpec,
+    outcome: TerminalOutcome,
+) -> ResultEnvelope {
+    let attempt = claimed(store, spec);
+    terminal(store, spec, attempt, outcome)
+}
+
+fn seed_every_settlement(store: &mut Store) -> (u32, u32, u32) {
+    let mut n = 0;
+    let mut totals = (0, 0, 0);
+    pin_settlement(
+        store,
+        &mut n,
+        &mut totals,
+        Settlement::Open(OpenReason::NoResult),
+        |_, _| {},
+    );
+    pin_settlement(
+        store,
+        &mut n,
+        &mut totals,
+        Settlement::Open(OpenReason::AttemptActive),
+        |store, spec| {
+            claimed(store, spec);
+        },
+    );
+    for outcome in [
+        TerminalOutcome::Candidate,
+        TerminalOutcome::Failed,
+        TerminalOutcome::Lost,
+        TerminalOutcome::Cancelled,
+    ] {
+        let settlement = match outcome {
+            TerminalOutcome::Candidate => Settlement::Open(OpenReason::Undecided),
+            other => Settlement::Open(OpenReason::Unacknowledged(other)),
+        };
+        pin_settlement(store, &mut n, &mut totals, settlement, |store, spec| {
+            claimed_terminal(store, spec, outcome);
+        });
+    }
+    pin_settlement(
+        store,
+        &mut n,
+        &mut totals,
+        Settlement::Open(OpenReason::RetryGranted),
+        |store, spec| {
+            let failed = claimed_terminal(store, spec, TerminalOutcome::Failed);
+            store.grant_pre_spawn_retry(failed.attempt_id).unwrap();
+        },
+    );
+    pin_settlement(
+        store,
+        &mut n,
+        &mut totals,
+        Settlement::Decided,
+        |store, spec| {
+            let envelope = claimed_terminal(store, spec, TerminalOutcome::Candidate);
+            accept_candidate(store, spec, &envelope, "pin-session");
+        },
+    );
+    for outcome in [
+        TerminalOutcome::Failed,
+        TerminalOutcome::Lost,
+        TerminalOutcome::Cancelled,
+    ] {
+        pin_settlement(
+            store,
+            &mut n,
+            &mut totals,
+            Settlement::Acknowledged(outcome),
+            |store, spec| {
+                let envelope = claimed_terminal(store, spec, outcome);
+                store
+                    .acknowledge(&spec.owner_id, envelope.result_id)
+                    .unwrap();
+            },
+        );
+    }
+    totals
+}
+
+#[test]
+fn session_counts_group_running_candidate_failed_and_asking_by_bound_session() {
+    let root = TempDir::new().unwrap();
+    let mut store = Store::open(root.path()).unwrap();
+
+    let running = owned_task("codex:one", "running");
+    admit(&mut store, &running);
+    bind_session(&store, &running, "session-a");
+    running_attempt(&store, &running);
+
+    let asking_task = owned_task("codex:one-ask", "asking");
+    admit(&mut store, &asking_task);
+    bind_session(&store, &asking_task, "session-a");
+    let asking_attempt = running_attempt(&store, &asking_task);
+    ask(&store, &asking_task, asking_attempt);
+
+    let waiting = owned_task("codex:one-wait", "waiting");
+    admit(&mut store, &waiting);
+    bind_session(&store, &waiting, "session-a");
+    let waiting_attempt = claimed(&store, &waiting);
+    terminal(
+        &mut store,
+        &waiting,
+        waiting_attempt,
+        TerminalOutcome::Candidate,
+    );
+
+    let failed = owned_task("codex:one-fail", "failed");
+    admit(&mut store, &failed);
+    bind_session(&store, &failed, "session-a");
+    let failed_attempt = claimed(&store, &failed);
+    terminal(&mut store, &failed, failed_attempt, TerminalOutcome::Failed);
+
+    let other = owned_task("codex:two", "other");
+    admit(&mut store, &other);
+    bind_session(&store, &other, "session-b");
+    let other_attempt = claimed(&store, &other);
+    terminal(
+        &mut store,
+        &other,
+        other_attempt,
+        TerminalOutcome::Candidate,
+    );
+
+    let rows = session_counts_at(root.path());
+    let a = counts_for(&rows, "session-a");
+    assert_eq!((a.running, a.candidates, a.failed, a.asking), (2, 1, 1, 1));
+    let b = counts_for(&rows, "session-b");
+    assert_eq!((b.running, b.candidates, b.failed, b.asking), (0, 1, 0, 0));
+}
+
+#[test]
+fn session_counts_agree_with_revision_settlement_for_every_row() {
+    let root = TempDir::new().unwrap();
+    let mut store = Store::open(root.path()).unwrap();
+    let (expected_running, expected_candidates, expected_failed) =
+        seed_every_settlement(&mut store);
+    let pin = counts_for(&session_counts_at(root.path()), "pin-session");
+    assert_eq!(
+        (pin.running, pin.candidates, pin.failed, pin.asking),
+        (expected_running, expected_candidates, expected_failed, 0)
+    );
+}
+
+#[test]
+fn session_counts_follow_the_latest_revision_only() {
+    let root = TempDir::new().unwrap();
+    let mut store = Store::open(root.path()).unwrap();
+    let spec = owned_task("codex:rev", "rev-1");
+    admit(&mut store, &spec);
+    bind_session(&store, &spec, "session-rev");
+    let first = claimed(&store, &spec);
+    terminal(&mut store, &spec, first, TerminalOutcome::Failed);
+
+    let mut revised = spec.clone();
+    revised.revision = 2;
+    revised.create_request_id = "rev-2".to_owned();
+    admit(&mut store, &revised);
+    running_attempt(&store, &revised);
+
+    let row = counts_for(&session_counts_at(root.path()), "session-rev");
+    assert_eq!(
+        (row.running, row.candidates, row.failed, row.asking),
+        (1, 0, 0, 0)
+    );
+}
+
+#[test]
+fn session_counts_skip_tasks_whose_owner_has_no_binding() {
+    let root = TempDir::new().unwrap();
+    let mut store = Store::open(root.path()).unwrap();
+    let unbound = owned_task("codex:unbound", "unbound");
+    admit(&mut store, &unbound);
+    running_attempt(&store, &unbound);
+    let bound = owned_task("codex:bound", "bound");
+    admit(&mut store, &bound);
+    bind_session(&store, &bound, "session-bound");
+    running_attempt(&store, &bound);
+
+    let rows = session_counts_at(root.path());
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].session_id, "session-bound");
+    assert_eq!(rows[0].running, 1);
+}
+
+#[test]
+fn session_counts_follow_an_owner_rebound_to_another_session() {
+    let root = TempDir::new().unwrap();
+    let mut store = Store::open(root.path()).unwrap();
+    let spec = owned_task("codex:move", "move");
+    admit(&mut store, &spec);
+    bind_session(&store, &spec, "session-old");
+    running_attempt(&store, &spec);
+    assert_eq!(
+        counts_for(&session_counts_at(root.path()), "session-old").running,
+        1
+    );
+
+    store.rebind_owner(&spec.owner_id, "session-new").unwrap();
+    let rows = session_counts_at(root.path());
+    assert_eq!(counts_for(&rows, "session-old").running, 0);
+    assert_eq!(counts_for(&rows, "session-new").running, 1);
+}
+
+#[test]
+fn a_decided_candidate_and_an_acknowledged_failure_are_not_counted() {
+    let root = TempDir::new().unwrap();
+    let mut store = Store::open(root.path()).unwrap();
+    let candidate = owned_task("codex:decided", "decided");
+    admit(&mut store, &candidate);
+    bind_session(&store, &candidate, "session-clear");
+    let attempt = claimed(&store, &candidate);
+    let envelope = terminal(&mut store, &candidate, attempt, TerminalOutcome::Candidate);
+    accept_candidate(&store, &candidate, &envelope, "session-clear");
+
+    let failed = owned_task("codex:acked", "acked");
+    admit(&mut store, &failed);
+    bind_session(&store, &failed, "session-clear");
+    let attempt = claimed(&store, &failed);
+    let envelope = terminal(&mut store, &failed, attempt, TerminalOutcome::Failed);
+    store
+        .acknowledge(&failed.owner_id, envelope.result_id)
+        .unwrap();
+
+    assert!(session_counts_at(root.path()).is_empty());
+}
+
+#[test]
+fn an_unacknowledged_cancellation_is_not_counted_as_failed() {
+    let root = TempDir::new().unwrap();
+    let mut store = Store::open(root.path()).unwrap();
+    let spec = owned_task("codex:cancel", "cancel");
+    admit(&mut store, &spec);
+    bind_session(&store, &spec, "session-cancel");
+    let attempt = claimed(&store, &spec);
+    terminal(&mut store, &spec, attempt, TerminalOutcome::Cancelled);
+    assert!(session_counts_at(root.path()).is_empty());
+}
+
+#[test]
+fn a_failed_attempt_with_a_retry_grant_counts_as_running() {
+    let root = TempDir::new().unwrap();
+    let mut store = Store::open(root.path()).unwrap();
+    let spec = owned_task("codex:retry", "retry");
+    admit(&mut store, &spec);
+    bind_session(&store, &spec, "session-retry");
+    let attempt = claimed(&store, &spec);
+    let envelope = terminal(&mut store, &spec, attempt, TerminalOutcome::Failed);
+    store.grant_pre_spawn_retry(envelope.attempt_id).unwrap();
+    let row = counts_for(&session_counts_at(root.path()), "session-retry");
+    assert_eq!(
+        (row.running, row.candidates, row.failed, row.asking),
+        (1, 0, 0, 0)
+    );
+}
+
+#[test]
+fn a_replied_or_withdrawn_question_is_not_asking_and_an_acknowledged_one_still_is() {
+    let root = TempDir::new().unwrap();
+    let mut store = Store::open(root.path()).unwrap();
+
+    let replied = owned_task("codex:replied", "replied");
+    admit(&mut store, &replied);
+    bind_session(&store, &replied, "session-q");
+    let replied_attempt = running_attempt(&store, &replied);
+    let question = ask(&store, &replied, replied_attempt);
+    store
+        .post_message(&MessageDraft::new(
+            replied.task_id,
+            replied_attempt,
+            MessageDirection::OwnerToWorker,
+            MessageKind::Reply,
+            "answer".to_owned(),
+            Some(question.message_id),
+        ))
+        .unwrap();
+
+    let withdrawn = owned_task("codex:withdrawn", "withdrawn");
+    admit(&mut store, &withdrawn);
+    bind_session(&store, &withdrawn, "session-q");
+    let withdrawn_attempt = running_attempt(&store, &withdrawn);
+    let question = ask(&store, &withdrawn, withdrawn_attempt);
+    store
+        .withdraw_question(withdrawn.task_id, withdrawn_attempt, &question.message_id)
+        .unwrap();
+
+    let read = owned_task("codex:read", "read");
+    admit(&mut store, &read);
+    bind_session(&store, &read, "session-q");
+    let read_attempt = running_attempt(&store, &read);
+    let question = ask(&store, &read, read_attempt);
+    store
+        .acknowledge_message(
+            read.task_id,
+            read_attempt,
+            MessageDirection::WorkerToOwner,
+            &question.message_id,
+        )
+        .unwrap();
+
+    let row = counts_for(&session_counts_at(root.path()), "session-q");
+    assert_eq!(
+        (row.running, row.candidates, row.failed, row.asking),
+        (3, 0, 0, 1)
+    );
+}
+
+#[test]
+fn a_question_on_a_terminal_attempt_is_not_asking() {
+    let root = TempDir::new().unwrap();
+    let mut store = Store::open(root.path()).unwrap();
+    let spec = owned_task("codex:term-q", "term-q");
+    admit(&mut store, &spec);
+    bind_session(&store, &spec, "session-term-q");
+    let attempt = running_attempt(&store, &spec);
+    ask(&store, &spec, attempt);
+    terminal(&mut store, &spec, attempt, TerminalOutcome::Candidate);
+    let row = counts_for(&session_counts_at(root.path()), "session-term-q");
+    assert_eq!(
+        (row.running, row.candidates, row.failed, row.asking),
+        (0, 1, 0, 0)
+    );
+}
+
+#[test]
+fn session_counts_never_create_or_migrate_the_database() {
+    let root = TempDir::new().unwrap();
+    let store_root = root.path().join("store");
+    let rows = BoardStore::open_existing(&store_root)
+        .unwrap()
+        .session_counts()
+        .unwrap();
+    assert!(rows.is_empty());
+    assert!(!store_root.exists());
+}
+
+#[test]
+fn session_counts_return_while_a_writer_holds_the_database() {
+    let root = TempDir::new().unwrap();
+    let mut store = Store::open(root.path()).unwrap();
+    let spec = owned_task("codex:busy", "busy");
+    admit(&mut store, &spec);
+    bind_session(&store, &spec, "session-busy");
+    running_attempt(&store, &spec);
+
+    let writer = store.write_transaction().unwrap();
+    let started = Instant::now();
+    let rows = BoardStore::open_existing(root.path())
+        .unwrap()
+        .session_counts()
+        .unwrap();
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "session_counts waited on the writer"
+    );
+    assert_eq!(counts_for(&rows, "session-busy").running, 1);
+    writer.commit().unwrap();
+}

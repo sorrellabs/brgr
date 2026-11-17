@@ -81,6 +81,7 @@ pub(crate) async fn hook(paths: &Paths, event: HookEvent) -> Result<()> {
     }
     let pending = store.pending_for_session(&session_id)?;
     emit(event, &session_id, &pending);
+    crate::worker_line::refresh(paths);
     Ok(())
 }
 

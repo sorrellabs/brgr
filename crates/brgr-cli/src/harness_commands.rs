@@ -372,12 +372,16 @@ pub(crate) fn integrate(paths: &Paths, command: IntegrateCommand, json_output: b
                 ClaudeCommand::Uninstall => codex_integration::claude_uninstall(&paths.home)?,
             };
             let status_line = match command {
-                ClaudeCommand::Install { context: true } => Some(statusline_install::install(
+                ClaudeCommand::Install {
+                    context: true,
+                    workers,
+                } => Some(statusline_install::install(
                     &paths.home,
                     statusline_install::Harness::Claude,
                     &std::env::current_exe()?,
+                    workers,
                 )?),
-                ClaudeCommand::Install { context: false } => None,
+                ClaudeCommand::Install { context: false, .. } => None,
                 ClaudeCommand::Status => Some(statusline_install::status(
                     &paths.home,
                     statusline_install::Harness::Claude,
@@ -395,9 +399,12 @@ pub(crate) fn integrate(paths: &Paths, command: IntegrateCommand, json_output: b
         IntegrateCommand::Cursor { command } => {
             let harness = statusline_install::Harness::Cursor;
             let outcome = match command {
-                CursorCommand::Install => {
-                    statusline_install::install(&paths.home, harness, &std::env::current_exe()?)?
-                }
+                CursorCommand::Install => statusline_install::install(
+                    &paths.home,
+                    harness,
+                    &std::env::current_exe()?,
+                    false,
+                )?,
                 CursorCommand::Status => statusline_install::status(&paths.home, harness)?,
                 CursorCommand::Uninstall => statusline_install::uninstall(&paths.home, harness)?,
             };
