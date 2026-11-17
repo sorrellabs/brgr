@@ -444,7 +444,19 @@ pub(super) fn resolve(
     if let Screen::Resolve { rule, keys } = &outcome {
         let rule = *rule;
         let identity = dialog_identity(rule, &screen, workspace);
-        if answers.standing(rule, &identity, Instant::now()) {
+        let selection = (rule == "workspace-trust")
+            .then(|| trust_selection(&screen))
+            .flatten();
+        // A standing trust dialog whose cursor moved after the press applied
+        // only the cursor key: finish it with the keys the current selection
+        // needs instead of waiting out the hold. A cursor on "No, exit" is
+        // never pressed.
+        let partially_applied = rule == "workspace-trust"
+            && selection.is_some()
+            && answers.selection().is_some()
+            && selection.as_deref() != answers.selection()
+            && selection.as_deref() != Some(squash("No, exit").as_str());
+        if answers.standing(rule, &identity, Instant::now()) && !partially_applied {
             trace(
                 paths,
                 run,
@@ -456,6 +468,22 @@ pub(super) fn resolve(
                 false,
             );
             return Ok(Screen::Answered { rule });
+        }
+        // Herdr detects this native worker's kind, so a missing status is the
+        // startup frame before it does. Keys pressed into that frame moved the
+        // cursor and lost the Enter, so wait for the status.
+        if !herdr_has_reported(status, run) {
+            trace(
+                paths,
+                run,
+                pane,
+                stage,
+                status,
+                Some(&screen),
+                "waiting-for-herdr",
+                false,
+            );
+            return Ok(Screen::Clear);
         }
         let mut call = vec!["pane", "send-keys", pane];
         call.extend(keys.iter().copied());
@@ -487,7 +515,7 @@ pub(super) fn resolve(
             true,
         );
         std::thread::sleep(REDRAW);
-        answers.note_answer(rule, identity, Instant::now());
+        answers.note_answer(rule, identity, selection, Instant::now());
     } else {
         // A readable screen that is no longer a dialog invalidates the
         // answer; an unreadable one returned above and kept it.
@@ -499,6 +527,38 @@ pub(super) fn resolve(
         trace(paths, run, pane, stage, status, Some(&screen), label, false);
     }
     Ok(outcome)
+}
+
+/// Whether Herdr has looked at this worker's agent yet. A native worker whose
+/// kind Herdr detects has no status in the startup frame, and a rule pressed
+/// then moves the cursor while losing its Enter.
+fn herdr_has_reported(status: Option<&str>, run: &PaneRunArgs) -> bool {
+    status.is_some() || run.native_executable.is_none() || !herdr_detects(&run.kind)
+}
+
+/// The kinds Herdr's lifecycle detection covers. `gjc`, `command-code` and the
+/// test `fixture` run in brgr's native host under a kind Herdr does not know,
+/// so they never report a status.
+fn herdr_detects(kind: &str) -> bool {
+    !matches!(kind, "gjc" | "command-code" | "fixture")
+}
+
+/// The workspace-trust choice the cursor points at, squashed, so a later poll
+/// can tell whether only the cursor moved. `None` when no cursor is drawn.
+fn trust_selection(screen: &str) -> Option<String> {
+    let options = menu_options(screen);
+    if let Some(option) = options.iter().find(|option| option.selected) {
+        return Some(squash(&option.text));
+    }
+    let flat = squash(screen);
+    ["Yes, I trust this folder", "No, exit"]
+        .into_iter()
+        .find(|label| {
+            ["❯", "›", ">"]
+                .iter()
+                .any(|cursor| flat.contains(&format!("{cursor}{}", squash(label))))
+        })
+        .map(squash)
 }
 
 /// What makes a dialog the same one for the hold. Every rule but
@@ -669,6 +729,10 @@ struct Answer {
     /// What makes a later screen the same dialog: the exact text for every
     /// rule but `workspace-trust`, which uses its stable identity.
     identity: String,
+    /// The `workspace-trust` choice under the cursor at the press, so a later
+    /// poll can tell that only the cursor key was applied. `None` for other
+    /// rules and when no cursor was drawn.
+    selection: Option<String>,
     at: Instant, // taken after the REDRAW sleep
 }
 
@@ -694,8 +758,26 @@ impl AnswerMemory {
         })
     }
 
-    fn note_answer(&mut self, rule: &'static str, identity: String, at: Instant) {
-        self.answer = Some(Answer { rule, identity, at });
+    /// The `workspace-trust` choice under the cursor at the last press.
+    fn selection(&self) -> Option<&str> {
+        self.answer
+            .as_ref()
+            .and_then(|answer| answer.selection.as_deref())
+    }
+
+    fn note_answer(
+        &mut self,
+        rule: &'static str,
+        identity: String,
+        selection: Option<String>,
+        at: Instant,
+    ) {
+        self.answer = Some(Answer {
+            rule,
+            identity,
+            selection,
+            at,
+        });
     }
 
     /// Forgets the answered dialog because it changed or the agent began
@@ -1792,7 +1874,7 @@ esac
         let identity = dialog_identity("workspace-trust", screen, work());
         let mut answers = AnswerMemory::new();
         let t0 = Instant::now();
-        answers.note_answer("workspace-trust", identity.clone(), t0);
+        answers.note_answer("workspace-trust", identity.clone(), None, t0);
         assert!(answers.standing(
             "workspace-trust",
             &identity,
@@ -1900,7 +1982,7 @@ esac
         let identity = dialog_identity("workspace-trust", screen, work());
         let mut watch = ScreenWatch::with_limit("claude", Duration::from_hours(1));
         let mut answers = AnswerMemory::new();
-        answers.note_answer("workspace-trust", identity.clone(), Instant::now());
+        answers.note_answer("workspace-trust", identity.clone(), None, Instant::now());
         watch.observe(&Screen::Clear).unwrap();
         watch.reset();
         watch.restart_clock();
@@ -2078,10 +2160,12 @@ esac
         assert_eq!(send_keys(&temp), ["pane send-keys w1:p2 down enter"]);
     }
 
-    /// The selection cursor moving is a redraw, not a new dialog: the choice
-    /// labels and their order are unchanged.
+    /// The first press moved the cursor to Yes and lost its Enter. The
+    /// selection now differs from the one at the press, so the answer is
+    /// finished with the one key the current selection needs, without waiting
+    /// for the 30-second hold.
     #[test]
-    fn trust_selection_redraw_does_not_repress_within_hold() {
+    fn a_trust_selection_moved_after_the_press_is_finished_with_enter() {
         let (temp, herdr) = fake_herdr(trust());
         let (paths, run) = run_args(&temp);
         let mut answers = AnswerMemory::new();
@@ -2111,8 +2195,184 @@ esac
                 "start-native",
             )
             .unwrap(),
+            Screen::Resolve {
+                rule: "workspace-trust",
+                keys: vec!["enter"],
+            }
+        );
+        assert_eq!(
+            send_keys(&temp),
+            [
+                "pane send-keys w1:p2 down enter",
+                "pane send-keys w1:p2 enter"
+            ]
+        );
+        let log = std::fs::read_to_string(log_path(&paths, &run)).unwrap();
+        assert_eq!(log.lines().count(), 2, "{log}");
+        // The cursor now stands still, so the new press is held like any other.
+        assert_eq!(
+            resolve(
+                &herdr,
+                "w1:p2",
+                &run,
+                &paths,
+                Some("idle"),
+                &mut answers,
+                "start-native",
+            )
+            .unwrap(),
             Screen::Answered {
                 rule: "workspace-trust"
+            }
+        );
+        assert_eq!(send_keys(&temp).len(), 2);
+    }
+
+    /// The selection at the press is still where the cursor is: nothing was
+    /// applied yet, so the answer is held for the full [`REPRESS_AFTER`].
+    #[test]
+    fn an_unchanged_standing_trust_dialog_is_held_for_the_repress_hold() {
+        let (temp, herdr) = fake_herdr(trust());
+        let (paths, run) = run_args(&temp);
+        let mut answers = AnswerMemory::new();
+        resolve(
+            &herdr,
+            "w1:p2",
+            &run,
+            &paths,
+            Some("idle"),
+            &mut answers,
+            "start-native",
+        )
+        .unwrap();
+        assert_eq!(
+            resolve(
+                &herdr,
+                "w1:p2",
+                &run,
+                &paths,
+                Some("idle"),
+                &mut answers,
+                "start-native",
+            )
+            .unwrap(),
+            Screen::Answered {
+                rule: "workspace-trust"
+            }
+        );
+        assert_eq!(send_keys(&temp), ["pane send-keys w1:p2 down enter"]);
+    }
+
+    /// A selection that moved to "No, exit" is never pressed. The hold runs
+    /// out and the rule then moves from wherever the cursor is.
+    #[test]
+    fn a_trust_selection_moved_to_no_exit_is_not_pressed() {
+        let selected =
+            "Accessing workspace:\n\n/repo/task\n\n  No, exit\n❯ Yes, I trust this folder\n";
+        let (temp, herdr) = fake_herdr(selected);
+        let (paths, run) = run_args(&temp);
+        let mut answers = AnswerMemory::new();
+        resolve(
+            &herdr,
+            "w1:p2",
+            &run,
+            &paths,
+            Some("idle"),
+            &mut answers,
+            "start-native",
+        )
+        .unwrap();
+        std::fs::write(temp.path().join("screen"), trust()).unwrap();
+        assert_eq!(
+            resolve(
+                &herdr,
+                "w1:p2",
+                &run,
+                &paths,
+                Some("idle"),
+                &mut answers,
+                "start-native",
+            )
+            .unwrap(),
+            Screen::Answered {
+                rule: "workspace-trust"
+            }
+        );
+        assert_eq!(send_keys(&temp), ["pane send-keys w1:p2 enter"]);
+    }
+
+    fn native_run(kind: &str, temp: &tempfile::TempDir) -> (Paths, PaneRunArgs) {
+        let (paths, mut run) = run_args(temp);
+        run.kind = kind.to_owned();
+        run.native_executable = Some(PathBuf::from(format!("/bin/{kind}")));
+        (paths, run)
+    }
+
+    /// Herdr has not detected the agent yet, so its status is absent. A rule
+    /// that pressed now moved the cursor and lost the Enter (seen live: a 30 s
+    /// stall). It waits for a status instead.
+    #[test]
+    fn a_native_harness_herdr_detects_is_not_pressed_before_a_status() {
+        let (temp, herdr) = fake_herdr(trust());
+        let (paths, run) = native_run("claude", &temp);
+        let mut answers = AnswerMemory::new();
+        assert_eq!(
+            resolve(
+                &herdr,
+                "w1:p2",
+                &run,
+                &paths,
+                None,
+                &mut answers,
+                "start-native",
+            )
+            .unwrap(),
+            Screen::Clear
+        );
+        assert!(
+            !temp.path().join("keys").exists(),
+            "nothing is pressed before Herdr reports the agent"
+        );
+        assert_eq!(
+            resolve(
+                &herdr,
+                "w1:p2",
+                &run,
+                &paths,
+                Some("blocked"),
+                &mut answers,
+                "start-native",
+            )
+            .unwrap(),
+            Screen::Resolve {
+                rule: "workspace-trust",
+                keys: vec!["down", "enter"],
+            }
+        );
+        assert_eq!(send_keys(&temp), ["pane send-keys w1:p2 down enter"]);
+    }
+
+    /// A kind Herdr has no detector for (`gjc` runs in brgr's native host) has
+    /// no status at any point, so its screens are still answered.
+    #[test]
+    fn an_unclassified_harness_is_pressed_with_no_herdr_status() {
+        let (temp, herdr) = fake_herdr(trust());
+        let (paths, run) = native_run("gjc", &temp);
+        let mut answers = AnswerMemory::new();
+        assert_eq!(
+            resolve(
+                &herdr,
+                "w1:p2",
+                &run,
+                &paths,
+                None,
+                &mut answers,
+                "start-native",
+            )
+            .unwrap(),
+            Screen::Resolve {
+                rule: "workspace-trust",
+                keys: vec!["down", "enter"],
             }
         );
         assert_eq!(send_keys(&temp), ["pane send-keys w1:p2 down enter"]);
@@ -2300,7 +2560,7 @@ esac
         let identity = dialog_identity("workspace-trust", screen, work());
         let mut answers = AnswerMemory::new();
         let t0 = Instant::now();
-        answers.note_answer("workspace-trust", identity.clone(), t0);
+        answers.note_answer("workspace-trust", identity.clone(), None, t0);
         let just_before = REPRESS_AFTER.checked_sub(Duration::from_millis(1)).unwrap();
         assert!(answers.standing("workspace-trust", &identity, t0 + just_before));
         assert!(!answers.standing("workspace-trust", &identity, t0 + REPRESS_AFTER));
