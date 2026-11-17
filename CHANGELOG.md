@@ -1,5 +1,24 @@
 # Changelog
 
+## 2.16.0 — 2026-11-17
+
+Herdr finally sees brgr's workers: Claude workers report status, carry a sidebar name and close their pane when the result is decided. Screens are answered once and only when safe, a lost network is reported as such, results that finish together arrive in one notice, and there is a board, a status-line count, two worker layouts and a `claude-route` setting. Minor release: `claude-route` refuses Claude models on other harnesses by default, and `worker-placement = below` or `claude-route = any` make `config.toml` unreadable to 2.15.
+
+- Native workers start with their harness kind as `argv[0]`, so Herdr detects them; the verified executable and its digest check are unchanged (#411).
+- Worker agents get a Herdr-valid sidebar name such as `claude-1cf44e8d` (#403).
+- A decided Claude pane is closed and its worktree removed after its banner has scrolled away (#404).
+- A screen brgr answered is held for the whole run across stages; the workspace-trust dialog has a stable identity, keys wait for Herdr to report a detected worker, and a half-applied answer is finished at once. `BRGR_SCREEN_TRACE=1` traces each decision by screen digest (#402).
+- OpenCode's web-search prompt is dismissed with Esc and Claude Code's LSP plugin offer gets "No, not now" (#416).
+- A harness's provider or network error screen is recognised passively, never answered, reported to the owner as such, and given a 10-minute recovery window; a timeout reason names the provider (#417).
+- Completions that finish together reach the owner in one `brgr_completions` notice; a single result keeps today's notice body (#407).
+- `brgr tui`: a read-only task board for any terminal, scoped to the owner's session, with model and alias columns; the Herdr plugin board shares its renderer (#413). PROJECT shows the source repository (#428).
+- `brgr integrate claude install --context --workers` adds the owner's worker counts to the status line (#410).
+- `adjacent` placement fills a second worker column before opening a tab (#409); `worker-placement below` puts workers in one row under the head (#414).
+- `claude-route claude-code-only|any` decides whether Claude models may run on harnesses other than `local.claude-code`; admission refuses, never reroutes (#415).
+- `brgr harness list` (#405). `harness add` works without `--workspace` and `--prompt` and keeps global git hooks out of its scratch (#406). GJC is a tier 3 harness again (#408). Command Code is recognised from its package path when installed as `cmd` or `index.mjs` (#429).
+- Stopping a worker's TUI host signals only verified descendants (#418).
+- Test processes start from a cleared environment (#412), and the notice tests wait for a whole notice line (#430).
+
 ## 2.15.24 — 2026-11-13
 
 The repository moved to `sorrellabs/brgr`, workers no longer stall on a folder-trust dialog in a short stacked pane, the crates.io page's links work, and `harness add` prints the receipt it stored.
