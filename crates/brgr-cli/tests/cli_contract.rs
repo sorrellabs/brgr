@@ -61,14 +61,33 @@ fn settle(home: &Path, task: &str, owner: &[(&str, &str)]) -> Option<Value> {
         .then(|| json_output(&run(home, &["result", task], owner)))
 }
 
-/// The owner pane's prompt file once a line satisfies `delivered`.
+/// The owner pane's prompt file once a line satisfies `delivered` and every
+/// notice in it is whole.
+///
+/// The owner's shell appends a prompt that exceeds its write buffer in more
+/// than one write, so a prefix such as `FROM BRGR` is visible before its JSON
+/// line is. Waiting on that prefix alone hands back a partly written notice.
 fn delivered_prompt(prompts: &Path, delivered: impl Fn(&str) -> bool) -> Option<String> {
     let mut text = String::new();
     wait_until(|| {
         text = fs::read_to_string(prompts).unwrap_or_default();
-        delivered(&text)
+        delivered(&text) && notices_are_whole(&text)
     })
     .then_some(text)
+}
+
+/// Whether every `FROM BRGR` notice start in `text` carries its whole JSON line.
+///
+/// A parsed notice alone is not proof: the file may hold one finished notice
+/// and the beginning of a later one still being written.
+fn notices_are_whole(text: &str) -> bool {
+    let lines: Vec<&str> = text.lines().collect();
+    lines.iter().enumerate().all(|(index, line)| {
+        *line != "FROM BRGR"
+            || lines
+                .get(index + 1)
+                .is_some_and(|json| serde_json::from_str::<Value>(json.trim()).is_ok())
+    })
 }
 
 fn run(home: &Path, args: &[&str], envs: &[(&str, &str)]) -> std::process::Output {
@@ -5054,6 +5073,43 @@ fn a_failed_run_in_a_batch_keeps_its_outcome_and_reason() {
     );
     assert_eq!(candidate["outcome"], "candidate");
     assert!(candidate.get("reason").is_none() || candidate["reason"].is_null());
+}
+
+/// The owner's shell appends a prompt longer than its write buffer in more than
+/// one write, so `FROM BRGR` is visible before the JSON line is complete. A
+/// wait on that prefix used to hand the notice tests a partial read, which
+/// parsed as zero notices.
+#[test]
+fn a_notice_is_not_delivered_until_its_json_line_is_complete() {
+    let temp = TempDir::new().unwrap();
+    let prompts = temp.path().join("prompts");
+    let body = format!(
+        "FROM BRGR\n{}",
+        json!({
+            "type": "brgr_completions",
+            "count": 1,
+            "completions": [{"task_id": "7b6f4c4e-8a5f-4c5f-9c1a-2f0f3f4f5f6f", "outcome": "failed"}],
+        })
+    );
+    // The first write ends inside the JSON line, as the shell's buffer cutoff
+    // does, and the second write lands while the wait is still polling.
+    let split = body.find('{').unwrap() + 10;
+    fs::write(&prompts, &body[..split]).unwrap();
+    let writer = {
+        let prompts = prompts.clone();
+        let rest = body[split..].to_owned();
+        thread::spawn(move || {
+            thread::sleep(Duration::from_millis(400));
+            let mut file = fs::OpenOptions::new().append(true).open(&prompts).unwrap();
+            file.write_all(rest.as_bytes()).unwrap();
+        })
+    };
+    let prompt = delivered_prompt(&prompts, |text| text.contains("FROM BRGR"))
+        .expect("the notice was not delivered");
+    writer.join().unwrap();
+    let notices = notice_json_lines(&prompt);
+    assert_eq!(notices.len(), 1, "read a partly written notice: {prompt:?}");
+    assert_eq!(notices[0]["type"], "brgr_completions", "{prompt}");
 }
 
 #[test]
