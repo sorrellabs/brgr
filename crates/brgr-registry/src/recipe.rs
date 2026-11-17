@@ -793,6 +793,55 @@ pub(crate) const RECIPES: &[Recipe] = &[
         }),
         ..GENERIC
     },
+    Recipe {
+        names: &["prime-agent"],
+        id: "local.prime-agent",
+        required_flags: &[
+            "-p, --print",
+            "--mode <text|json|rpc|acp|daemon>",
+            "--model <id>",
+            "--thinking <level>",
+            "-r, --resume",
+        ],
+        // Print mode is daemonless: the task, its IPython kernel, and its
+        // child agents run in this process's group, so stopping the group
+        // stops the work. The session file it saves is what `--resume <id>`
+        // reopens; it lives in the agent dir (`~/.prime/agent`, or
+        // `PRIME_AGENT_CODING_AGENT_DIR`/`PRIME_AGENT_SESSION_DIR`), never in
+        // the task worktree. `--autonomous` is never passed: brgr owns the
+        // completion decision.
+        argv: &["-p", "--mode", "json", "${input.prompt}"],
+        // The CLI refuses a model name it cannot resolve, locally and before
+        // any request, so the exact selector passes through.
+        catalog: Some((&[], Catalog::CliValidated)),
+        model_argv: MODEL,
+        effort_argv: &["--thinking", "${route.effort}"],
+        env_allow: &[
+            "HOME",
+            "PATH",
+            "LANG",
+            "TMPDIR",
+            "USER",
+            "PRIME_AGENT_CODING_AGENT_DIR",
+            "PRIME_AGENT_SESSION_DIR",
+            "PRIME_API_KEY",
+            "PRIME_TEAM_ID",
+            "ANTHROPIC_OAUTH_TOKEN",
+            "ANTHROPIC_API_KEY",
+            "OPENAI_API_KEY",
+            "COPILOT_GITHUB_TOKEN",
+            "GH_TOKEN",
+            "GITHUB_TOKEN",
+        ],
+        source: Source::JsonlAssistantFinal,
+        capabilities: &JSON_CAPS,
+        // No approval layer: model-generated Python and project commands
+        // already run with the user's permissions.
+        full: Some(&[]),
+        edits: None,
+        read_only: None,
+        ..GENERIC
+    },
 ];
 
 /// The recipe an executable's own file name names.

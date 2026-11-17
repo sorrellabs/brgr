@@ -251,6 +251,15 @@ pub(crate) fn extract_jsonl_assistant_final(stdout: &[u8]) -> Result<Vec<u8>, Ru
                         .and_then(serde_json::Value::as_str)
                         .map(str::to_owned),
                 ));
+                // Some harnesses qualify the turn only here: Prime Agent's
+                // `agent_end` carries no stop reason, and a provider failure
+                // may follow partial text. The last assistant message decides.
+                agent_failed = matches!(
+                    message
+                        .get("stopReason")
+                        .and_then(serde_json::Value::as_str),
+                    Some("error" | "aborted")
+                );
             }
             Some("agent_end") => {
                 match event.get("stopReason").and_then(serde_json::Value::as_str) {
@@ -348,4 +357,48 @@ pub(crate) fn observe_jsonl_model(
         }
     }
     Ok(observed)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A provider error can follow partial text. The message's own
+    /// `stopReason` is the only terminal signal Prime Agent gives (its
+    /// `agent_end` carries no stop reason), so text without it must not
+    /// become a candidate.
+    #[test]
+    fn a_failed_assistant_message_is_not_a_result_even_with_partial_text() {
+        let stream = concat!(
+            "{\"type\":\"session\",\"version\":3,\"id\":\"s\"}\n",
+            "{\"type\":\"message_end\",\"message\":{\"role\":\"assistant\",",
+            "\"content\":[{\"type\":\"text\",\"text\":\"partial\"}],",
+            "\"stopReason\":\"error\",\"errorMessage\":\"provider exploded\"}}\n",
+            "{\"type\":\"turn_end\",\"message\":{\"role\":\"assistant\",",
+            "\"content\":[],\"stopReason\":\"error\"},\"toolResults\":[]}\n",
+            "{\"type\":\"agent_end\",\"messages\":[]}\n",
+        );
+        assert!(matches!(
+            extract_jsonl_assistant_final(stream.as_bytes()),
+            Err(RunnerError::AssistantError(ref message)) if message == "provider exploded"
+        ));
+    }
+
+    /// A completed turn with no stop reason on `agent_end` is prime-agent's
+    /// success shape: the assistant `turn_end` qualifies it.
+    #[test]
+    fn an_unqualified_agent_end_after_an_assistant_turn_is_complete() {
+        let stream = concat!(
+            "{\"type\":\"session\",\"version\":3,\"id\":\"s\"}\n",
+            "{\"type\":\"message_end\",\"message\":{\"role\":\"assistant\",",
+            "\"content\":[{\"type\":\"text\",\"text\":\"prime answer\"}]}}\n",
+            "{\"type\":\"turn_end\",\"message\":{\"role\":\"assistant\",",
+            "\"content\":[],\"stopReason\":\"stop\"},\"toolResults\":[]}\n",
+            "{\"type\":\"agent_end\",\"messages\":[]}\n",
+        );
+        assert_eq!(
+            extract_jsonl_assistant_final(stream.as_bytes()).unwrap(),
+            b"prime answer"
+        );
+    }
 }
