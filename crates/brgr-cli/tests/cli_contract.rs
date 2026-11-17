@@ -7012,6 +7012,59 @@ fn harness_add_prints_the_registered_symlink_it_stored() {
 }
 
 #[test]
+fn dsh_drafts_its_headless_recipe_from_the_pinned_help() {
+    let temp = TempDir::new().unwrap();
+    let home = temp.path().join("brgr");
+    let help = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../testdata/fixtures/help/dsh-0.2.2-rc.1.txt")
+        .canonicalize()
+        .unwrap();
+    let dsh = temp.path().join("dsh");
+    write_fast_script(
+        &dsh,
+        &format!(
+            "#!/bin/sh\ncase \"$1\" in\n  --version) echo '0.2.2-rc.1';;\n  --profile) /bin/cat '{}';;\n  *) exit 2;;\nesac\n",
+            help.display()
+        ),
+    );
+    let manifest = json_output(&run(
+        &home,
+        &["harness", "draft", dsh.to_str().unwrap()],
+        &[],
+    ));
+    assert_eq!(manifest["id"], "local.dsh");
+    assert_eq!(manifest["result"]["source"]["kind"], "dsh_headless_final");
+    assert_eq!(
+        manifest["probe"]["help_argv"],
+        json!(["--profile", "headless", "--help"])
+    );
+    assert_eq!(
+        manifest["launch"]["argv"],
+        json!([
+            "--profile",
+            "headless",
+            "--json",
+            "--permission-mode",
+            "danger-full-access",
+            "--approval-policy",
+            "never",
+            "${input.prompt}",
+        ])
+    );
+    assert_eq!(
+        manifest["launch"]["resume_argv"],
+        json!(["--session-id", "${input.session}"])
+    );
+    let environment = manifest["launch"]["env_allow"].as_array().unwrap();
+    for name in ["DSH_HOME", "DEEPSEEK_API_KEY"] {
+        assert!(
+            environment.iter().any(|value| value == name),
+            "{name} missing from {environment:?}"
+        );
+    }
+}
+
+#[test]
 fn harness_list_shows_each_registered_harness_id_executable_version_and_health() {
     let temp = TempDir::new().unwrap();
     let home = temp.path().join("brgr");

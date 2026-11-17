@@ -74,6 +74,7 @@
             { "type": "object", "additionalProperties": false, "required": ["kind"], "properties": { "kind": { "const": "stdout" } } },
             { "type": "object", "additionalProperties": false, "required": ["kind"], "properties": { "kind": { "const": "jsonl_assistant_final" } } },
             { "type": "object", "additionalProperties": false, "required": ["kind"], "properties": { "kind": { "const": "stream_json_result" } } },
+            { "type": "object", "additionalProperties": false, "required": ["kind"], "properties": { "kind": { "const": "dsh_headless_final" } } },
             { "type": "object", "additionalProperties": false, "required": ["kind", "path"], "properties": { "kind": { "const": "file" }, "path": { "type": "string", "minLength": 1 } } }
           ]
         },

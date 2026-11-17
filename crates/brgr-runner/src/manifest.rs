@@ -199,6 +199,10 @@ pub enum ResultSource {
     /// in `session_id`. Only the pinned envelope parses; anything else is a
     /// typed error.
     StreamJsonResult,
+    /// `dsh --profile headless --json`: the sealed result is the text of the
+    /// terminal `final` event, present only when its durable turn reason is
+    /// `completed`. That event also names the Session a follow-up resumes.
+    DshHeadlessFinal,
     File {
         path: String,
     },
@@ -227,9 +231,13 @@ impl TryFrom<ResultSourceFields> for ResultSource {
             ("stdout", None) => Ok(Self::Stdout),
             ("jsonl_assistant_final", None) => Ok(Self::JsonlAssistantFinal),
             ("stream_json_result", None) => Ok(Self::StreamJsonResult),
+            ("dsh_headless_final", None) => Ok(Self::DshHeadlessFinal),
             ("file", Some(path)) => Ok(Self::File { path }),
             ("file", None) => Err("a `file` result source requires `path`".to_owned()),
-            ("stdout" | "jsonl_assistant_final" | "stream_json_result", Some(_)) => Err(format!(
+            (
+                "stdout" | "jsonl_assistant_final" | "stream_json_result" | "dsh_headless_final",
+                Some(_),
+            ) => Err(format!(
                 "a `{}` result source takes no `path`; did you mean `file`?",
                 fields.kind
             )),
@@ -334,6 +342,8 @@ impl HarnessManifest {
         }
         let change = if self.id == "local.cline" {
             "change it with `cline auth -m <model-id>`"
+        } else if self.id == "local.dsh" {
+            "change it in dsh settings (`agentDefaultModel` in the headless profile)"
         } else {
             "change it in that CLI's own settings"
         };

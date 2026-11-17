@@ -2519,6 +2519,111 @@ mod tests {
         );
     }
 
+    /// dsh documents one headless invocation. Its full-access preset is the
+    /// launch itself; `workspace-write` is never offered as a lower level.
+    #[test]
+    fn dsh_drafts_from_the_pinned_headless_help() {
+        let manifest = generate_manifest(
+            "dsh",
+            PathBuf::from("/bin/echo"),
+            &help_fixture("dsh-0.2.2-rc.1.txt"),
+        )
+        .unwrap();
+        manifest.validate().unwrap();
+        assert_eq!(manifest.id, "local.dsh");
+        assert_eq!(manifest.adapter, PROCESS_ADAPTER_V1);
+        assert_eq!(manifest.probe.version_argv, ["--version"]);
+        assert_eq!(
+            manifest.probe.help_argv,
+            ["--profile", "headless", "--help"]
+        );
+        assert_eq!(
+            manifest.launch.argv,
+            [
+                "--profile",
+                "headless",
+                "--json",
+                "--permission-mode",
+                "danger-full-access",
+                "--approval-policy",
+                "never",
+                "${input.prompt}",
+            ]
+        );
+        assert_eq!(
+            manifest.launch.resume_argv,
+            ["--session-id", "${input.session}"]
+        );
+        assert!(manifest.launch.model_argv.is_empty());
+        assert!(manifest.launch.effort_argv.is_empty());
+        assert_eq!(manifest.result.source, ResultSource::DshHeadlessFinal);
+        assert!(manifest.permission_arguments(None).unwrap().is_empty());
+        assert_eq!(
+            manifest.capabilities["model_select"].semantics,
+            "configured_default_only"
+        );
+        assert_eq!(
+            manifest.capabilities["effort_select"].status,
+            CapabilityStatus::Unsupported
+        );
+        let allow: Vec<&str> = manifest
+            .launch
+            .env_allow
+            .iter()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            allow,
+            [
+                "HOME",
+                "PATH",
+                "LANG",
+                "TMPDIR",
+                "DSH_HOME",
+                "DEEPSEEK_API_KEY"
+            ]
+        );
+    }
+
+    /// A fixture executable named `dsh` drafts by name, and a scratch run that
+    /// asks for a model or effort is refused before anything runs.
+    #[tokio::test]
+    async fn dsh_fixture_executable_drafts_and_refuses_a_scratch_model() {
+        let root = tempfile::tempdir().unwrap();
+        let help_path = root.path().join("help.txt");
+        fs::write(&help_path, help_fixture("dsh-0.2.2-rc.1.txt")).unwrap();
+        let executable = root.path().join("dsh");
+        write_fast_script(
+            &executable,
+            &format!(
+                "#!/bin/sh\ncase \"$1\" in\n  --version) echo '0.2.2-rc.1';;\n  --profile) /bin/cat '{}';;\n  *) exit 2;;\nesac\n",
+                help_path.display()
+            ),
+        );
+        let registry = Registry::open(root.path().join("registry")).unwrap();
+        let manifest = registry.draft(&executable).await.unwrap();
+        assert_eq!(manifest.id, "local.dsh");
+        let workspace = scratch_workspace(&root);
+
+        let model_error = registry
+            .activate_with_scratch(&manifest, &workspace, "probe", Some("deepseek-chat"), None)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            model_error,
+            RegistryError::ConfiguredModelOnly { ref hint, .. }
+                if hint.contains("dsh settings") && hint.contains("agentDefaultModel")
+        ));
+        let effort_error = registry
+            .activate_with_scratch(&manifest, &workspace, "probe", None, Some("high"))
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            effort_error,
+            RegistryError::UnsupportedScratchEffort
+        ));
+    }
+
     #[test]
     fn registry_rejects_path_escape_identifiers() {
         for id in ["local.../private", "../local.foo", "local.Foo", "local."] {
