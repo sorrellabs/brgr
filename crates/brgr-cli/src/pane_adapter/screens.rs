@@ -56,6 +56,34 @@ pub(super) enum Screen {
     Unknown(String),
     /// A dialog a rule already answered that still stands unchanged; nothing was pressed.
     Answered { rule: &'static str },
+    /// The harness's own provider/network diagnostic. Passive: no rule answers
+    /// it, and nothing is ever pressed on it.
+    Provider { state: ProviderState, quote: String },
+}
+
+/// Whether the harness is still retrying a provider request or has stopped.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum ProviderState {
+    Retrying,
+    Stopped,
+}
+
+impl ProviderState {
+    pub(super) fn label(self) -> &'static str {
+        match self {
+            Self::Retrying => "retrying",
+            Self::Stopped => "stopped",
+        }
+    }
+}
+
+/// Classifies a pane's text for a known harness kind, recognizing its own
+/// provider/network diagnostics before any rule that could produce a key.
+pub(super) fn classify_for(kind: &str, screen: &str, workspace: &Path) -> Screen {
+    if let Some((state, quote)) = provider_screen(kind, screen) {
+        return Screen::Provider { state, quote };
+    }
+    classify(screen, workspace)
 }
 
 /// Classifies a pane's visible text. Pure: it never reads or presses anything.
@@ -166,6 +194,352 @@ pub(super) fn classify(screen: &str, workspace: &Path) -> Screen {
         };
     }
     Screen::Unknown(head(screen))
+}
+
+/// How many trailing visible rows are read for an active diagnostic. The
+/// bottom block is where a harness draws its own status; older transcript
+/// above it is never evidence.
+const DIAGNOSTIC_ROWS: usize = 16;
+/// A quoted diagnostic is bounded, controls removed, like every other quote.
+const QUOTE_LIMIT: usize = 300;
+
+/// The harness's own provider/network error, passive and never answered.
+///
+/// Only a narrow, harness-specific grammar at the bottom of the pane is
+/// admitted. There is no broad "error"/"timeout"/"retry" rule: a harness's
+/// tool output or prose can contain any of those words.
+pub(super) fn provider_screen(kind: &str, screen: &str) -> Option<(ProviderState, String)> {
+    // A live approval dialog is not an incident, even if an old diagnostic is
+    // still above it.
+    if menu_options(screen).iter().any(|option| option.selected) {
+        return None;
+    }
+    let rows = diagnostic_rows(screen);
+    if rows.is_empty() {
+        return None;
+    }
+    match kind {
+        "opencode" => opencode_provider(&rows),
+        "claude" => claude_provider(&rows),
+        "codex" => codex_provider(&rows),
+        "cursor" => cursor_provider(&rows),
+        "devin" => devin_provider(&rows),
+        _ => None,
+    }
+}
+
+/// The bottom visible rows that can carry an active diagnostic, with ANSI
+/// sequences, borders and bullet decorations removed. Fenced examples,
+/// quote-prefixed lines and tool-output blocks are rejected.
+fn diagnostic_rows(screen: &str) -> Vec<String> {
+    let mut rows = Vec::new();
+    let mut fenced = false;
+    for line in screen.lines() {
+        let line = strip_controls(line);
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("```") {
+            fenced = !fenced;
+            continue;
+        }
+        if fenced {
+            continue;
+        }
+        let row = row_text(&line);
+        if row.is_empty() || is_rejected_row(trimmed, &row) {
+            continue;
+        }
+        rows.push(row);
+    }
+    let start = rows.len().saturating_sub(DIAGNOSTIC_ROWS);
+    rows[start..].to_vec()
+}
+
+/// A quoted line, a shell line, or a tool result is data about the screen, not
+/// the harness's own status.
+fn is_rejected_row(trimmed: &str, row: &str) -> bool {
+    trimmed.starts_with('>')
+        || row.starts_with('$')
+        || row.starts_with('⎿')
+        || row.starts_with("The tool ")
+        || row.starts_with("I saw ")
+}
+
+/// Removes borders, box drawing and bullet decorations from one visible row.
+fn row_text(line: &str) -> String {
+    let mut row = strip_controls(line).trim().to_owned();
+    loop {
+        let next = row
+            .trim_start_matches(['│', '┃', '║', '╭', '╮', '╰', '╯', '─', ' '])
+            .to_owned();
+        if next == row {
+            break;
+        }
+        row = next;
+    }
+    row.trim_end_matches(['│', '┃', '║', ' '])
+        .trim_start_matches(['⚠', '✗', '✘', '⏺', '•', '·', '*', '-', ' '])
+        .trim()
+        .to_owned()
+}
+
+/// Drops ANSI escape and other control sequences while keeping visible text.
+fn strip_controls(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(character) = chars.next() {
+        if character == '\u{1b}' {
+            match chars.peek() {
+                Some('[') => {
+                    chars.next();
+                    for next in chars.by_ref() {
+                        if ('@'..='~').contains(&next) {
+                            break;
+                        }
+                    }
+                }
+                Some(']') => {
+                    chars.next();
+                    while let Some(next) = chars.next() {
+                        if next == '\u{7}' {
+                            break;
+                        }
+                        if next == '\u{1b}' {
+                            if chars.peek() == Some(&'\\') {
+                                chars.next();
+                            }
+                            break;
+                        }
+                    }
+                }
+                Some(_) => {
+                    chars.next();
+                }
+                None => {}
+            }
+            continue;
+        }
+        if character == '\t' {
+            out.push(' ');
+        } else if !character.is_control() {
+            out.push(character);
+        }
+    }
+    out
+}
+
+fn bounded_quote(text: &str) -> String {
+    let flat: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    flat.chars().take(QUOTE_LIMIT).collect()
+}
+
+/// A row and at most one wrapped continuation row.
+fn row_variants(rows: &[String], at: usize) -> [String; 2] {
+    let joined = rows
+        .get(at + 1)
+        .map_or_else(|| rows[at].clone(), |next| format!("{} {}", rows[at], next));
+    [rows[at].clone(), joined]
+}
+
+/// `OpenCode`'s own provider timeouts. The anchored `Error:` row is stopped;
+/// the warning/retry/count renderer grammar is retrying. Issue #417.
+fn opencode_provider(rows: &[String]) -> Option<(ProviderState, String)> {
+    const TIMEOUTS: [&str; 2] = [
+        "Timed out waiting for response headers",
+        "Timed out waiting for response data",
+    ];
+    for at in (0..rows.len()).rev() {
+        for text in row_variants(rows, at) {
+            let Some(diagnostic) = TIMEOUTS
+                .iter()
+                .find(|diagnostic| text.contains(**diagnostic))
+            else {
+                continue;
+            };
+            let lower = text.to_lowercase();
+            let retrying = (lower.contains("retrying in") || lower.contains("retry due"))
+                && lower.contains("attempt");
+            let anchored = text == *diagnostic || text.starts_with(&format!("Error: {diagnostic}"));
+            if !retrying && !anchored {
+                continue;
+            }
+            return Some((
+                if retrying {
+                    ProviderState::Retrying
+                } else {
+                    ProviderState::Stopped
+                },
+                bounded_quote(&text),
+            ));
+        }
+    }
+    None
+}
+
+/// Claude Code's native connection and API errors. `API Error` alone is not a
+/// network failure: aborted requests, prompt-length and tool-result errors and
+/// cancellation are excluded.
+fn claude_provider(rows: &[String]) -> Option<(ProviderState, String)> {
+    for at in (0..rows.len()).rev() {
+        for text in row_variants(rows, at) {
+            let lower = text.to_lowercase();
+            let admitted = lower.starts_with("unable to connect to api")
+                || (lower.starts_with("api error:") && claude_api_error_admitted(&lower));
+            if !admitted || claude_not_network(&lower) {
+                continue;
+            }
+            let retrying = rows[at..]
+                .iter()
+                .any(|row| claude_retry_status(&row.to_lowercase()));
+            return Some((
+                if retrying {
+                    ProviderState::Retrying
+                } else {
+                    ProviderState::Stopped
+                },
+                bounded_quote(&text),
+            ));
+        }
+    }
+    None
+}
+
+fn claude_api_error_admitted(lower: &str) -> bool {
+    [
+        "connect",
+        "network",
+        "timed out",
+        "timeout",
+        "ssl",
+        "tls",
+        "certificate",
+        "401",
+        "403",
+        "unauthorized",
+        "forbidden",
+        "authentication",
+        "429",
+        "rate limit",
+        "rate_limit",
+        "quota",
+        "overloaded",
+        "500",
+        "502",
+        "503",
+        "504",
+        "529",
+        "server error",
+        "internal server error",
+    ]
+    .iter()
+    .any(|word| lower.contains(word))
+}
+
+fn claude_not_network(lower: &str) -> bool {
+    [
+        "request was aborted",
+        "prompt is too long",
+        "prompt length",
+        "tool result",
+        "tool_result",
+        "concurrency",
+        "cancelled by user",
+        "canceled by user",
+        "aborted by user",
+    ]
+    .iter()
+    .any(|word| lower.contains(word))
+}
+
+fn claude_retry_status(lower: &str) -> bool {
+    (lower.contains("retrying in") || lower.contains("will retry in"))
+        && (lower.contains("attempt") || lower.contains("check your network"))
+}
+
+/// Codex CLI's native reconnect status and final stream/server-response error.
+/// Arbitrary `Connection failed:` text and voice/remote-app-server reconnects
+/// are not model retries.
+fn codex_provider(rows: &[String]) -> Option<(ProviderState, String)> {
+    for at in (0..rows.len()).rev() {
+        for text in row_variants(rows, at) {
+            let lower = text.to_lowercase();
+            if codex_not_model(&lower) {
+                continue;
+            }
+            if lower.starts_with("reconnecting")
+                && lower.chars().any(|character| character.is_ascii_digit())
+            {
+                return Some((ProviderState::Retrying, bounded_quote(&text)));
+            }
+            if lower.starts_with("stream disconnected before completion:")
+                || lower.starts_with("error while reading the server response:")
+            {
+                return Some((ProviderState::Stopped, bounded_quote(&text)));
+            }
+        }
+    }
+    None
+}
+
+fn codex_not_model(lower: &str) -> bool {
+    lower.contains("voice")
+        || lower.contains("remote app server")
+        || lower.contains("remote-app-server")
+}
+
+/// Cursor's native `Connection failed` title needs the network or proxy detail
+/// in the same bottom block. A retryable flag alone is not an active retry.
+fn cursor_provider(rows: &[String]) -> Option<(ProviderState, String)> {
+    let has_title = rows.iter().any(|row| {
+        let lower = row.to_lowercase();
+        lower == "connection failed" || lower.contains("connection failed repeatedly")
+    });
+    if !has_title {
+        return None;
+    }
+    let detail = rows.iter().find(|row| {
+        let lower = row.to_lowercase();
+        lower.contains("check your network connection")
+            || lower.contains("network connection")
+            || lower.contains("proxy")
+    })?;
+    Some((ProviderState::Stopped, bounded_quote(detail)))
+}
+
+/// Devin CLI's continue-retrying error (stopped, never an Enter), its backend
+/// stream creation retry grammar (retrying), and its startup connect failure.
+fn devin_provider(rows: &[String]) -> Option<(ProviderState, String)> {
+    for at in (0..rows.len()).rev() {
+        for text in row_variants(rows, at) {
+            let lower = text.to_lowercase();
+            if lower.contains("connection error, send a message to continue retrying") {
+                return Some((ProviderState::Stopped, bounded_quote(&text)));
+            }
+            if lower.starts_with("backend stream creation failed")
+                && lower.contains("attempt")
+                && lower.contains("retrying in")
+            {
+                return Some((ProviderState::Retrying, bounded_quote(&text)));
+            }
+            if lower.starts_with("failed to connect to devin:") {
+                return Some((ProviderState::Stopped, bounded_quote(&text)));
+            }
+        }
+    }
+    None
+}
+
+/// The one-line, versioned stderr marker the pane adapter emits when a provider
+/// incident starts, changes state, or recovers. Core decodes only this shape.
+pub(super) fn provider_marker(active: bool, state: Option<ProviderState>, quote: &str) -> String {
+    let mut value = serde_json::json!({
+        "category": "provider_network",
+        "active": active,
+    });
+    if let Some(state) = state {
+        value["state"] = serde_json::Value::from(state.label());
+        value["quote"] = serde_json::Value::from(bounded_quote(quote));
+    }
+    format!("brgr-pane-diagnostic-v1 {value}")
 }
 
 /// `OpenCode`'s web-search prompt: Esc dismisses. Allow would send queries to
@@ -433,6 +807,24 @@ pub(super) fn resolve(
     let workspace = run.workspace.as_path();
     if status == Some("working") {
         answers.forget();
+        // Passive recognition only: a harness retrying a provider request is
+        // `working` to Herdr, but it must never become an approval or be
+        // answered. No key-producing rule runs here.
+        if let Some(screen) = herdr.screen(pane)
+            && let Screen::Provider { state, quote } = classify_for(&run.kind, &screen, workspace)
+        {
+            trace(
+                paths,
+                run,
+                pane,
+                stage,
+                status,
+                Some(&screen),
+                "provider",
+                false,
+            );
+            return Ok(Screen::Provider { state, quote });
+        }
         trace(paths, run, pane, stage, status, None, "working", false);
         return Ok(Screen::Clear);
     }
@@ -440,7 +832,7 @@ pub(super) fn resolve(
         trace(paths, run, pane, stage, status, None, "unreadable", false);
         return Ok(Screen::Clear); // unreadable is not "changed": keep the answer
     };
-    let outcome = classify(&screen, workspace);
+    let outcome = classify_for(&run.kind, &screen, workspace);
     if let Screen::Resolve { rule, keys } = &outcome {
         let rule = *rule;
         let identity = dialog_identity(rule, &screen, workspace);
@@ -522,6 +914,7 @@ pub(super) fn resolve(
         answers.forget();
         let label = match &outcome {
             Screen::Unknown(_) => "unknown",
+            Screen::Provider { .. } => "provider",
             _ => "clear",
         };
         trace(paths, run, pane, stage, status, Some(&screen), label, false);
@@ -559,6 +952,14 @@ fn trust_selection(screen: &str) -> Option<String> {
                 .any(|cursor| flat.contains(&format!("{cursor}{}", squash(label))))
         })
         .map(squash)
+}
+
+/// Reads and classifies the pane once, passively: no key is pressed.
+/// `None` means Herdr could not read the screen.
+pub(super) fn look(herdr: &Herdr, pane: &str, run: &PaneRunArgs) -> Option<Screen> {
+    herdr
+        .screen(pane)
+        .map(|screen| classify_for(&run.kind, &screen, &run.workspace))
 }
 
 /// What makes a dialog the same one for the hold. Every rule but
@@ -787,12 +1188,42 @@ impl AnswerMemory {
     }
 }
 
+/// How long a recognized provider/network incident may stand, counting the
+/// harness's own retries, before the run fails with the provider named. It is
+/// separate from the unknown-screen deadline: an outage is not an approval,
+/// and ten minutes let the owner restore connectivity while the attempt's own
+/// budget remains the hard upper bound.
+pub(super) const PROVIDER_RECOVERY_LIMIT: Duration = Duration::from_mins(10);
+
+/// The provider recovery limit, shortened for tests only.
+fn provider_deadline() -> Duration {
+    #[cfg(debug_assertions)]
+    if let Some(millis) = std::env::var("BRGR_TEST_PROVIDER_LIMIT_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+    {
+        return Duration::from_millis(millis);
+    }
+    PROVIDER_RECOVERY_LIMIT
+}
+
+/// One provider/network incident. Its start is fixed at first observation;
+/// retry countdowns, attempt numbers and retrying/stopped changes never renew
+/// it.
+struct ProviderEpisode {
+    since: Instant,
+    state: ProviderState,
+    quote: String,
+}
+
 /// Bounds how long a screen no rule covers may stand and counts presses.
 pub(super) struct ScreenWatch {
     kind: String,
     limit: Duration,
+    provider_limit: Duration,
     since: Option<Instant>,
     presses: Vec<(&'static str, u32)>,
+    provider: Option<ProviderEpisode>,
 }
 
 /// How many times one rule may answer the same standing screen before the run
@@ -808,9 +1239,19 @@ impl ScreenWatch {
         Self {
             kind: kind.to_owned(),
             limit,
+            provider_limit: provider_deadline(),
             since: None,
             presses: Vec::new(),
+            provider: None,
         }
+    }
+
+    /// A watch with both deadlines set, for deterministic tests.
+    #[cfg(test)]
+    pub(super) fn with_limits(kind: &str, limit: Duration, provider_limit: Duration) -> Self {
+        let mut watch = Self::with_limit(kind, limit);
+        watch.provider_limit = provider_limit;
+        watch
     }
 
     /// Records a key press for `rule`. Fails when it keeps being needed.
@@ -834,14 +1275,27 @@ impl ScreenWatch {
 
     /// Records a poll. Fails once an unknown screen has stood past the limit.
     pub(super) fn observe(&mut self, screen: &Screen) -> Result<()> {
+        self.observe_at(screen, Instant::now())
+    }
+
+    /// Records a poll at `now`, so time-based tests need no sleeps.
+    pub(super) fn observe_at(&mut self, screen: &Screen, now: Instant) -> Result<()> {
         match screen {
-            Screen::Unknown(text) => self.stuck(text),
+            Screen::Provider { state, quote } => self.provider_seen(*state, quote, now),
+            Screen::Unknown(text) => {
+                // A different dialog is not the incident: it exits provider
+                // handling and gets the unchanged unknown-screen clock.
+                self.provider = None;
+                self.stuck_at(text, now)
+            }
             Screen::Clear => {
+                self.provider = None;
                 self.since = None;
                 self.presses.clear();
                 Ok(())
             }
             Screen::Resolve { .. } | Screen::Answered { .. } => {
+                self.provider = None;
                 self.since = None;
                 Ok(())
             }
@@ -850,7 +1304,18 @@ impl ScreenWatch {
 
     /// Records a poll where Herdr reports `blocked` but no rule answered.
     pub(super) fn observe_blocked(&mut self, screen: Option<&str>) -> Result<()> {
-        self.stuck(&screen.map(head).unwrap_or_default())
+        self.observe_blocked_at(screen, Instant::now())
+    }
+
+    pub(super) fn observe_blocked_at(&mut self, screen: Option<&str>, now: Instant) -> Result<()> {
+        if let Some(screen) = screen
+            && let Screen::Provider { state, quote } =
+                classify_for(&self.kind, screen, Path::new(""))
+        {
+            return self.provider_seen(state, &quote, now);
+        }
+        self.provider = None;
+        self.stuck_at(&screen.map(head).unwrap_or_default(), now)
     }
 
     pub(super) fn reset(&mut self) {
@@ -859,14 +1324,53 @@ impl ScreenWatch {
     }
 
     /// Stops the unknown-screen clock but keeps the press counts, for an
-    /// agent whose screen moved without Herdr saying it works.
+    /// agent whose screen moved without Herdr saying it works. It does not
+    /// recover a provider incident.
     pub(super) fn restart_clock(&mut self) {
         self.since = None;
     }
 
-    fn stuck(&mut self, text: &str) -> Result<()> {
-        let since = *self.since.get_or_insert_with(Instant::now);
-        if since.elapsed() >= self.limit {
+    /// Fresh readable evidence with no active diagnostic and ordinary work or
+    /// readiness restored. Herdr `working` alone is not recovery.
+    pub(super) fn recovered(&mut self) {
+        self.provider = None;
+        self.since = None;
+    }
+
+    pub(super) fn provider_active(&self) -> bool {
+        self.provider.is_some()
+    }
+
+    fn provider_seen(&mut self, state: ProviderState, quote: &str, now: Instant) -> Result<()> {
+        if let Some(episode) = &mut self.provider {
+            episode.state = state;
+            episode.quote = bounded_quote(quote);
+        } else {
+            // The incident clock replaces the unknown-screen clock.
+            self.since = None;
+            self.provider = Some(ProviderEpisode {
+                since: now,
+                state,
+                quote: bounded_quote(quote),
+            });
+        }
+        let episode = self.provider.as_ref().expect("episode was just set");
+        if now.saturating_duration_since(episode.since) >= self.provider_limit {
+            bail!(
+                "the {} provider/network recovery window exhausted after {}s (harness {}); {} {}",
+                self.kind,
+                self.provider_limit.as_secs(),
+                episode.state.label(),
+                LAST_SCREEN,
+                episode.quote
+            );
+        }
+        Ok(())
+    }
+
+    fn stuck_at(&mut self, text: &str, now: Instant) -> Result<()> {
+        let since = *self.since.get_or_insert(now);
+        if now.saturating_duration_since(since) >= self.limit {
             bail!(
                 "the {} agent stayed on a screen no brgr rule answers for {}s: {text}",
                 self.kind,
@@ -2680,5 +3184,450 @@ esac
         assert!(
             trace_line(0, "p", "s", "idle", "unreadable", "clear", false).ends_with("keys=none")
         );
+    }
+
+    // ---- Provider/network screens (issue #417) -------------------------
+
+    fn provider_of(kind: &str, screen: &str) -> (ProviderState, String) {
+        match classify_for(kind, screen, work()) {
+            Screen::Provider { state, quote } => (state, quote),
+            other => panic!("expected a provider screen, got {other:?}"),
+        }
+    }
+
+    fn is_provider(kind: &str, screen: &str) -> bool {
+        matches!(classify_for(kind, screen, work()), Screen::Provider { .. })
+    }
+
+    /// The exact rows issue #417 captured, labelled synthetic: the diagnostic
+    /// and the harness's status footer, not a complete exported pane.
+    const OPENCODE_HEADERS_TIMEOUT: &str = "\
+  Build · grok-4.6 · 1h 0m
+  Error: Timed out waiting for response headers
+";
+
+    #[test]
+    fn opencode_headers_timeout_is_provider_stopped_not_clear() {
+        assert_eq!(
+            provider_of("opencode", OPENCODE_HEADERS_TIMEOUT),
+            (
+                ProviderState::Stopped,
+                "Error: Timed out waiting for response headers".to_owned()
+            )
+        );
+        assert_eq!(
+            classify_for("opencode", OPENCODE_HEADERS_TIMEOUT, work()),
+            Screen::Provider {
+                state: ProviderState::Stopped,
+                quote: "Error: Timed out waiting for response headers".to_owned(),
+            }
+        );
+        // The response-data timeout is the same renderer.
+        assert_eq!(
+            provider_of("opencode", "  Error: Timed out waiting for response data\n").0,
+            ProviderState::Stopped
+        );
+    }
+
+    #[test]
+    fn opencode_retry_countdown_is_provider_retrying() {
+        let retry = "\
+  ⚠ Retrying in 1s · attempt 11 · Timed out waiting for response headers
+  Build · grok-4.6 · 1h 0m
+";
+        assert_eq!(
+            provider_of("opencode", retry),
+            (
+                ProviderState::Retrying,
+                "Retrying in 1s · attempt 11 · Timed out waiting for response headers".to_owned()
+            )
+        );
+        // Retry due and the response-data timeout render the same way.
+        assert_eq!(
+            provider_of(
+                "opencode",
+                "  ⚠ Retry due · attempt 3 · Timed out waiting for response data\n"
+            )
+            .0,
+            ProviderState::Retrying
+        );
+    }
+
+    #[test]
+    fn claude_api_connection_and_provider_errors_are_passive() {
+        for screen in [
+            "  Unable to connect to API. Check your internet connection\n",
+            "  Unable to connect to API: SSL certificate has expired\n",
+            "  API Error: 401 {\"type\":\"error\",\"error\":{\"type\":\"authentication_error\"}}\n",
+            "  API Error: 403 Forbidden\n",
+            "  API Error: 429 rate limit exceeded\n",
+            "  API Error: 500 Internal server error\n",
+            "  API Error: 529 overloaded_error\n",
+        ] {
+            assert!(is_provider("claude", screen), "{screen}");
+        }
+    }
+
+    #[test]
+    fn claude_native_retry_suffix_marks_retrying() {
+        for screen in [
+            "  Unable to connect to API. Check your internet connection · retrying in 3s · attempt 2/5\n",
+            "  Unable to connect to API\n   · will retry in 4s · check your network\n",
+        ] {
+            assert_eq!(
+                provider_of("claude", screen).0,
+                ProviderState::Retrying,
+                "{screen}"
+            );
+        }
+    }
+
+    #[test]
+    fn claude_abort_and_tool_result_errors_are_not_network() {
+        for screen in [
+            "  API Error: 500 Internal server error: Request was aborted\n",
+            "  API Error: 500 tool_result concurrency limit\n",
+            "  API Error: 400 prompt is too long: 250000 tokens\n",
+            "  API Error: 429 rate limit: cancelled by user\n",
+            "  Request was aborted\n",
+        ] {
+            assert!(!is_provider("claude", screen), "{screen}");
+        }
+    }
+
+    #[test]
+    fn codex_reconnect_progress_is_retrying() {
+        for screen in ["  Reconnecting... 2/5\n", "  Reconnecting... (attempt 3)\n"] {
+            assert_eq!(
+                provider_of("codex", screen).0,
+                ProviderState::Retrying,
+                "{screen}"
+            );
+        }
+    }
+
+    #[test]
+    fn codex_final_stream_error_is_provider_stopped() {
+        for screen in [
+            "  stream disconnected before completion: connection reset\n",
+            "  Error while reading the server response: unexpected EOF\n",
+        ] {
+            assert_eq!(
+                provider_of("codex", screen).0,
+                ProviderState::Stopped,
+                "{screen}"
+            );
+        }
+        // Arbitrary connection text is not a model retry.
+        assert!(!is_provider("codex", "  Connection failed: ECONNREFUSED\n"));
+    }
+
+    #[test]
+    fn codex_voice_and_remote_server_reconnects_are_not_model_retries() {
+        for screen in [
+            "  Reconnecting... voice 2/5\n",
+            "  Reconnecting... remote app server 1/3\n",
+        ] {
+            assert!(!is_provider("codex", screen), "{screen}");
+        }
+    }
+
+    #[test]
+    fn cursor_connection_title_requires_native_network_or_proxy_detail() {
+        for screen in [
+            "  Connection failed\n  The connection was interrupted. Please check your network connection and try again.\n",
+            "  Connection failed repeatedly\n  Check your proxy settings.\n",
+        ] {
+            assert_eq!(
+                provider_of("cursor", screen).0,
+                ProviderState::Stopped,
+                "{screen}"
+            );
+        }
+        assert!(!is_provider(
+            "cursor",
+            "  Connection failed\n  Unable to reach the model.\n"
+        ));
+    }
+
+    #[test]
+    fn cursor_retryable_error_is_not_active_retry() {
+        assert!(!is_provider(
+            "cursor",
+            "  Connection failed\n  displayInfo.isRetryable: true\n"
+        ));
+    }
+
+    #[test]
+    fn devin_continue_retrying_error_is_stopped() {
+        assert_eq!(
+            provider_of(
+                "devin",
+                "  Connection error, send a message to continue retrying\n"
+            )
+            .0,
+            ProviderState::Stopped
+        );
+        assert_eq!(
+            provider_of(
+                "devin",
+                "  Failed to connect to Devin: connection refused\n"
+            )
+            .0,
+            ProviderState::Stopped
+        );
+    }
+
+    #[test]
+    fn devin_backend_retry_status_is_retrying() {
+        assert_eq!(
+            provider_of(
+                "devin",
+                "  Backend stream creation failed (attempt 2), retrying in 4s\n"
+            )
+            .0,
+            ProviderState::Retrying
+        );
+    }
+
+    #[test]
+    fn provider_rule_is_scoped_to_harness_and_active_block() {
+        // Another harness's kind is not this grammar.
+        for kind in ["claude", "codex", "cursor", "devin", "other"] {
+            assert!(
+                !is_provider(kind, OPENCODE_HEADERS_TIMEOUT),
+                "{kind} must not inherit the opencode rule"
+            );
+        }
+        // A live approval menu is not an incident.
+        let mixed = "Error: Timed out waiting for response headers\n❯ 1. Retry now\n  2. Exit\n";
+        assert!(!is_provider("opencode", mixed));
+        // An old diagnostic scrolled above the active block is not current.
+        let mut old = String::from("Error: Timed out waiting for response headers\n");
+        for row in 0..20 {
+            old.push_str("  assistant output ");
+            old.push_str(&row.to_string());
+            old.push('\n');
+        }
+        assert!(!is_provider("opencode", &old));
+    }
+
+    #[test]
+    fn quoted_tool_output_and_old_provider_errors_do_not_match() {
+        for screen in [
+            "  The tool prints:\n  ```\n  Error: Timed out waiting for response headers\n  ```\n",
+            "> Error: Timed out waiting for response headers\n",
+            "  The tool prints \"Error: Timed out waiting for response headers\"\n",
+            "  I saw Error: Timed out waiting for response headers in the log\n",
+        ] {
+            assert!(!is_provider("opencode", screen), "{screen:?}");
+        }
+    }
+
+    #[test]
+    fn wrapped_provider_diagnostic_is_bounded() {
+        // One wrapped continuation row inside the diagnostic block is rejoined.
+        assert_eq!(
+            provider_of(
+                "codex",
+                "  Error while reading the server response: connection\n  reset by peer\n"
+            )
+            .0,
+            ProviderState::Stopped
+        );
+        let long = "x".repeat(400);
+        let (state, quote) = provider_of(
+            "codex",
+            &format!("  Error while reading the server response: {long}\n"),
+        );
+        assert_eq!(state, ProviderState::Stopped);
+        assert!(quote.chars().count() <= QUOTE_LIMIT, "{}", quote.len());
+        assert!(!quote.chars().any(char::is_control));
+        // Non-ASCII stays bounded and control-free.
+        let (_, quote) = provider_of(
+            "claude",
+            "  Unable to connect to API: SSL certificate has expired — 证书 ⚠\n",
+        );
+        assert!(quote.chars().count() <= QUOTE_LIMIT);
+        assert!(!quote.chars().any(char::is_control));
+    }
+
+    #[test]
+    fn provider_screen_with_continue_hint_never_resolves() {
+        let screen = "\
+  Error: Timed out waiting for response headers
+  Build · grok-4.6 · 1h 0m
+  Press Enter to continue
+";
+        assert!(is_provider("opencode", screen));
+        let (temp, herdr) = fake_herdr(screen);
+        let (paths, run) = run_args(&temp);
+        let mut answers = AnswerMemory::new();
+        assert!(matches!(
+            resolve(
+                &herdr,
+                "w1:p2",
+                &run,
+                &paths,
+                Some("blocked"),
+                &mut answers,
+                "test",
+            )
+            .unwrap(),
+            Screen::Provider { .. }
+        ));
+        assert!(!temp.path().join("keys").exists());
+        assert!(!log_path(&paths, &run).exists());
+    }
+
+    fn provider_screen() -> Screen {
+        Screen::Provider {
+            state: ProviderState::Retrying,
+            quote: "Timed out waiting for response headers".to_owned(),
+        }
+    }
+
+    #[test]
+    fn provider_incident_survives_unknown_screen_deadline() {
+        let mut watch =
+            ScreenWatch::with_limits("opencode", Duration::from_secs(1), Duration::from_mins(10));
+        let t0 = Instant::now();
+        watch.observe_at(&provider_screen(), t0).unwrap();
+        // Past the unknown-screen deadline, the provider episode is still open
+        // and its own clock has not run out.
+        watch
+            .observe_at(&provider_screen(), t0 + Duration::from_secs(30))
+            .unwrap();
+        assert!(watch.provider_active());
+        assert!(watch.since.is_none(), "the unknown clock never started");
+    }
+
+    #[test]
+    fn provider_retry_changes_do_not_renew_recovery_limit() {
+        let mut watch =
+            ScreenWatch::with_limits("opencode", SCREEN_DEADLINE, Duration::from_mins(1));
+        let t0 = Instant::now();
+        watch.observe_at(&provider_screen(), t0).unwrap();
+        for second in 1..60 {
+            watch
+                .observe_at(&provider_screen(), t0 + Duration::from_secs(second))
+                .unwrap();
+        }
+        let error = watch
+            .observe_at(&provider_screen(), t0 + Duration::from_mins(1))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("provider/network recovery window exhausted")
+                && error.contains("harness retrying")
+                && error.contains(LAST_SCREEN),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn retry_to_stopped_keeps_original_limit() {
+        let mut watch =
+            ScreenWatch::with_limits("opencode", SCREEN_DEADLINE, Duration::from_mins(1));
+        let t0 = Instant::now();
+        watch.observe_at(&provider_screen(), t0).unwrap();
+        let stopped = Screen::Provider {
+            state: ProviderState::Stopped,
+            quote: "Error: Timed out waiting for response headers".to_owned(),
+        };
+        watch
+            .observe_at(&stopped, t0 + Duration::from_secs(59))
+            .unwrap();
+        let error = watch
+            .observe_at(&stopped, t0 + Duration::from_mins(1))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("harness stopped"), "{error}");
+    }
+
+    #[test]
+    fn working_status_and_unreadable_screen_do_not_reset_provider_incident() {
+        let mut watch =
+            ScreenWatch::with_limits("opencode", SCREEN_DEADLINE, Duration::from_mins(5));
+        let t0 = Instant::now();
+        watch.observe_at(&provider_screen(), t0).unwrap();
+        // Herdr `working` and an unreadable screen only touch the unknown clock.
+        watch.reset();
+        watch.restart_clock();
+        assert!(watch.provider_active());
+        watch
+            .observe_at(&provider_screen(), t0 + Duration::from_secs(299))
+            .unwrap();
+        assert!(watch.provider_active());
+    }
+
+    #[test]
+    fn real_recovery_clears_provider_incident() {
+        let mut watch =
+            ScreenWatch::with_limits("opencode", SCREEN_DEADLINE, Duration::from_mins(10));
+        let t0 = Instant::now();
+        watch.observe_at(&provider_screen(), t0).unwrap();
+        watch
+            .observe_at(&Screen::Clear, t0 + Duration::from_secs(1))
+            .unwrap();
+        assert!(!watch.provider_active());
+        // The explicit recovery path behaves the same.
+        watch.observe_at(&provider_screen(), t0).unwrap();
+        watch.recovered();
+        assert!(!watch.provider_active());
+    }
+
+    #[test]
+    fn unrelated_unknown_screen_keeps_three_minute_deadline() {
+        let mut watch =
+            ScreenWatch::with_limits("opencode", Duration::from_mins(3), Duration::from_mins(10));
+        let t0 = Instant::now();
+        watch.observe_at(&provider_screen(), t0).unwrap();
+        // A different dialog exits provider handling, without ten-minute grace.
+        watch
+            .observe_at(
+                &Screen::Unknown("Choose a theme".to_owned()),
+                t0 + Duration::from_secs(1),
+            )
+            .unwrap();
+        assert!(!watch.provider_active());
+        let error = watch
+            .observe_at(
+                &Screen::Unknown("Choose a theme".to_owned()),
+                t0 + Duration::from_secs(181),
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("no brgr rule answers"), "{error}");
+    }
+
+    #[test]
+    fn provider_screen_never_sends_keys_or_writes_screen_key_log() {
+        let screen = "\
+  Error: Timed out waiting for response headers
+  Build · grok-4.6 · 1h 0m
+  Press Enter to continue
+";
+        for status in ["blocked", "idle", "unknown", "working"] {
+            let (temp, herdr) = fake_herdr(screen);
+            let (paths, run) = run_args(&temp);
+            let mut answers = AnswerMemory::new();
+            let outcome = resolve(
+                &herdr,
+                "w1:p2",
+                &run,
+                &paths,
+                Some(status),
+                &mut answers,
+                "test",
+            )
+            .unwrap();
+            assert!(
+                matches!(outcome, Screen::Provider { .. }),
+                "{status}: {outcome:?}"
+            );
+            assert!(!temp.path().join("keys").exists(), "{status} pressed a key");
+            assert!(!log_path(&paths, &run).exists(), "{status} logged a key");
+        }
     }
 }

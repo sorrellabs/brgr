@@ -1437,6 +1437,7 @@ PY
     echo idle > "$d/state"
     echo '{"result":{"agent":{"agent":"claude","agent_status":"idle","pane_id":"w9:p2"}}}';;
   'agent prompt')
+    : > "$d/prompted"
     if [ -e "$d/prompt-refused" ]; then
       echo '{"error":{"code":"agent_not_ready","message":"agent w9:p2 is not an active named agent"}}' >&2
       exit 1
@@ -1485,9 +1486,42 @@ PY
       exit 0
     fi
     s=$(/bin/cat "$d/state")
+    if [ -e "$d/provider" ] && [ ! -e "$d/provider-recovered" ] \
+       && { [ -e "$d/prompted" ] || [ -e "$d/provider-at-startup" ]; }; then
+      if [ -e "$d/provider-recover-after" ]; then
+        n=$(/bin/cat "$d/provider-tick" 2>/dev/null || echo 0)
+        n=$((n + 1)); echo "$n" > "$d/provider-tick"
+        if [ "$n" -gt "$(/bin/cat "$d/provider-recover-after")" ]; then
+          : > "$d/provider-recovered"
+        fi
+      fi
+      if [ ! -e "$d/provider-recovered" ]; then
+        if [ -e "$d/provider-idle" ]; then s=idle
+        elif [ -e "$d/provider-working" ]; then s=working
+        elif [ -e "$d/provider-unknown" ]; then s=unknown
+        else s=blocked; fi
+      fi
+    fi
     printf '{"result":{"agent":{"agent":"claude","agent_status":"%s","pane_id":"w9:p2"}}}\n' "$s"
     if [ "$s" = working ]; then echo idle > "$d/state"; fi;;
   'pane read')
+    if [ -e "$d/provider" ] && [ ! -e "$d/provider-recovered" ] \
+       && { [ -e "$d/prompted" ] || [ -e "$d/provider-at-startup" ]; }; then
+      if [ -e "$d/provider-flip" ]; then
+        n=$(/bin/cat "$d/provider-flip-tick" 2>/dev/null || echo 0)
+        n=$((n + 1)); echo "$n" > "$d/provider-flip-tick"
+        if [ "$n" -le 3 ]; then
+          printf '%s\n' "⚠ Retrying in ${n}s · attempt $n · Timed out waiting for response headers" 'Build · grok-4.6 · 1h 0m'
+        else
+          printf '%s\n' 'Build · grok-4.6 · 1h 0m' 'Error: Timed out waiting for response headers'
+        fi
+      elif [ -e "$d/provider-retry" ]; then
+        printf '%s\n' '⚠ Retrying in 1s · attempt 11 · Timed out waiting for response headers' 'Build · grok-4.6 · 1h 0m'
+      else
+        printf '%s\n' 'Build · grok-4.6 · 1h 0m' 'Error: Timed out waiting for response headers'
+      fi
+      exit 0
+    fi
     if [ -e "$d/dialog" ] && [ -s "$d/paste" ]; then
       printf '%s\n' 'Pick a region' '› 1. us-east' '  2. eu-west'
       exit 0
@@ -2203,6 +2237,260 @@ fn an_unclassified_agent_stuck_on_an_unknown_dialog_fails_on_the_screen_deadline
         calls.matches("pane send-keys").count(),
         1,
         "only the prompt's own Enter may be sent: {calls}"
+    );
+}
+
+/// Every message the worker side sent its owner for this task, with whether it
+/// was later withdrawn.
+fn task_message_bodies(fixture: &PaneFixture, task: &str) -> Vec<(String, bool)> {
+    let store = brgr_store::Store::open(fixture.home.join("store")).unwrap();
+    let task_id: brgr_protocol::TaskId = task.parse().unwrap();
+    let attempt = store.latest_message_attempt(task_id).unwrap();
+    store
+        .task_messages(
+            task_id,
+            attempt,
+            brgr_store::MessageDirection::WorkerToOwner,
+            true,
+        )
+        .unwrap()
+        .into_iter()
+        .map(|message| (message.body, message.acknowledged))
+        .collect()
+}
+
+fn write_provider_flags(fixture: &PaneFixture, flags: &[&str]) {
+    fs::create_dir_all(&fixture.state).unwrap();
+    for flag in flags {
+        fs::write(fixture.state.join(flag), "").unwrap();
+    }
+}
+
+/// A provider/network screen is not an approval. It is reported as a model or
+/// network failure with its quoted diagnostic, and nothing is pressed on it.
+#[test]
+fn blocked_provider_sends_network_note_not_approval() {
+    let fixture = pane_fixture();
+    write_provider_flags(&fixture, &["no-report", "provider"]);
+    let ran = fixture.run_on_with_env(
+        "local.opencode",
+        &[],
+        &[
+            ("BRGR_TEST_PROVIDER_LIMIT_MS", "1500"),
+            ("BRGR_TEST_REPORT_GRACE_MS", "600000"),
+        ],
+    );
+    assert_eq!(ran["outcome"], "lost", "{ran}");
+    let error = ran["error"].as_str().unwrap_or_default();
+    assert!(error.contains("provider/network"), "{error}");
+    assert!(
+        error.contains("Timed out waiting for response headers"),
+        "{error}"
+    );
+    assert!(!error.contains("waiting for an approval"), "{error}");
+    let calls = fixture.state("calls.log");
+    assert!(
+        !calls.contains("pane send-keys"),
+        "nothing may be pressed on a provider screen: {calls}"
+    );
+    let task = ran["task_id"].as_str().unwrap();
+    let bodies: String = task_message_bodies(&fixture, task)
+        .into_iter()
+        .map(|(body, _)| body)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(bodies.contains("provider/network"), "{bodies}");
+    assert!(
+        bodies.contains("Timed out waiting for response headers"),
+        "{bodies}"
+    );
+    assert!(
+        !bodies.contains("waiting for an approval"),
+        "an approval note was sent: {bodies}"
+    );
+}
+
+/// An unclassified Herdr status must not hide a provider diagnostic behind the
+/// stillness filter, and it is never the unknown screen.
+#[test]
+fn retrying_unclassified_provider_is_seen_before_stillness() {
+    let fixture = pane_fixture();
+    write_provider_flags(
+        &fixture,
+        &[
+            "no-report",
+            "provider",
+            "provider-unknown",
+            "provider-retry",
+        ],
+    );
+    let ran = fixture.run_on_with_env(
+        "local.opencode",
+        &[],
+        &[
+            ("BRGR_TEST_PROVIDER_LIMIT_MS", "1500"),
+            ("BRGR_TEST_REPORT_GRACE_MS", "600000"),
+        ],
+    );
+    assert_eq!(ran["outcome"], "lost", "{ran}");
+    let error = ran["error"].as_str().unwrap_or_default();
+    assert!(error.contains("provider/network"), "{error}");
+    assert!(!error.contains("no brgr rule answers"), "{error}");
+    assert!(
+        !fixture.state("calls.log").contains("pane send-keys"),
+        "{}",
+        fixture.state("calls.log")
+    );
+}
+
+/// An idle provider error gets no report reminder and no mailbox input.
+#[test]
+fn idle_provider_gets_no_report_reminder_or_mailbox_input() {
+    let fixture = pane_fixture();
+    write_provider_flags(&fixture, &["no-report", "provider", "provider-idle"]);
+    let ran = fixture.run_on_with_env(
+        "local.opencode",
+        &[],
+        &[
+            ("BRGR_TEST_PROVIDER_LIMIT_MS", "1500"),
+            ("BRGR_TEST_REPORT_GRACE_MS", "200"),
+        ],
+    );
+    assert_eq!(ran["outcome"], "lost", "{ran}");
+    let error = ran["error"].as_str().unwrap_or_default();
+    assert!(error.contains("provider/network"), "{error}");
+    assert!(
+        !error.contains("finished without writing its report"),
+        "{error}"
+    );
+    let calls = fixture.state("calls.log");
+    assert_eq!(calls.matches("agent prompt").count(), 1, "{calls}");
+    assert!(!calls.contains("pane send-text"), "{calls}");
+    assert!(!calls.contains("pane send-keys"), "{calls}");
+}
+
+/// A provider error during startup is not a prompt the harness may swallow.
+#[test]
+fn startup_provider_does_not_accept_first_prompt() {
+    let fixture = pane_fixture();
+    write_provider_flags(&fixture, &["provider", "provider-at-startup"]);
+    let ran = fixture.run_on_with_env(
+        "local.opencode",
+        &[],
+        &[
+            ("BRGR_TEST_PROVIDER_LIMIT_MS", "1500"),
+            ("BRGR_TEST_REPORT_GRACE_MS", "600000"),
+        ],
+    );
+    assert_eq!(ran["outcome"], "lost", "{ran}");
+    let error = ran["error"].as_str().unwrap_or_default();
+    assert!(error.contains("provider/network"), "{error}");
+    let calls = fixture.state("calls.log");
+    assert!(!calls.contains("agent prompt"), "{calls}");
+    assert!(!calls.contains("pane send-text"), "{calls}");
+}
+
+/// Retrying to stopped is one transition note, not one per countdown change,
+/// and the terminal reason names the stopped harness.
+#[test]
+fn provider_attention_transitions_replace_notes_without_spam() {
+    let fixture = pane_fixture();
+    write_provider_flags(&fixture, &["no-report", "provider", "provider-flip"]);
+    let ran = fixture.run_on_with_env(
+        "local.opencode",
+        &[],
+        &[
+            ("BRGR_TEST_PROVIDER_LIMIT_MS", "6000"),
+            ("BRGR_TEST_REPORT_GRACE_MS", "600000"),
+        ],
+    );
+    assert_eq!(ran["outcome"], "lost", "{ran}");
+    let error = ran["error"].as_str().unwrap_or_default();
+    assert!(error.contains("harness stopped"), "{error}");
+    let task = ran["task_id"].as_str().unwrap();
+    let notes: Vec<String> = task_message_bodies(&fixture, task)
+        .into_iter()
+        .map(|(body, _)| body)
+        .filter(|body| body.contains("provider/network"))
+        .collect();
+    assert_eq!(
+        notes.len(),
+        2,
+        "expected one retrying and one stopped note: {notes:?}"
+    );
+    assert!(notes.iter().any(|note| note.contains("is retrying")));
+    assert!(
+        notes
+            .iter()
+            .any(|note| note.contains("has stopped retrying"))
+    );
+    assert!(
+        !notes
+            .iter()
+            .any(|note| note.contains("waiting for an approval")),
+        "{notes:?}"
+    );
+    assert!(
+        !fixture.state("calls.log").contains("pane send-keys"),
+        "{}",
+        fixture.state("calls.log")
+    );
+}
+
+/// A provider incident is cleared by fresh screen evidence, and the run then
+/// finishes normally: the report the worker already wrote is sealed.
+#[test]
+fn provider_recovery_allows_existing_run_to_finish() {
+    let fixture = pane_fixture();
+    write_provider_flags(&fixture, &["no-seal", "provider", "provider-recover-after"]);
+    fs::write(fixture.state.join("provider-recover-after"), "1").unwrap();
+    let ran = fixture.run_on_with_env(
+        "local.opencode",
+        &[],
+        &[("BRGR_TEST_REPORT_GRACE_MS", "200")],
+    );
+    assert_eq!(ran["outcome"], "candidate", "{ran}");
+    assert!(
+        !fixture.state("calls.log").contains("pane send-keys"),
+        "{}",
+        fixture.state("calls.log")
+    );
+}
+
+/// A withdrawn transient note is acknowledged at terminal exit; the failure
+/// result itself stays unacknowledged for the owner.
+#[test]
+fn provider_terminal_exit_withdraws_transient_note_not_failure_ack() {
+    let fixture = pane_fixture();
+    write_provider_flags(&fixture, &["no-report", "provider"]);
+    let ran = fixture.run_on_with_env(
+        "local.opencode",
+        &[],
+        &[
+            ("BRGR_TEST_PROVIDER_LIMIT_MS", "1500"),
+            ("BRGR_TEST_REPORT_GRACE_MS", "600000"),
+        ],
+    );
+    assert_eq!(ran["outcome"], "lost", "{ran}");
+    let task = ran["task_id"].as_str().unwrap();
+    let notes = task_message_bodies(&fixture, task);
+    let provider_notes: Vec<_> = notes
+        .iter()
+        .filter(|(body, _)| body.contains("provider/network"))
+        .collect();
+    assert!(!provider_notes.is_empty(), "{notes:?}");
+    assert!(
+        provider_notes.iter().all(|(_, acknowledged)| *acknowledged),
+        "a transient note outlived the run: {provider_notes:?}"
+    );
+    let store = brgr_store::Store::open(fixture.home.join("store")).unwrap();
+    let task_id: brgr_protocol::TaskId = task.parse().unwrap();
+    let owner = store.task(task_id).unwrap().owner_id;
+    let inbox = store.inbox(&owner, false).unwrap();
+    assert!(
+        inbox.iter().any(|item| !item.acknowledged
+            && item.result.outcome == brgr_protocol::TerminalOutcome::Lost),
+        "the failure result must stay unacknowledged: {inbox:?}"
     );
 }
 

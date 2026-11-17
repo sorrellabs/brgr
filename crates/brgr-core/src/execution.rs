@@ -217,8 +217,20 @@ pub const AGENT_GAVE_NO_REPORT_EXIT: i32 = 3;
 pub(crate) fn delegated_lost_reason(output: Option<&brgr_runner::ExecutionOutput>) -> String {
     let reason = "the Herdr-backed worker did not provide a valid final result";
     // A run stopped at its deadline leaves whatever the adapter last printed,
-    // which says nothing about why it stopped.
+    // which says nothing about why it stopped. The one exception is the
+    // adapter's own provider/network diagnostic: the pane was still stuck on a
+    // harness retrying or stopped on a provider error, not on an approval.
     if output.is_some_and(|output| output.timed_out) {
+        if let Some(diagnostic) = output
+            .and_then(|output| last_pane_diagnostic(&output.stderr))
+            .filter(|diagnostic| diagnostic.active)
+        {
+            return format!(
+                "{reason}: the attempt deadline elapsed while the harness had a provider/network \
+                 problem ({}); last screen: {}",
+                diagnostic.state, diagnostic.quote
+            );
+        }
         return format!("{reason}: the attempt deadline elapsed");
     }
     match output.and_then(|output| last_stderr_line(&output.stderr)) {
@@ -233,7 +245,7 @@ pub(crate) fn last_stderr_line(stderr: &[u8]) -> Option<String> {
         .lines()
         .rev()
         .map(str::trim)
-        .find(|line| !line.is_empty())?;
+        .find(|line| !line.is_empty() && !is_pane_diagnostic(line))?;
     let line = line.strip_prefix("Error: ").unwrap_or(line);
     Some(
         line.chars()
@@ -241,6 +253,64 @@ pub(crate) fn last_stderr_line(stderr: &[u8]) -> Option<String> {
             .take(300)
             .collect(),
     )
+}
+
+/// The adapter's versioned diagnostic marker. It is an internal stderr
+/// convention, never pane text, and its quote is untrusted.
+pub(crate) const PANE_DIAGNOSTIC_PREFIX: &str = "brgr-pane-diagnostic-v1 ";
+const PANE_DIAGNOSTIC_LINE_LIMIT: usize = 1024;
+const PANE_DIAGNOSTIC_QUOTE_LIMIT: usize = 300;
+
+fn is_pane_diagnostic(line: &str) -> bool {
+    line.starts_with(PANE_DIAGNOSTIC_PREFIX)
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct PaneDiagnostic {
+    active: bool,
+    state: String,
+    quote: String,
+}
+
+/// The last well-formed adapter diagnostic in stderr. Only the adapter's own
+/// marker decodes; malformed, oversized or unknown shapes are ignored.
+fn last_pane_diagnostic(stderr: &[u8]) -> Option<PaneDiagnostic> {
+    String::from_utf8_lossy(stderr)
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix(PANE_DIAGNOSTIC_PREFIX))
+        .filter(|json| json.len() <= PANE_DIAGNOSTIC_LINE_LIMIT)
+        .filter_map(decode_pane_diagnostic)
+        .next_back()
+}
+
+fn decode_pane_diagnostic(json: &str) -> Option<PaneDiagnostic> {
+    let value: serde_json::Value = serde_json::from_str(json).ok()?;
+    if value.get("category").and_then(serde_json::Value::as_str) != Some("provider_network") {
+        return None;
+    }
+    let active = value.get("active")?.as_bool()?;
+    if !active {
+        return Some(PaneDiagnostic {
+            active: false,
+            state: String::new(),
+            quote: String::new(),
+        });
+    }
+    let state = value.get("state")?.as_str()?;
+    if !matches!(state, "retrying" | "stopped") {
+        return None;
+    }
+    let quote = value.get("quote")?.as_str()?;
+    let quote: String = quote
+        .chars()
+        .filter(|character| !character.is_control())
+        .take(PANE_DIAGNOSTIC_QUOTE_LIMIT)
+        .collect();
+    Some(PaneDiagnostic {
+        active: true,
+        state: state.to_owned(),
+        quote,
+    })
 }
 
 pub(crate) fn finish_execution(

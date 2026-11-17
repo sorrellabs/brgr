@@ -730,7 +730,21 @@ pub(super) fn send_first_prompt(
     retry_unsent(
         SHELL_READY,
         SHELL_POLL,
-        || send_prompt(herdr, name, pane, run, text, paths),
+        || {
+            // Never type into a pane that shows the harness's own
+            // provider/network error. It is not an approval and takes no key.
+            if let Some(screen) = herdr.screen(pane)
+                && matches!(
+                    screens::classify_for(&run.kind, &screen, &run.workspace),
+                    Screen::Provider { .. }
+                )
+            {
+                return Err(
+                    Unsent("native TUI is showing a provider/network error".to_owned()).into(),
+                );
+            }
+            send_prompt(herdr, name, pane, run, text, paths)
+        },
         || {
             let status = herdr.status(pane).ok();
             answer_between_attempts(
@@ -764,6 +778,13 @@ fn answer_between_attempts(
     let outcome = screens::resolve(herdr, pane, run, paths, status, answers, stage)?;
     match &outcome {
         Screen::Resolve { rule, .. } => watch.pressed(rule)?,
+        Screen::Provider { state, quote } => watch.observe_at(
+            &Screen::Provider {
+                state: *state,
+                quote: quote.clone(),
+            },
+            Instant::now(),
+        )?,
         Screen::Unknown(text) => watch.observe(&Screen::Unknown(text.clone()))?,
         Screen::Clear => watch.reset(),
         Screen::Answered { .. } => {}
@@ -771,6 +792,7 @@ fn answer_between_attempts(
     Ok(outcome)
 }
 
+#[allow(clippy::too_many_lines)]
 pub(super) fn start_native(
     herdr: &Herdr,
     pane: &str,
@@ -807,6 +829,7 @@ pub(super) fn start_native(
         thread::sleep(SHELL_POLL);
     }
     let mut announced = false;
+    let mut attention = Attention::None;
     let mut watch = ScreenWatch::new(&run.kind);
     let mut settle = ReadySettle::default();
     loop {
@@ -823,13 +846,28 @@ pub(super) fn start_native(
             answers,
             "start-native",
         )? {
+            Screen::Provider { state, quote } => {
+                note_provider(notices, run, pane, state, &quote, &mut attention);
+                settle.reset();
+                watch.observe_at(
+                    &Screen::Provider {
+                        state,
+                        quote: quote.clone(),
+                    },
+                    Instant::now(),
+                )?;
+                thread::sleep(POLL);
+                continue;
+            }
             Screen::Resolve { rule, .. } => {
+                recover_provider(notices, &mut attention);
                 watch.pressed(rule)?;
                 settle.reset();
                 thread::sleep(POLL);
                 continue;
             }
             Screen::Unknown(text) => {
+                recover_provider(notices, &mut attention);
                 settle.reset();
                 if !announced {
                     notices.tell(&run.kind, pane, &format!("The {} agent is on a screen no brgr rule answers: {text}. Use brgr input if it needs a key.", run.kind));
@@ -837,8 +875,12 @@ pub(super) fn start_native(
                 }
                 watch.observe(&Screen::Unknown(text))?;
             }
-            Screen::Clear => watch.reset(),
+            Screen::Clear => {
+                recover_provider(notices, &mut attention);
+                watch.reset();
+            }
             Screen::Answered { .. } => {
+                recover_provider(notices, &mut attention);
                 settle.reset();
                 thread::sleep(POLL);
                 continue;

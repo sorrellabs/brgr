@@ -1535,6 +1535,51 @@ mod completion_batch_tests {
     }
 
     #[test]
+    fn provider_failure_push_names_the_network_with_its_quote() {
+        let (result_id, task_id) = sample_ids();
+        let reason = "the Herdr-backed worker did not provide a valid final result: the opencode provider/network recovery window exhausted after 600s (harness retrying); last screen: Timed out waiting for response headers";
+        let single = completion_body(&[NoticeEntry {
+            result_id,
+            task_id,
+            outcome: "lost",
+            reason: Some(reason.to_owned()),
+        }]);
+        let parsed: Value = serde_json::from_str(single.trim_start_matches("FROM BRGR\n")).unwrap();
+        assert_eq!(parsed["type"], "brgr_failure");
+        assert_eq!(parsed["outcome"], "lost");
+        let delivered = parsed["reason"].as_str().unwrap();
+        assert!(
+            delivered.contains("provider/network")
+                && delivered.contains("last screen: Timed out waiting for response headers"),
+            "{delivered}"
+        );
+        // A batched notice keeps the wording and its bounded quote.
+        let other = ResultId::from_str("33333333-3333-4333-8333-333333333333").unwrap();
+        let batch = completion_body(&[
+            NoticeEntry {
+                result_id,
+                task_id,
+                outcome: "candidate",
+                reason: None,
+            },
+            NoticeEntry {
+                result_id: other,
+                task_id,
+                outcome: "lost",
+                reason: Some(reason.to_owned()),
+            },
+        ]);
+        let parsed: Value = serde_json::from_str(batch.trim_start_matches("FROM BRGR\n")).unwrap();
+        let delivered = parsed["completions"][1]["reason"].as_str().unwrap();
+        assert!(
+            delivered.contains("provider/network")
+                && delivered.contains("Timed out waiting for response headers"),
+            "{delivered}"
+        );
+        assert!(delivered.chars().count() <= 300, "{delivered}");
+    }
+
+    #[test]
     fn a_pane_prompted_moments_ago_counts_as_busy() {
         let now = 10_000_u128;
         assert!(recently_prompted(Some(now - 500), now));

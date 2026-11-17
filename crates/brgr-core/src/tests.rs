@@ -1177,3 +1177,99 @@ fn sealed_files(root: &std::path::Path) -> Vec<PathBuf> {
     }
     files
 }
+
+fn provider_output(stderr: &str, timed_out: bool) -> ExecutionOutput {
+    ExecutionOutput {
+        exit_code: None,
+        stdout: Vec::new(),
+        stderr: stderr.as_bytes().to_vec(),
+        result: Vec::new(),
+        observed_model: None,
+        timed_out,
+        cancelled: false,
+        output_truncated: false,
+        elapsed: Duration::from_hours(1),
+        slept_seconds: None,
+    }
+}
+
+const ACTIVE_PROVIDER_MARKER: &str = "brgr-pane-diagnostic-v1 {\"category\":\"provider_network\",\"active\":true,\"state\":\"retrying\",\"quote\":\"Timed out waiting for response headers\"}\n";
+
+#[test]
+fn delegated_provider_timeout_retains_active_diagnostic() {
+    let stderr = format!("brgr pane mode · prompted\n{ACTIVE_PROVIDER_MARKER}");
+    let reason = delegated_lost_reason(Some(&provider_output(&stderr, true)));
+    assert!(reason.contains("provider/network"), "{reason}");
+    assert!(reason.contains("retrying"), "{reason}");
+    assert!(
+        reason.contains("last screen: Timed out waiting for response headers"),
+        "{reason}"
+    );
+}
+
+#[test]
+fn recovered_or_malformed_provider_marker_does_not_taint_timeout() {
+    let generic = brgr_runner::ExecutionOutput {
+        stderr: b"brgr pane mode \xc2\xb7 prompted\n".to_vec(),
+        timed_out: true,
+        ..provider_output("", true)
+    };
+    let expected = delegated_lost_reason(Some(&generic));
+    assert!(
+        expected.ends_with("the attempt deadline elapsed"),
+        "{expected}"
+    );
+    for stderr in [
+        "brgr-pane-diagnostic-v1 {\"category\":\"provider_network\",\"active\":false}\n".to_owned(),
+        "brgr-pane-diagnostic-v1 {not json}\n".to_owned(),
+        "brgr-pane-diagnostic-v1 {\"category\":\"provider_network\",\"active\":true,\"state\":\"unknown\",\"quote\":\"x\"}\n".to_owned(),
+        "brgr-pane-diagnostic-v1 {\"category\":\"other\",\"active\":true,\"state\":\"retrying\",\"quote\":\"x\"}\n".to_owned(),
+        format!("{}{}", ACTIVE_PROVIDER_MARKER, "brgr-pane-diagnostic-v1 {\"category\":\"provider_network\",\"active\":false}\n"),
+        "brgr pane mode · prompted\n".to_owned(),
+    ] {
+        assert_eq!(
+            delegated_lost_reason(Some(&provider_output(&stderr, true))),
+            expected,
+            "{stderr}"
+        );
+    }
+    // A marker line alone is never quoted as the reason of an ordinary failure.
+    let marker_only = provider_output(ACTIVE_PROVIDER_MARKER, false);
+    assert_eq!(
+        delegated_lost_reason(Some(&marker_only)),
+        "the Herdr-backed worker did not provide a valid final result"
+    );
+}
+
+#[test]
+fn provider_error_remains_lost_with_unresolved_effects_and_no_retry() {
+    let root = tempfile::tempdir().unwrap();
+    let mut store = Store::open(root.path()).unwrap();
+    let spec = task_spec(TaskId::new(), 1);
+    store.record_task(&spec, "provider-lost").unwrap();
+    let (mut attempt, mut sequence) = running_attempt(&store, &spec);
+    let mut manifest = one_shot_manifest();
+    manifest.launch.mode = ExecutionMode::DelegatedExternal;
+    let stderr = format!("brgr pane mode · prompted\n{ACTIVE_PROVIDER_MARKER}");
+    let output = provider_output(&stderr, true);
+    let retryable = is_retryable_spawn_failure(&Ok(output.clone()));
+    let result = finish_execution(
+        &store,
+        &spec,
+        &manifest,
+        &mut attempt,
+        &mut sequence,
+        None,
+        Ok(output),
+    )
+    .unwrap();
+    assert_eq!(result.outcome, TerminalOutcome::Lost);
+    assert!(!retryable, "a provider timeout is not a spawn retry");
+    assert!(!result.unresolved_effects.is_empty());
+    let error = result.error.unwrap_or_default();
+    assert!(error.contains("provider/network"), "{error}");
+    assert!(
+        error.contains("last screen: Timed out waiting for response headers"),
+        "{error}"
+    );
+}
