@@ -32,6 +32,21 @@ jobs:
       # workspace must fail here, before a release is tagged and half published.
       - run: cargo package --workspace --locked
 
+  # Windows compile gate (#420). The workspace does not compile for Windows yet,
+  # so the job is allowed to fail while still listing the errors on every pull
+  # request. To make it required once `cargo check` passes: remove
+  # `continue-on-error`, then add `windows` to the branch protection checks.
+  # Tests and release gating come later with the generic-process work.
+  windows:
+    runs-on: windows-2025
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.95.0 --profile minimal
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - run: cargo check --workspace --all-targets --all-features --locked
+
   # On every push to main. A release tag waits for this job to pass on its commit
   # before anything is published.
   macos:
