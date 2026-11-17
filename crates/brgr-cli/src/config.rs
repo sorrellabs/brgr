@@ -30,6 +30,7 @@ pub(crate) const PANE_NAME_PLACEHOLDERS: [&str; 6] = [
 pub enum WorkerPlacement {
     #[default]
     Adjacent,
+    Below,
     Tab,
 }
 
@@ -260,8 +261,9 @@ impl Config {
             "worker-placement" if harness.is_none() => {
                 self.herdr.worker_placement = match value {
                     "adjacent" => WorkerPlacement::Adjacent,
+                    "below" => WorkerPlacement::Below,
                     "tab" => WorkerPlacement::Tab,
-                    _ => bail!("worker-placement must be adjacent or tab"),
+                    _ => bail!("worker-placement must be adjacent, below or tab"),
                 }
             }
             _ => bail!("unknown calling option {key}"),
@@ -676,11 +678,34 @@ mod tests {
         config.reset_pane_name_template();
         assert_eq!(config.herdr.pane_name_template, DEFAULT_PANE_NAME_TEMPLATE);
     }
+
+    #[test]
+    fn below_placement_loads_and_round_trips() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("config.toml");
+        fs::write(&path, "[herdr]\nworker_placement = 'below'\n").unwrap();
+        assert_eq!(
+            Config::load(&path).unwrap().herdr.worker_placement,
+            WorkerPlacement::Below
+        );
+        let mut config = Config::default();
+        config.set("worker-placement", "below", None).unwrap();
+        assert_eq!(config.herdr.worker_placement, WorkerPlacement::Below);
+        let error = config
+            .set("worker-placement", "elsewhere", None)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("adjacent") && error.contains("below") && error.contains("tab"),
+            "{error}"
+        );
+    }
 }
 
 #[cfg(test)]
 mod serialize_tests {
     use super::*;
+    use serde::Deserialize;
 
     /// Earlier releases refuse unknown tables and share this file, so saving an
     /// unrelated setting must not add the tables they do not know.
@@ -694,5 +719,45 @@ mod serialize_tests {
         config.issues.auto_file = true;
         let text = toml::to_string_pretty(&config).unwrap();
         assert!(text.contains("[issues]"), "{text}");
+    }
+
+    /// Frozen copy of the 2.15.24 enum. A new default value would make older
+    /// releases refuse a freshly written config.toml.
+    #[test]
+    fn only_the_below_choice_is_unreadable_by_an_older_release() {
+        #[derive(Debug, Deserialize)]
+        struct OldFile {
+            herdr: OldHerdr,
+        }
+        #[derive(Debug, Deserialize)]
+        struct OldHerdr {
+            #[serde(default)]
+            worker_placement: OldWorkerPlacement,
+        }
+        #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Deserialize)]
+        #[serde(rename_all = "snake_case")]
+        enum OldWorkerPlacement {
+            #[default]
+            Adjacent,
+            Tab,
+        }
+
+        let default_text = toml::to_string_pretty(&Config::default()).unwrap();
+        let parsed: OldFile = toml::from_str(&default_text).unwrap();
+        assert_eq!(parsed.herdr.worker_placement, OldWorkerPlacement::Adjacent);
+
+        let mut tab = Config::default();
+        tab.herdr.worker_placement = WorkerPlacement::Tab;
+        let tab_text = toml::to_string_pretty(&tab).unwrap();
+        let parsed: OldFile = toml::from_str(&tab_text).unwrap();
+        assert_eq!(parsed.herdr.worker_placement, OldWorkerPlacement::Tab);
+
+        let mut below = Config::default();
+        below.herdr.worker_placement = WorkerPlacement::Below;
+        let below_text = toml::to_string_pretty(&below).unwrap();
+        assert!(
+            toml::from_str::<OldFile>(&below_text).is_err(),
+            "{below_text}"
+        );
     }
 }

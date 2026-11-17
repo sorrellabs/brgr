@@ -13,6 +13,15 @@
 //! When a worker closes, its neighbour takes its space, so the rest are made
 //! equal again.
 //!
+//! With `worker-placement = below`, the first worker splits the caller down
+//! and later workers split the last (rightmost) worker of that row right, so
+//! several heads can share a tab, each above its own row. A full row, or a
+//! caller too narrow or too short to halve, opens the next worker in a new
+//! tab; there is no second row. Resizes are only `right` on a worker that has
+//! a row-mate to its right and `left` on a worker that has one to its left.
+//! `up`, `down`, `right` on the last of a row, `left` on the first, and any
+//! resize of the caller would move a head border, so they are never sent.
+//!
 //! Herdr's split tree is binary. Splitting the last worker down, then pairing
 //! each row, makes the area a chain of rows, each row a pair. The `down` split
 //! whose first child is a row holds the rest of the chain and gets ratio
@@ -219,6 +228,60 @@ pub(super) fn place(layout: &Layout, caller: &str, workers: &[String]) -> Placem
         };
     }
     Placement::Tab
+}
+
+/// The caller's workers in the row directly under it, left to right. Only
+/// panes inside the caller's own column count.
+fn row_below(layout: &Layout, caller: &str, workers: &[String]) -> Vec<(String, Rect)> {
+    let Some(caller) = layout.rect(caller) else {
+        return Vec::new();
+    };
+    let mut row: Vec<(String, Rect)> = workers
+        .iter()
+        .filter_map(|worker| Some((worker.clone(), layout.rect(worker)?)))
+        .filter(|(_, rect)| {
+            rect.y == caller.y + caller.height
+                && rect.x >= caller.x
+                && rect.x + rect.width <= caller.x + caller.width
+        })
+        .collect();
+    row.sort_by_key(|(_, rect)| rect.x);
+    row
+}
+
+/// Rows a pane of this width needs to show a startup dialog whole.
+fn rows_needed(width: u64) -> u64 {
+    if width < NARROW_CALLER {
+        MIN_ROWS_PAIRED
+    } else {
+        MIN_ROWS
+    }
+}
+
+pub(super) fn place_below(layout: &Layout, caller: &str, workers: &[String]) -> Placement {
+    let row = row_below(layout, caller, workers);
+    let Some((last, _)) = row.last() else {
+        let Some(rect) = layout.rect(caller) else {
+            return Placement::Tab;
+        };
+        if rect.width < MIN_COLS || rect.height / 2 < rows_needed(rect.width) {
+            return Placement::Tab;
+        }
+        return Placement::Split {
+            pane: caller.to_owned(),
+            direction: "down",
+        };
+    };
+    let width: u64 = row.iter().map(|(_, rect)| rect.width).sum();
+    let height = row.iter().map(|(_, rect)| rect.height).min().unwrap_or(0);
+    let each = width / (row.len() as u64 + 1);
+    if each < MIN_COLS || height < rows_needed(each) {
+        return Placement::Tab;
+    }
+    Placement::Split {
+        pane: last.clone(),
+        direction: "right",
+    }
 }
 
 /// The resizes that make the caller's workers equal, as
@@ -605,10 +668,14 @@ mod tests {
         )
     }
 
-    fn assert_horizontal_resizes_stay_inside_the_row(layout: &Layout, workers: &[&str]) {
+    fn assert_horizontal_resizes_stay_inside_the_row(
+        layout: &Layout,
+        caller: &str,
+        workers: &[&str],
+    ) {
         let names = names(workers);
-        let rows = rows(layout, "c", &names);
-        for (pane, direction, _) in equalize(layout, "c", &names) {
+        let rows = rows(layout, caller, &names);
+        for (pane, direction, _) in equalize(layout, caller, &names) {
             if direction != "right" && direction != "left" {
                 continue;
             }
@@ -753,7 +820,7 @@ mod tests {
         assert_eq!(moves.len(), 1);
         assert_eq!((moves[0].0.as_str(), moves[0].1), ("b", "up"));
         assert!((moves[0].2 - (0.55 - 1.0 / 3.0)).abs() < 1e-9);
-        assert_horizontal_resizes_stay_inside_the_row(&layout, &["f", "b", "g", "d", "h"]);
+        assert_horizontal_resizes_stay_inside_the_row(&layout, "c", &["f", "b", "g", "d", "h"]);
     }
 
     #[test]
@@ -763,7 +830,7 @@ mod tests {
         assert_eq!(moves.len(), 1);
         assert_eq!((moves[0].0.as_str(), moves[0].1), ("d", "up"));
         assert!((moves[0].2 - 0.05).abs() < 1e-9);
-        assert_horizontal_resizes_stay_inside_the_row(&layout, &["f", "d", "h"]);
+        assert_horizontal_resizes_stay_inside_the_row(&layout, "c", &["f", "d", "h"]);
     }
 
     #[test]
@@ -778,7 +845,7 @@ mod tests {
         assert_eq!(moves.len(), 1);
         assert_eq!((moves[0].0.as_str(), moves[0].1), ("a", "down"));
         assert!((moves[0].2 - (1.0 / 3.0 - 0.2)).abs() < 1e-9);
-        assert_horizontal_resizes_stay_inside_the_row(&layout, &["a", "e", "b", "d"]);
+        assert_horizontal_resizes_stay_inside_the_row(&layout, "c", &["a", "e", "b", "d"]);
     }
 
     #[test]
@@ -788,39 +855,44 @@ mod tests {
         assert_eq!(moves.len(), 1);
         assert_eq!((moves[0].0.as_str(), moves[0].1), ("e", "left"));
         assert!((moves[0].2 - 0.1).abs() < 1e-9);
-        assert_horizontal_resizes_stay_inside_the_row(&left_heavy, &["a", "e", "b", "d"]);
+        assert_horizontal_resizes_stay_inside_the_row(&left_heavy, "c", &["a", "e", "b", "d"]);
         let right_heavy = finding_two(1.0 / 3.0, 0.4);
         let moves = equalize(&right_heavy, "c", &names(&["a", "e", "b", "d"]));
         assert_eq!(moves.len(), 1);
         assert_eq!((moves[0].0.as_str(), moves[0].1), ("a", "right"));
         assert!((moves[0].2 - 0.1).abs() < 1e-9);
-        assert_horizontal_resizes_stay_inside_the_row(&right_heavy, &["a", "e", "b", "d"]);
+        assert_horizontal_resizes_stay_inside_the_row(&right_heavy, "c", &["a", "e", "b", "d"]);
     }
 
     #[test]
     fn the_callers_border_is_never_resized() {
         let layout = equal_two_by_two(0.55);
         assert!(equalize(&layout, "c", &names(&["a", "e", "b", "f"])).is_empty());
-        assert_horizontal_resizes_stay_inside_the_row(&layout, &["a", "e", "b", "f"]);
+        assert_horizontal_resizes_stay_inside_the_row(&layout, "c", &["a", "e", "b", "f"]);
         assert_horizontal_resizes_stay_inside_the_row(
             &closed_left_of_row_one(),
+            "c",
             &["f", "b", "g", "d", "h"],
         );
-        assert_horizontal_resizes_stay_inside_the_row(&closed_whole_row(), &["f", "d", "h"]);
+        assert_horizontal_resizes_stay_inside_the_row(&closed_whole_row(), "c", &["f", "d", "h"]);
         assert_horizontal_resizes_stay_inside_the_row(
             &finding_two(0.5, 0.5),
+            "c",
             &["a", "e", "b", "d"],
         );
         assert_horizontal_resizes_stay_inside_the_row(
             &finding_two(0.2, 0.5),
+            "c",
             &["a", "e", "b", "d"],
         );
         assert_horizontal_resizes_stay_inside_the_row(
             &finding_two(1.0 / 3.0, 0.6),
+            "c",
             &["a", "e", "b", "d"],
         );
         assert_horizontal_resizes_stay_inside_the_row(
             &finding_two(1.0 / 3.0, 0.4),
+            "c",
             &["a", "e", "b", "d"],
         );
     }
@@ -840,6 +912,344 @@ mod tests {
         assert_eq!(
             place(&layout, "c", &names(&["a", "e", "b", "f"])),
             Placement::Tab
+        );
+    }
+    fn two_heads_rows() -> Layout {
+        layout(
+            &[
+                pane("c", 0, 0, 119, 32),
+                pane("a", 0, 32, 40, 40),
+                pane("b", 40, 32, 40, 40),
+                pane("d", 80, 32, 39, 40),
+                pane("h", 119, 0, 119, 36),
+                pane("e", 119, 36, 60, 36),
+                pane("f", 179, 36, 59, 36),
+            ],
+            &[
+                split("right", 0.5, 0, 0, 238, 72),
+                split("down", 0.45, 0, 0, 119, 72),
+                split("right", 0.3333, 0, 32, 119, 40),
+                split("right", 0.5, 40, 32, 79, 40),
+                split("down", 0.5, 119, 0, 119, 72),
+                split("right", 0.5, 119, 36, 119, 36),
+            ],
+        )
+    }
+
+    fn row_of_three_halves() -> Layout {
+        layout(
+            &[
+                pane("c", 0, 0, 119, 36),
+                pane("a", 0, 36, 60, 36),
+                pane("b", 60, 36, 30, 36),
+                pane("d", 90, 36, 29, 36),
+                pane("h", 119, 0, 119, 72),
+            ],
+            &[
+                split("right", 0.5, 0, 0, 238, 72),
+                split("down", 0.5, 0, 0, 119, 72),
+                split("right", 0.5, 0, 36, 119, 36),
+                split("right", 0.5, 60, 36, 59, 36),
+            ],
+        )
+    }
+
+    #[test]
+    fn below_the_first_worker_splits_the_caller_down() {
+        let wide = layout(&[pane("c", 0, 0, 238, 72)], &[]);
+        assert_eq!(
+            place_below(&wide, "c", &[]),
+            Placement::Split {
+                pane: "c".into(),
+                direction: "down"
+            }
+        );
+        let two_heads = layout(&[pane("c", 0, 0, 119, 72), pane("h", 119, 0, 119, 72)], &[]);
+        assert_eq!(
+            place_below(&two_heads, "c", &[]),
+            Placement::Split {
+                pane: "c".into(),
+                direction: "down"
+            }
+        );
+    }
+
+    #[test]
+    fn below_later_workers_split_the_last_worker_right() {
+        let two = layout(
+            &[
+                pane("c", 0, 0, 238, 36),
+                pane("a", 0, 36, 119, 36),
+                pane("b", 119, 36, 119, 36),
+            ],
+            &[],
+        );
+        assert_eq!(
+            place_below(&two, "c", &names(&["a", "b"])),
+            Placement::Split {
+                pane: "b".into(),
+                direction: "right"
+            }
+        );
+        let one = layout(&[pane("c", 0, 0, 238, 36), pane("a", 0, 36, 238, 36)], &[]);
+        assert_eq!(
+            place_below(&one, "c", &names(&["a"])),
+            Placement::Split {
+                pane: "a".into(),
+                direction: "right"
+            }
+        );
+    }
+
+    #[test]
+    fn below_a_row_of_halves_becomes_thirds() {
+        let moves = equalize(&row_of_three_halves(), "c", &names(&["a", "b", "d"]));
+        assert_eq!(moves.len(), 1);
+        assert_eq!((moves[0].0.as_str(), moves[0].1), ("b", "left"));
+        assert!((moves[0].2 - (0.5 - 1.0 / 3.0)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn below_never_resizes_the_caller_or_another_heads_border() {
+        let current = two_heads_rows();
+        assert!(equalize(&current, "c", &names(&["a", "b", "d"])).is_empty());
+        assert!(equalize(&current, "h", &names(&["e", "f"])).is_empty());
+        let uneven = layout(
+            &[
+                pane("c", 0, 0, 119, 32),
+                pane("a", 0, 32, 40, 40),
+                pane("b", 40, 32, 40, 40),
+                pane("d", 80, 32, 39, 40),
+                pane("h", 119, 0, 119, 36),
+                pane("e", 119, 36, 60, 36),
+                pane("f", 179, 36, 59, 36),
+            ],
+            &[
+                split("right", 0.5, 0, 0, 238, 72),
+                split("down", 0.45, 0, 0, 119, 72),
+                split("right", 0.3333, 0, 32, 119, 40),
+                split("right", 0.5, 40, 32, 79, 40),
+                split("down", 0.5, 119, 0, 119, 72),
+                split("right", 0.6, 119, 36, 119, 36),
+            ],
+        );
+        let moves = equalize(&uneven, "h", &names(&["e", "f"]));
+        assert_eq!(moves.len(), 1);
+        assert_eq!((moves[0].0.as_str(), moves[0].1), ("f", "left"));
+        assert!((moves[0].2 - 0.1).abs() < 1e-9);
+        for (pane, direction, _) in moves
+            .iter()
+            .cloned()
+            .chain(equalize(&current, "c", &names(&["a", "b", "d"])))
+            .chain(equalize(&current, "h", &names(&["e", "f"])))
+        {
+            assert_ne!(direction, "up");
+            assert_ne!(direction, "down");
+            assert_ne!(pane, "c");
+            assert_ne!(pane, "h");
+        }
+        assert_horizontal_resizes_stay_inside_the_row(&current, "c", &["a", "b", "d"]);
+        assert_horizontal_resizes_stay_inside_the_row(&current, "h", &["e", "f"]);
+        assert_horizontal_resizes_stay_inside_the_row(&uneven, "h", &["e", "f"]);
+    }
+
+    #[test]
+    fn below_two_heads_each_keep_their_own_row() {
+        let under_h = layout(
+            &[
+                pane("c", 0, 0, 119, 32),
+                pane("a", 0, 32, 40, 40),
+                pane("b", 40, 32, 40, 40),
+                pane("d", 80, 32, 39, 40),
+                pane("h", 119, 0, 119, 36),
+                pane("e", 119, 36, 119, 36),
+            ],
+            &[
+                split("right", 0.5, 0, 0, 238, 72),
+                split("down", 0.45, 0, 0, 119, 72),
+                split("right", 0.3333, 0, 32, 119, 40),
+                split("right", 0.5, 40, 32, 79, 40),
+                split("down", 0.5, 119, 0, 119, 72),
+            ],
+        );
+        match place_below(&under_h, "h", &names(&["e", "a", "b", "d"])) {
+            Placement::Split { pane, direction } => {
+                assert_eq!(pane, "e");
+                assert_eq!(direction, "right");
+                assert_ne!(pane, "a");
+                assert_ne!(pane, "b");
+                assert_ne!(pane, "d");
+                assert_ne!(pane, "c");
+            }
+            Placement::Tab => panic!("expected a split of e, not a tab"),
+        }
+        let under_c = layout(
+            &[
+                pane("c", 0, 0, 119, 36),
+                pane("a", 0, 36, 119, 36),
+                pane("h", 119, 0, 119, 36),
+                pane("e", 119, 36, 119, 36),
+            ],
+            &[],
+        );
+        match place_below(&under_c, "c", &names(&["a", "e"])) {
+            Placement::Split { pane, direction } => {
+                assert_eq!(pane, "a");
+                assert_eq!(direction, "right");
+                assert_ne!(pane, "h");
+                assert_ne!(pane, "e");
+            }
+            Placement::Tab => panic!("expected a split of a, not a tab"),
+        }
+        match place_below(&under_c, "h", &names(&["e", "a"])) {
+            Placement::Split { pane, direction } => {
+                assert_eq!(pane, "e");
+                assert_eq!(direction, "right");
+                assert_ne!(pane, "a");
+                assert_ne!(pane, "c");
+            }
+            Placement::Tab => panic!("expected a split of e, not a tab"),
+        }
+    }
+
+    #[test]
+    fn below_a_full_row_sends_the_next_worker_to_a_tab() {
+        assert_eq!(
+            place_below(&two_heads_rows(), "h", &names(&["e", "f"])),
+            Placement::Tab
+        );
+        let three = layout(
+            &[
+                pane("c", 0, 0, 238, 36),
+                pane("a", 0, 36, 80, 36),
+                pane("b", 80, 36, 79, 36),
+                pane("d", 159, 36, 79, 36),
+            ],
+            &[],
+        );
+        assert_eq!(
+            place_below(&three, "c", &names(&["a", "b", "d"])),
+            Placement::Split {
+                pane: "d".into(),
+                direction: "right"
+            }
+        );
+        let four = layout(
+            &[
+                pane("c", 0, 0, 238, 36),
+                pane("a", 0, 36, 60, 36),
+                pane("b", 60, 36, 60, 36),
+                pane("d", 120, 36, 59, 36),
+                pane("e", 179, 36, 59, 36),
+            ],
+            &[],
+        );
+        assert_eq!(
+            place_below(&four, "c", &names(&["a", "b", "d", "e"])),
+            Placement::Tab
+        );
+    }
+
+    #[test]
+    fn below_a_narrow_caller_gets_one_worker_then_tabs() {
+        let one = layout(&[pane("c", 0, 0, 90, 40), pane("a", 0, 40, 90, 40)], &[]);
+        assert_eq!(place_below(&one, "c", &names(&["a"])), Placement::Tab);
+        let empty = layout(&[pane("c", 0, 0, 90, 72)], &[]);
+        assert_eq!(
+            place_below(&empty, "c", &[]),
+            Placement::Split {
+                pane: "c".into(),
+                direction: "down"
+            }
+        );
+    }
+
+    #[test]
+    fn below_a_caller_too_short_to_halve_goes_to_a_tab() {
+        let short = layout(&[pane("c", 0, 0, 238, 38)], &[]);
+        assert_eq!(place_below(&short, "c", &[]), Placement::Tab);
+        let narrow_short = layout(&[pane("c", 0, 0, 90, 44)], &[]);
+        assert_eq!(place_below(&narrow_short, "c", &[]), Placement::Tab);
+        let tall_enough = layout(&[pane("c", 0, 0, 238, 44)], &[]);
+        assert_eq!(
+            place_below(&tall_enough, "c", &[]),
+            Placement::Split {
+                pane: "c".into(),
+                direction: "down"
+            }
+        );
+    }
+
+    #[test]
+    fn below_a_row_too_short_for_narrow_panes_is_not_divided_further() {
+        let pair = layout(
+            &[
+                pane("c", 0, 0, 238, 22),
+                pane("a", 0, 22, 119, 22),
+                pane("b", 119, 22, 119, 22),
+            ],
+            &[],
+        );
+        assert_eq!(place_below(&pair, "c", &names(&["a", "b"])), Placement::Tab);
+        let one = layout(&[pane("c", 0, 0, 238, 22), pane("a", 0, 22, 238, 22)], &[]);
+        assert_eq!(
+            place_below(&one, "c", &names(&["a"])),
+            Placement::Split {
+                pane: "a".into(),
+                direction: "right"
+            }
+        );
+    }
+
+    #[test]
+    fn below_a_closed_worker_leaves_the_rest_equal() {
+        let closed_middle = layout(
+            &[
+                pane("c", 0, 0, 119, 36),
+                pane("a", 0, 36, 40, 36),
+                pane("d", 40, 36, 79, 36),
+            ],
+            &[
+                split("right", 0.5, 0, 0, 238, 72),
+                split("down", 0.5, 0, 0, 119, 72),
+                split("right", 1.0 / 3.0, 0, 36, 119, 36),
+            ],
+        );
+        let moves = equalize(&closed_middle, "c", &names(&["a", "d"]));
+        assert_eq!(moves.len(), 1);
+        assert_eq!((moves[0].0.as_str(), moves[0].1), ("a", "right"));
+        assert!((moves[0].2 - (0.5 - 1.0 / 3.0)).abs() < 1e-9);
+        let closed_first = layout(
+            &[
+                pane("c", 0, 0, 119, 36),
+                pane("d", 0, 36, 60, 36),
+                pane("f", 60, 36, 59, 36),
+            ],
+            &[
+                split("right", 0.5, 0, 0, 238, 72),
+                split("down", 0.5, 0, 0, 119, 72),
+                split("right", 0.5, 0, 36, 119, 36),
+            ],
+        );
+        assert!(equalize(&closed_first, "c", &names(&["d", "f"])).is_empty());
+    }
+
+    #[test]
+    fn below_ignores_own_workers_outside_the_callers_column() {
+        let layout = layout(
+            &[
+                pane("c", 0, 0, 119, 36),
+                pane("a", 0, 36, 119, 36),
+                pane("r", 119, 0, 119, 72),
+            ],
+            &[],
+        );
+        assert_eq!(
+            place_below(&layout, "c", &names(&["a", "r"])),
+            Placement::Split {
+                pane: "a".into(),
+                direction: "right"
+            }
         );
     }
 }

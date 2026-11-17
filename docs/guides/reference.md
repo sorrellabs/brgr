@@ -185,10 +185,14 @@ for config, instructions, debate, and the current verification limits.
 ### Recursive workers
 
 Default TUI tasks own their native pane; an additional supervisor pane is not
-created. Set `brgr config set worker-placement tab` for new tabs or `adjacent`
+created. Set `brgr config set worker-placement tab` for new tabs, `adjacent`
 for a split beside the exact caller: later workers stack under the first, then
 fill a second column beside them when the area is wide enough, then a new tab
-once both columns are full. Settings live at `$BRGR_HOME/config.toml`
+once both columns are full, or `below` for one row under the caller, left to
+right, then a new tab when the row is full. While `worker-placement` is
+`below`, brgr 2.15.24 and older cannot read `config.toml` and commands that
+load it fail with "brgr config is invalid". Set it back to `adjacent` or `tab`
+before running an older release. Settings live at `$BRGR_HOME/config.toml`
 and do not move existing panes. Legacy auto-worker settings remain readable.
 
 Named routes live under `[aliases]` in `config.toml`; each entry stores a

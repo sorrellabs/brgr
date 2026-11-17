@@ -1169,21 +1169,42 @@ impl Herdr {
         let placement = crate::config::Config::load(&paths.config)?
             .herdr
             .worker_placement;
-        let target = if placement == crate::config::WorkerPlacement::Tab {
-            layout::Placement::Tab
-        } else {
-            let workers = layout::workers(&paths.runs, caller);
-            self.call(&["pane", "layout", "--pane", caller])
-                .ok()
-                .as_ref()
-                .and_then(layout::Layout::parse)
-                .map_or_else(
-                    || layout::Placement::Split {
-                        pane: caller.to_owned(),
-                        direction: "right",
-                    },
-                    |current| layout::place(&current, caller, &workers),
-                )
+        let target = match placement {
+            crate::config::WorkerPlacement::Tab => layout::Placement::Tab,
+            crate::config::WorkerPlacement::Adjacent => {
+                let workers = layout::workers(&paths.runs, caller);
+                self.call(&["pane", "layout", "--pane", caller])
+                    .ok()
+                    .as_ref()
+                    .and_then(layout::Layout::parse)
+                    .map_or_else(
+                        || layout::Placement::Split {
+                            pane: caller.to_owned(),
+                            direction: "right",
+                        },
+                        |current| layout::place(&current, caller, &workers),
+                    )
+            }
+            crate::config::WorkerPlacement::Below => {
+                let workers = layout::workers(&paths.runs, caller);
+                self.call(&["pane", "layout", "--pane", caller])
+                    .ok()
+                    .as_ref()
+                    .and_then(layout::Layout::parse)
+                    .map_or_else(
+                        || {
+                            if workers.is_empty() {
+                                layout::Placement::Split {
+                                    pane: caller.to_owned(),
+                                    direction: "down",
+                                }
+                            } else {
+                                layout::Placement::Tab
+                            }
+                        },
+                        |current| layout::place_below(&current, caller, &workers),
+                    )
+            }
         };
         let mut args: Vec<String> = match target {
             layout::Placement::Tab => vec![
