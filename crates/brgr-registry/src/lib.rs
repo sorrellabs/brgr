@@ -3425,4 +3425,192 @@ mod tests {
             Err(RunnerError::MissingResultEvent)
         ));
     }
+
+    /// Prime Agent 0.10.3: print/json mode, exact model and thinking flags,
+    /// `--resume`, and no approval layer. A saved session is left for
+    /// `--resume <id>`; `--no-session` and `--autonomous` are never passed.
+    #[test]
+    fn prime_agent_v0_10_3_drafts_from_its_own_help() {
+        let manifest = generate_manifest(
+            "prime-agent",
+            PathBuf::from("/bin/echo"),
+            &help_fixture("prime-agent-0.10.3.txt"),
+        )
+        .unwrap();
+        manifest.validate().unwrap();
+        assert_eq!(manifest.id, "local.prime-agent");
+        assert_eq!(
+            manifest.launch.argv,
+            ["-p", "--mode", "json", "${input.prompt}"]
+        );
+        assert!(!manifest.launch.argv.contains(&"--no-session".to_owned()));
+        assert!(!manifest.launch.argv.contains(&"--autonomous".to_owned()));
+        assert_eq!(manifest.launch.model_argv, ["--model", "${route.model}"]);
+        assert_eq!(
+            manifest.launch.effort_argv,
+            ["--thinking", "${route.effort}"]
+        );
+        assert!(
+            manifest.permission_arguments(None).unwrap().is_empty(),
+            "Prime Agent has no approval layer to switch on"
+        );
+        for level in [PermissionLevel::Edits, PermissionLevel::ReadOnly] {
+            assert!(
+                manifest
+                    .permission_arguments(Some(level))
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+        assert_eq!(manifest.result.source, ResultSource::JsonlAssistantFinal);
+        assert_eq!(
+            manifest.capabilities["model_select"].status,
+            CapabilityStatus::Supported
+        );
+        assert_eq!(
+            manifest.capabilities["effort_select"].status,
+            CapabilityStatus::Supported
+        );
+        assert!(manifest.launch.interactive.is_none());
+        for name in [
+            "HOME",
+            "PRIME_AGENT_CODING_AGENT_DIR",
+            "PRIME_AGENT_SESSION_DIR",
+            "ANTHROPIC_API_KEY",
+            "OPENAI_API_KEY",
+            "GH_TOKEN",
+        ] {
+            assert!(
+                manifest
+                    .launch
+                    .env_allow
+                    .iter()
+                    .any(|allowed| allowed == name),
+                "{name} is not allowlisted"
+            );
+        }
+        assert!(
+            !manifest
+                .launch
+                .env_allow
+                .iter()
+                .any(|allowed| allowed == "PRIME_AGENT_FAUX_SCRIPT"),
+            "the scripted verification seam must never reach a worker"
+        );
+    }
+
+    /// Prime Agent's `--mode json` stream: a `session` header, assistant
+    /// `message_end`, assistant `turn_end`, and an `agent_end` with no stop
+    /// reason. A provider error rides the assistant message; a stream that
+    /// stops before either terminal event is refused. The saved session's id
+    /// goes back through `-r` for a follow-up.
+    #[tokio::test]
+    async fn prime_agent_fixture_accepts_only_its_own_terminal_stream() {
+        async fn run(
+            manifest: &HarnessManifest,
+            workspace: &Path,
+            prompt: &str,
+        ) -> Result<brgr_runner::ExecutionOutput, RunnerError> {
+            ProcessRunner::run(
+                manifest,
+                brgr_runner::RunRequest {
+                    workspace,
+                    prompt,
+                    criteria: None,
+                    instructions: None,
+                    model: None,
+                    effort: None,
+                    resume_session: None,
+                    permission: None,
+                    deadline: Duration::from_mins(1),
+                    cancel_path: None,
+                    pid_path: None,
+                },
+            )
+            .await
+        }
+
+        let root = tempfile::tempdir().unwrap();
+        let executable = root.path().join("prime-agent");
+        fs::write(
+            root.path().join("prime-help.txt"),
+            help_fixture("prime-agent-0.10.3.txt"),
+        )
+        .unwrap();
+        write_fast_script(&executable, PRIME_FIXTURE_BODY);
+        let registry = Registry::open(root.path().join("registry")).unwrap();
+        let manifest = registry.draft(&executable).await.unwrap();
+        assert_eq!(manifest.id, "local.prime-agent");
+
+        let output = run(&manifest, root.path(), "prime").await.unwrap();
+        assert_eq!(output.result, b"prime answer");
+
+        let error = run(&manifest, root.path(), "PROVIDER_ERROR")
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, RunnerError::AssistantError(ref message) if message == "provider exploded"),
+            "{error}"
+        );
+
+        let error = run(&manifest, root.path(), "TRUNCATED").await.unwrap_err();
+        assert!(
+            matches!(error, RunnerError::MissingTerminalEvent),
+            "{error}"
+        );
+
+        let mut resumed = manifest.clone();
+        resumed.launch.argv.insert(3, "-r".to_owned());
+        resumed.launch.argv.insert(4, "prime-session".to_owned());
+        let output = run(&resumed, root.path(), "resume").await.unwrap();
+        assert_eq!(output.result, b"resumed:prime-session");
+    }
+
+    const PRIME_FIXTURE_BODY: &str = r#"#!/bin/sh
+case "${1:-}" in
+  --version) printf '0.10.3\n'; exit 0 ;;
+  --help) /bin/cat "$(dirname "$0")/prime-help.txt"; exit 0 ;;
+esac
+resume=''
+prompt=''
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    -p|--print) shift ;;
+    --mode|-r|--resume|--model|--thinking|--provider)
+      if [ "$1" = "-r" ] || [ "$1" = "--resume" ]; then resume="$2"; fi
+      shift 2 ;;
+    --no-session|--offline) shift ;;
+    *) prompt="$1"; shift ;;
+  esac
+done
+case "$prompt" in
+  *PROVIDER_ERROR*)
+    printf '%s\n' \
+      '{"type":"session","version":3,"id":"prime-session","cwd":"/workspace"}' \
+      '{"type":"agent_start"}' \
+      '{"type":"turn_start"}' \
+      '{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"partial answer"}],"stopReason":"error","errorMessage":"provider exploded"}}' \
+      '{"type":"turn_end","message":{"role":"assistant","content":[],"stopReason":"error"},"toolResults":[]}' \
+      '{"type":"agent_end","messages":[]}'
+    ;;
+  *TRUNCATED*)
+    printf '%s\n' \
+      '{"type":"session","version":3,"id":"prime-session","cwd":"/workspace"}' \
+      '{"type":"agent_start"}' \
+      '{"type":"turn_start"}'
+    ;;
+  *)
+    answer='prime answer'
+    if [ "$prompt" = 'resume' ]; then answer="resumed:$resume"; fi
+    printf '%s\n' \
+      '{"type":"session","version":3,"id":"prime-session","cwd":"/workspace"}' \
+      '{"type":"agent_start"}' \
+      '{"type":"turn_start"}' \
+      "{\"type\":\"message_end\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"$answer\"}]}}" \
+      '{"type":"turn_end","message":{"role":"assistant","content":[],"stopReason":"stop"},"toolResults":[]}' \
+      '{"type":"agent_end","messages":[]}'
+    ;;
+esac
+exit 0
+"#;
 }

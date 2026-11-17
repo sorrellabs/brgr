@@ -179,6 +179,10 @@ pub(crate) fn retain_jsonl_event(line: &[u8], retained: &mut Vec<u8>, limit: u64
                     "role": "assistant",
                     "provider": event.pointer("/message/provider"),
                     "model": event.pointer("/message/model"),
+                    // The message's own stop reason is the only terminal
+                    // failure signal some harnesses emit: Prime Agent's
+                    // `agent_end` carries none.
+                    "stopReason": event.pointer("/message/stopReason"),
                     "content": event.pointer("/message/content"),
                 });
                 // A failed turn says why here and nowhere else. Keep a bounded
@@ -318,5 +322,21 @@ mod error_message_tests {
             "{\"type\":\"message_end\",\"message\":{\"role\":\"assistant\",\"content\":[]}}",
         );
         assert!(!kept.contains("errorMessage"));
+    }
+
+    /// A harness whose `agent_end` has no stop reason qualifies a failed turn
+    /// on the assistant message, so the reduction must keep that field.
+    #[test]
+    fn a_failed_turns_stop_reason_survives_the_reduction() {
+        let kept: Value = serde_json::from_str(
+            retained(
+                "{\"type\":\"message_end\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"partial\"}],\"stopReason\":\"error\",\"errorMessage\":\"provider exploded\"}}",
+            )
+            .trim(),
+        )
+        .unwrap();
+        assert_eq!(kept["message"]["stopReason"], "error");
+        assert_eq!(kept["message"]["errorMessage"], "provider exploded");
+        assert_eq!(kept["message"]["content"][0]["text"], "partial");
     }
 }
