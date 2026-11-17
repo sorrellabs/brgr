@@ -42,6 +42,18 @@ pub(crate) struct ResultHooks<'a> {
     pub(crate) failure_hint: Option<&'a FailureHint>,
 }
 
+/// Test hook: hold the attempt right after its claim, at most two seconds.
+#[cfg(debug_assertions)]
+fn pause_after_claim_for_tests() {
+    if let Some(milliseconds) = std::env::var("BRGR_TEST_PAUSE_AFTER_CLAIM_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value <= 2_000)
+    {
+        std::thread::sleep(Duration::from_millis(milliseconds));
+    }
+}
+
 pub(crate) async fn run_single_attempt(
     store: &mut Store,
     epoch: u64,
@@ -57,13 +69,7 @@ pub(crate) async fn run_single_attempt(
     let mut producer_seq = 0_u64;
     store.claim_attempt(spec.task_id, spec.revision, attempt_id)?;
     #[cfg(debug_assertions)]
-    if let Some(milliseconds) = std::env::var("BRGR_TEST_PAUSE_AFTER_CLAIM_MS")
-        .ok()
-        .and_then(|value| value.parse::<u64>().ok())
-        .filter(|value| *value <= 2_000)
-    {
-        std::thread::sleep(Duration::from_millis(milliseconds));
-    }
+    pause_after_claim_for_tests();
     #[cfg(debug_assertions)]
     crash_at("after_claim");
     transition(
