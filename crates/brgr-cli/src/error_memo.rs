@@ -996,6 +996,24 @@ mod tests {
         assert_eq!(redact(&"word ".repeat(200), 50).chars().count(), 50);
     }
 
+    /// The GJC log hint a failure reason may carry must not change the error
+    /// class or its fingerprint: the same causeless failure is one entry
+    /// whether or not the recipe added its hint (issue #432).
+    #[test]
+    fn a_failure_hint_does_not_change_the_error_memo_fingerprint() {
+        let without_hint =
+            "process produced no result artifact; last error event: Agent run failed.";
+        let with_hint = "process produced no result artifact; last error event: Agent run failed. (GJC wrote no cause; see ~/.gjc/logs/ for its log.)";
+        assert_eq!(classify(without_hint), classify(with_hint));
+        assert_eq!(
+            fingerprint(&classify(without_hint)),
+            fingerprint(&classify(with_hint))
+        );
+        // The hint follows the quote marker, so it is cut with the quote and
+        // cannot become free text that reaches an issue.
+        assert_eq!(classify(with_hint), "process produced no result artifact");
+    }
+
     #[test]
     fn dates_are_utc_calendar_days() {
         assert_eq!(date(0), "1970-01-01");

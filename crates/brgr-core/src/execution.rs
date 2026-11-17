@@ -19,7 +19,7 @@ use brgr_store::{RunnerIdentity, Store, StoreError};
 use sha2::{Digest, Sha256};
 
 use crate::{
-    Attempt, CoreError, DelegationHost, SessionModel, SupervisorError, TaskRevision,
+    Attempt, CoreError, DelegationHost, FailureHint, SessionModel, SupervisorError, TaskRevision,
     evidence::{seal_requested_evidence, seal_requested_logs},
 };
 
@@ -30,6 +30,16 @@ pub(crate) struct AttemptControl<'a> {
     pub(crate) runner_identity: Option<&'a RunnerIdentity>,
     pub(crate) delegation_host: Option<&'a DelegationHost>,
     pub(crate) session_model: Option<&'a SessionModel>,
+    pub(crate) failure_hint: Option<&'a FailureHint>,
+}
+
+/// The caller-owned readers a sealed result may consult: the model a worker's
+/// own session record names, and the recipe's explanation for a failure whose
+/// own words name no cause. Both default to nothing.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct ResultHooks<'a> {
+    pub(crate) session_model: Option<&'a SessionModel>,
+    pub(crate) failure_hint: Option<&'a FailureHint>,
 }
 
 pub(crate) async fn run_single_attempt(
@@ -124,7 +134,10 @@ pub(crate) async fn run_single_attempt(
         manifest,
         &mut attempt,
         &mut producer_seq,
-        control.session_model,
+        ResultHooks {
+            session_model: control.session_model,
+            failure_hint: control.failure_hint,
+        },
         execution,
     )?;
     #[cfg(debug_assertions)]
@@ -337,13 +350,20 @@ pub(crate) fn finish_execution(
     manifest: &HarnessManifest,
     attempt: &mut Attempt,
     producer_seq: &mut u64,
-    session_model: Option<&SessionModel>,
+    hooks: ResultHooks<'_>,
     execution: Result<brgr_runner::ExecutionOutput, RunnerError>,
 ) -> Result<ResultEnvelope, SupervisorError> {
     let attempt_id = attempt.id();
-    let mut result =
-        finish_execution_result(store, spec, manifest, attempt, producer_seq, execution)?;
-    apply_session_model(&mut result, session_model, spec, attempt_id);
+    let mut result = finish_execution_result(
+        store,
+        spec,
+        manifest,
+        attempt,
+        producer_seq,
+        hooks.failure_hint,
+        execution,
+    )?;
+    apply_session_model(&mut result, hooks.session_model, spec, attempt_id);
     Ok(result)
 }
 
@@ -392,6 +412,7 @@ fn finish_execution_result(
     manifest: &HarnessManifest,
     attempt: &mut Attempt,
     producer_seq: &mut u64,
+    failure_hint: Option<&FailureHint>,
     execution: Result<brgr_runner::ExecutionOutput, RunnerError>,
 ) -> Result<ResultEnvelope, SupervisorError> {
     let attempt_id = attempt.id();
@@ -470,7 +491,7 @@ fn finish_execution_result(
             spec,
             attempt_id,
             TerminalOutcome::Failed,
-            execution_failure_reason(manifest, &output),
+            execution_failure_reason(manifest, &output, failure_hint),
             Some(&output),
         )),
         Err(error) => Ok(result_for(
@@ -537,6 +558,7 @@ fn route_observation(
 pub(crate) fn execution_failure_reason(
     manifest: &HarnessManifest,
     output: &ExecutionOutput,
+    failure_hint: Option<&FailureHint>,
 ) -> String {
     let budget_stop = output
         .exit_code
@@ -567,7 +589,15 @@ pub(crate) fn execution_failure_reason(
                 CauseSource::Stderr => LAST_STDERR,
                 CauseSource::ErrorEvent => LAST_ERROR_EVENT,
             };
-            format!("{reason}; {mark} {}", cause.text)
+            let reason = format!("{reason}; {mark} {}", cause.text);
+            // Some harnesses report their failure with words that carry no
+            // cause at all. The recipe may know where the cause went; the
+            // hint is appended only for its exact causeless text, never for a
+            // real cause, and never read from the harness's log.
+            match failure_hint.and_then(|hint| hint(&manifest.id, &cause.text)) {
+                Some(hint) => format!("{reason} ({hint})"),
+                None => reason,
+            }
         }
         None => reason,
     }
@@ -786,6 +816,35 @@ mod failure_reason_tests {
         }
     }
 
+    /// A stand-in for the registry's table (`brgr_registry::failure_hint_for`,
+    /// tested there against the real recipe): core cannot depend on the
+    /// registry, which is published after it.
+    fn hint(harness: &str, cause: &str) -> Option<&'static str> {
+        (harness == "local.gjc" && cause == "Agent run failed.")
+            .then_some("GJC wrote no cause; see ~/.gjc/logs/ for its log.")
+    }
+
+    fn gjc_manifest() -> HarnessManifest {
+        let mut gjc = manifest(&[]);
+        gjc.id = "local.gjc".to_owned();
+        gjc
+    }
+
+    fn gjc_causeless_failure() -> ExecutionOutput {
+        // GJC 0.21.0 on a model error: exit 1, empty stderr, and a failed
+        // assistant turn whose only words are `Agent run failed.`. The reduced
+        // JSONL stream keeps `errorMessage` on the `message_end` event.
+        let mut output = failed("");
+        output.stdout = concat!(
+            "{\"type\":\"message_end\",\"message\":{\"role\":\"assistant\",\"content\":[],",
+            "\"errorMessage\":\"Agent run failed.\"}}\n",
+            "{\"type\":\"agent_end\",\"stopReason\":\"error\"}\n",
+        )
+        .as_bytes()
+        .to_vec();
+        output
+    }
+
     fn failed(stderr: &str) -> ExecutionOutput {
         ExecutionOutput {
             exit_code: Some(1),
@@ -810,18 +869,19 @@ mod failure_reason_tests {
             Error when talking to Gemini API TerminalQuotaError: You have exhausted your daily quota\n\
                 at classifyGoogleError (file:///x.js:1:1)\n\
             }";
-        let reason = execution_failure_reason(&manifest(&[]), &failed(gemini));
+        let reason = execution_failure_reason(&manifest(&[]), &failed(gemini), Some(&hint));
         assert!(reason.starts_with("process produced no result artifact; last stderr: "));
         assert!(reason.contains("exhausted your daily quota"), "{reason}");
         assert!(
             execution_failure_reason(
                 &manifest(&[]),
-                &failed("Error: Insufficient credits for Command Code.")
+                &failed("Error: Insufficient credits for Command Code."),
+                Some(&hint),
             )
             .ends_with("last stderr: Error: Insufficient credits for Command Code.")
         );
         assert_eq!(
-            execution_failure_reason(&manifest(&[]), &failed("")),
+            execution_failure_reason(&manifest(&[]), &failed(""), Some(&hint)),
             "process produced no result artifact"
         );
     }
@@ -834,7 +894,7 @@ mod failure_reason_tests {
         for code in [53, 55] {
             let mut output = failed("FatalBudgetExceededError: wall-time budget exceeded");
             output.exit_code = Some(code);
-            let reason = execution_failure_reason(&manifest(&[53, 55]), &output);
+            let reason = execution_failure_reason(&manifest(&[53, 55]), &output, Some(&hint));
             assert!(
                 reason.starts_with(&format!(
                     "harness stopped on its own run budget (exit {code}); last stderr: "
@@ -846,7 +906,7 @@ mod failure_reason_tests {
         let mut output = failed("");
         output.exit_code = Some(55);
         assert_eq!(
-            execution_failure_reason(&manifest(&[]), &output),
+            execution_failure_reason(&manifest(&[]), &output, Some(&hint)),
             "process produced no result artifact"
         );
     }
@@ -858,8 +918,53 @@ mod failure_reason_tests {
 "#
         .to_vec();
         assert_eq!(
-            execution_failure_reason(&manifest(&[]), &output),
+            execution_failure_reason(&manifest(&[]), &output, Some(&hint)),
             "process produced no result artifact; last error event: Connect error resource_exhausted: Error"
+        );
+    }
+
+    #[test]
+    fn a_causeless_gjc_failure_points_at_its_own_log() {
+        let reason =
+            execution_failure_reason(&gjc_manifest(), &gjc_causeless_failure(), Some(&hint));
+        assert!(
+            reason.ends_with(
+                "; last error event: Agent run failed. (GJC wrote no cause; see ~/.gjc/logs/ for its log.)"
+            ),
+            "{reason}"
+        );
+    }
+
+    #[test]
+    fn a_gjc_failure_that_names_a_cause_gets_no_hint() {
+        let mut output = failed("");
+        output.stdout = concat!(
+            "{\"type\":\"message_end\",\"message\":{\"role\":\"assistant\",\"content\":[],",
+            "\"errorMessage\":\"Connection error. (transport=ConnectionRefused)\"}}\n",
+            "{\"type\":\"agent_end\",\"stopReason\":\"error\"}\n",
+        )
+        .as_bytes()
+        .to_vec();
+        let reason = execution_failure_reason(&gjc_manifest(), &output, Some(&hint));
+        assert!(
+            reason.ends_with("last error event: Connection error. (transport=ConnectionRefused)"),
+            "{reason}"
+        );
+        assert!(!reason.contains("GJC wrote no cause"), "{reason}");
+    }
+
+    #[test]
+    fn a_causeless_failure_of_another_harness_gets_no_gjc_hint() {
+        let reason =
+            execution_failure_reason(&manifest(&[]), &gjc_causeless_failure(), Some(&hint));
+        assert_eq!(
+            reason,
+            "process produced no result artifact; last error event: Agent run failed."
+        );
+        // Without a wired table nothing is added, whatever the cause.
+        assert_eq!(
+            execution_failure_reason(&gjc_manifest(), &gjc_causeless_failure(), None),
+            "process produced no result artifact; last error event: Agent run failed."
         );
     }
 }

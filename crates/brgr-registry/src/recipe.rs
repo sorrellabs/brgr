@@ -22,6 +22,21 @@ pub(crate) struct Interactive {
     pub(crate) model_print_only_with: Option<&'static str>,
 }
 
+/// What a recipe says about a harness whose own last words name no cause.
+///
+/// GJC exits a model error with nothing but `Agent run failed.` on its event
+/// stream and writes the real cause to its own log. The hint points there, so
+/// an owner is not left with a failure that says nothing. It is recipe data and
+/// never a manifest field: a manifest is persisted per harness, so a field a
+/// newer build wrote would be unreadable to an older brgr.
+pub(crate) struct FailureHint {
+    /// The harness's own words, exactly as its stream reports them, that carry
+    /// no cause.
+    pub(crate) cause: &'static str,
+    /// Appended to the failure reason, naming where the cause is instead.
+    pub(crate) hint: &'static str,
+}
+
 /// A harness brgr recognizes by name, and the process manifest it drafts.
 ///
 /// Data rather than one function per harness: the seven drafts were ~500 lines
@@ -65,6 +80,8 @@ pub(crate) struct Recipe {
     /// Where the help that documents `required_flags` lives, when the flags
     /// belong to a subcommand (`opencode run --help`).
     pub(crate) help_argv: &'static [&'static str],
+    /// An explanation for a failure this harness reports without a cause.
+    pub(crate) failure_hint: Option<FailureHint>,
     /// Arguments for each permission level; `None` is a level the CLI has no
     /// way to honour, which brgr then refuses rather than run wider.
     pub(crate) full: Option<&'static [&'static str]>,
@@ -144,6 +161,7 @@ pub(crate) const GENERIC: Recipe = Recipe {
         ("effort_select", Cap::Unsupported("not_observed")),
     ],
     help_argv: &["--help"],
+    failure_hint: None,
     // A generic CLI's approval model is unknown, so it declares no levels and
     // runs only as it always has.
     full: None,
@@ -201,6 +219,14 @@ pub(crate) const RECIPES: &[Recipe] = &[
         full: Some(&[]),
         edits: None,
         read_only: None,
+        // GJC's generic `Agent run failed.` event names no cause; the cause is
+        // written only to GJC's own log. brgr never reads or quotes that log:
+        // it may hold prompts and keys, and the error memo forbids quoting
+        // harness output into issue text.
+        failure_hint: Some(FailureHint {
+            cause: "Agent run failed.",
+            hint: "GJC wrote no cause; see ~/.gjc/logs/ for its log.",
+        }),
         interactive: Some(Interactive {
             kind: "gjc",
             argv: &[],
@@ -847,6 +873,19 @@ pub(crate) const RECIPES: &[Recipe] = &[
 /// The recipe an executable's own file name names.
 pub(crate) fn named(name: &str) -> Option<&'static Recipe> {
     RECIPES.iter().find(|recipe| recipe.names.contains(&name))
+}
+
+/// What the built-in recipe for `harness_id` says about a cause it reports
+/// without one. `None` when the harness has no recipe, has no hint, or its own
+/// words are not the hint's exact causeless text.
+///
+/// The table is here, with the recipes, so a caller that formats a failure
+/// reason asks this function instead of branching on a harness name.
+#[must_use]
+pub fn failure_hint_for(harness_id: &str, cause: &str) -> Option<&'static str> {
+    let recipe = RECIPES.iter().find(|recipe| recipe.id == harness_id)?;
+    let hint = recipe.failure_hint.as_ref()?;
+    (hint.cause == cause).then_some(hint.hint)
 }
 
 /// The recipe for an executable: its file name first, then the npm package its

@@ -115,6 +115,7 @@ async fn supervise_inner(
         launch.delegation_enabled,
     );
     crate::session_model::install(paths, &mut supervisor);
+    explain_failures(&mut supervisor);
     // Reconcile before publishing our own task receipt. Otherwise a previous
     // crashed attempt without a launch identity could mistake this new process
     // for its original live supervisor and remain unfinished forever.
@@ -202,6 +203,13 @@ fn print_supervised_receipt(
     Ok(())
 }
 
+/// Tells the supervisor how to explain a failed run whose own words name no
+/// cause. The table is the registry's recipe data; the CLI never branches on a
+/// harness name.
+fn explain_failures(supervisor: &mut Supervisor) {
+    supervisor.explain_failures_with(Box::new(brgr_registry::failure_hint_for));
+}
+
 pub(crate) fn pinned_manifest_for_launch(
     manifest: Option<&HarnessManifest>,
     digest: Option<&str>,
@@ -280,6 +288,7 @@ fn recover_one(
 pub(crate) fn reconcile_pending(paths: &Paths) -> Result<()> {
     let mut supervisor = Supervisor::open(&paths.store)?;
     crate::session_model::install(paths, &mut supervisor);
+    explain_failures(&mut supervisor);
     for attempt in supervisor.store().unfinished_attempts()? {
         if !matches!(
             observe_attempt(paths, &attempt),

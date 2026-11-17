@@ -1,7 +1,7 @@
 use super::*;
 use crate::execution::{
-    delegated_lost_reason, finish_execution, is_retryable_spawn_failure, last_stderr_line,
-    resumable_session, transition,
+    ResultHooks, delegated_lost_reason, finish_execution, is_retryable_spawn_failure,
+    last_stderr_line, resumable_session, transition,
 };
 use brgr_protocol::{ArtifactContract, AttemptBudget, OwnerId, Route, SCHEMA_V1};
 use brgr_protocol::{AttemptId, AttemptState, ObservationSource, ResultId, TaskId};
@@ -98,6 +98,59 @@ fn only_pre_spawn_transient_errors_are_retryable() {
         std::io::ErrorKind::WouldBlock,
     )));
     assert!(!is_retryable_spawn_failure(&after_spawn));
+}
+
+/// A one-shot GJC run against a fixture that fails with the causeless
+/// `Agent run failed.` turn GJC emits when the cause is only in its own log.
+#[tokio::test]
+async fn a_supervisor_that_explains_failures_puts_the_recipe_hint_on_the_result() {
+    let root = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    let executable = root.path().join("gjc");
+    crate::fast_script::write_fast_script(
+        &executable,
+        "#!/bin/sh\ncase \"$1\" in\n --version) echo 'gjc/0.21.0';;\n \
+         --help) echo '--mode=<value> --no-session --no-mcp -p, --print';;\n \
+         *) printf '%s\\n' '{\"type\":\"message_end\",\"message\":{\"role\":\"assistant\",\
+         \"content\":[],\"errorMessage\":\"Agent run failed.\"}}' \
+         '{\"type\":\"agent_end\",\"stopReason\":\"error\"}';\n exit 1;;\nesac\n",
+    );
+    let mut manifest = one_shot_manifest();
+    manifest.id = "local.gjc".to_owned();
+    manifest.executable = executable;
+    manifest.launch.argv = vec![
+        "-p".to_owned(),
+        "--mode=json".to_owned(),
+        "@${input.prompt_file}".to_owned(),
+    ];
+    manifest.result.source = ResultSource::JsonlAssistantFinal;
+    let mut spec = task_spec(TaskId::new(), 1);
+    spec.route.harness_id = "local.gjc".to_owned();
+    spec.required_capabilities = vec![];
+    spec.workspace = workspace.path().to_string_lossy().into_owned();
+    spec.budget.max_attempts = 1;
+
+    let mut wired = Supervisor::open(root.path().join("wired")).unwrap();
+    // A stand-in for `brgr_registry::failure_hint_for`, which core cannot
+    // depend on; the registry tests pin the real table.
+    wired.explain_failures_with(Box::new(|harness: &str, cause: &str| {
+        (harness == "local.gjc" && cause == "Agent run failed.")
+            .then_some("GJC wrote no cause; see ~/.gjc/logs/ for its log.")
+    }));
+    let with_hint = wired.run_fresh(spec.clone(), &manifest).await.unwrap();
+
+    let mut plain = Supervisor::open(root.path().join("plain")).unwrap();
+    let without_hint = plain.run_fresh(spec, &manifest).await.unwrap();
+
+    // Only the hint differs: same outcome, same reason otherwise.
+    assert_eq!(with_hint.outcome, TerminalOutcome::Failed);
+    assert_eq!(with_hint.outcome, without_hint.outcome);
+    let without = without_hint.error.expect("a failed result names its cause");
+    let with = with_hint.error.expect("a failed result names its cause");
+    assert_eq!(
+        with,
+        format!("{without} (GJC wrote no cause; see ~/.gjc/logs/ for its log.)")
+    );
 }
 
 fn delegated_fixture_manifest() -> HarnessManifest {
@@ -255,7 +308,10 @@ fn delegated_pane_finish(
         &manifest,
         &mut attempt,
         &mut sequence,
-        session_model,
+        ResultHooks {
+            session_model,
+            ..ResultHooks::default()
+        },
         Ok(output),
     )
     .unwrap()
@@ -427,7 +483,7 @@ fn delegated_external_failure_is_lost_with_unresolved_effects() {
         &manifest,
         &mut attempt,
         &mut sequence,
-        None,
+        ResultHooks::default(),
         Ok(failed.clone()),
     )
     .unwrap();
@@ -447,7 +503,7 @@ fn delegated_external_failure_is_lost_with_unresolved_effects() {
             &manifest,
             &mut attempt,
             &mut sequence,
-            None,
+            ResultHooks::default(),
             Ok(interrupted),
         )
         .unwrap();
@@ -460,7 +516,7 @@ fn delegated_external_failure_is_lost_with_unresolved_effects() {
         &manifest,
         &mut attempt,
         &mut sequence,
-        None,
+        ResultHooks::default(),
         Ok(failed),
     )
     .unwrap();
@@ -1072,7 +1128,7 @@ fn a_candidate_result_notes_a_stash_left_on_the_task_branch() {
         &one_shot_manifest(),
         &mut attempt,
         &mut sequence,
-        None,
+        ResultHooks::default(),
         Ok(successful_output(b"report")),
     )
     .unwrap();
@@ -1103,7 +1159,7 @@ fn a_failed_result_notes_a_stash_left_on_the_task_branch() {
         &one_shot_manifest(),
         &mut attempt,
         &mut sequence,
-        None,
+        ResultHooks::default(),
         Ok(ExecutionOutput {
             exit_code: Some(1),
             ..successful_output(b"")
@@ -1135,7 +1191,7 @@ fn a_result_without_capture_diff_has_no_stash_note() {
         &one_shot_manifest(),
         &mut attempt,
         &mut sequence,
-        None,
+        ResultHooks::default(),
         Ok(successful_output(b"report")),
     )
     .unwrap();
@@ -1278,7 +1334,7 @@ fn provider_error_remains_lost_with_unresolved_effects_and_no_retry() {
         &manifest,
         &mut attempt,
         &mut sequence,
-        None,
+        ResultHooks::default(),
         Ok(output),
     )
     .unwrap();

@@ -87,6 +87,7 @@ pub struct Supervisor {
     epoch: u64,
     delegation_host: Option<DelegationHost>,
     session_model: Option<Box<SessionModel>>,
+    failure_hint: Option<Box<FailureHint>>,
 }
 
 struct DelegationHost {
@@ -99,6 +100,11 @@ struct DelegationHost {
 /// the caller can identify that exact record. `None` is "unknown", never a
 /// guess.
 pub type SessionModel = dyn Fn(&TaskSpec, AttemptId) -> Option<String> + Send + Sync;
+
+/// Explains a harness failure whose own words name no cause, given the harness
+/// id and the quoted cause text. `None` leaves the reason as it is. The table
+/// lives with the harness recipes, so core never switches on a harness name.
+pub type FailureHint = dyn Fn(&str, &str) -> Option<&'static str> + Send + Sync;
 
 /// Independent observation of the original runner incarnation. A numeric PID
 /// is insufficient: `Alive` must carry the exact recorded birth/session marker.
@@ -126,6 +132,7 @@ impl Supervisor {
             epoch: (uuid::Uuid::new_v4().as_u64_pair().0 & 0x7fff_ffff_ffff_ffff).max(1),
             delegation_host: None,
             session_model: None,
+            failure_hint: None,
         })
     }
 
@@ -135,6 +142,12 @@ impl Supervisor {
     /// the observation `unavailable`.
     pub fn observe_session_models(&mut self, read: Box<SessionModel>) {
         self.session_model = Some(read);
+    }
+
+    /// Explains a failed run whose quoted cause names nothing, using the table
+    /// the caller owns; a harness brgr does not know simply gets no hint.
+    pub fn explain_failures_with(&mut self, hint: Box<FailureHint>) {
+        self.failure_hint = Some(hint);
     }
 
     /// Gives each worker process its exact attempt identity and brgr
@@ -269,6 +282,7 @@ impl Supervisor {
             runner_identity,
             delegation_host: self.delegation_host.as_ref(),
             session_model: self.session_model.as_deref(),
+            failure_hint: self.failure_hint.as_deref(),
         };
 
         for number in 1..=spec.budget.max_attempts {
