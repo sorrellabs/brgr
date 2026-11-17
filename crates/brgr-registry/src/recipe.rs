@@ -106,6 +106,7 @@ pub(crate) enum Source {
     Stdout,
     JsonlAssistantFinal,
     StreamJsonResult,
+    DshHeadlessFinal,
 }
 
 #[derive(Clone, Copy)]
@@ -868,6 +869,62 @@ pub(crate) const RECIPES: &[Recipe] = &[
         read_only: None,
         ..GENERIC
     },
+    Recipe {
+        names: &["dsh"],
+        id: "local.dsh",
+        required_flags: &[
+            "--json",
+            "--session-id <id>",
+            "--permission-mode <preset>",
+            "--approval-policy <policy>",
+        ],
+        // The profile's `agentDefaultModel` picks the model; headless has no
+        // `--model`, so a requested model is refused instead of passed.
+        catalog: None,
+        // The headless flags are documented only by the profile's own help.
+        help_argv: &["--profile", "headless", "--help"],
+        // The documented headless invocation. Full access is the launch itself,
+        // not a level: `workspace-write` is never offered as a lower one.
+        argv: &[
+            "--profile",
+            "headless",
+            "--json",
+            "--permission-mode",
+            "danger-full-access",
+            "--approval-policy",
+            "never",
+            "${input.prompt}",
+        ],
+        model_argv: &[],
+        effort_argv: &[],
+        // `--session-id` adopts the persisted Session a previous final named.
+        resume_argv: &["--session-id", "${input.session}"],
+        // BASE_ENV, the harness home, and its own provider key. Other provider
+        // credentials are not passed through: dsh reads them from the `.env`
+        // file under `$DSH_HOME`, which it loads itself.
+        env_allow: &[
+            "HOME",
+            "PATH",
+            "LANG",
+            "TMPDIR",
+            "DSH_HOME",
+            "DEEPSEEK_API_KEY",
+        ],
+        source: Source::DshHeadlessFinal,
+        capabilities: &[
+            PROCESS_CAPS[0],
+            (
+                "completion",
+                Cap::Supported("process_exit_with_completed_final_event"),
+            ),
+            ("model_select", Cap::Unsupported("configured_default_only")),
+            ("effort_select", Cap::Unsupported("not_documented")),
+        ],
+        full: Some(&[]),
+        edits: None,
+        read_only: None,
+        ..GENERIC
+    },
 ];
 
 /// The recipe an executable's own file name names.
@@ -1052,6 +1109,7 @@ pub(crate) fn draft(
                 Source::Stdout => ResultSource::Stdout,
                 Source::JsonlAssistantFinal => ResultSource::JsonlAssistantFinal,
                 Source::StreamJsonResult => ResultSource::StreamJsonResult,
+                Source::DshHeadlessFinal => ResultSource::DshHeadlessFinal,
             },
             media_type: recipe.media_type.to_owned(),
             max_bytes: 1_048_576,

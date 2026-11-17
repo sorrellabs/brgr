@@ -585,8 +585,10 @@ async fn stop_process_group(child: &mut tokio::process::Child) -> Result<ExitSta
 mod tests {
     use super::*;
 
-    use crate::capture::read_jsonl_semantic;
-    use crate::collect::{collect_result, extract_jsonl_assistant_final, observe_jsonl_model};
+    use crate::capture::{read_jsonl_semantic, read_semantic, retain_dsh_event};
+    use crate::collect::{
+        collect_result, extract_dsh_final, extract_jsonl_assistant_final, observe_jsonl_model,
+    };
     use brgr_platform::process::GroupSpawn;
     use brgr_protocol::TaskSpec;
     use brgr_protocol::{ArtifactContract, AttemptBudget, OwnerId, Route, SCHEMA_V1, TaskId};
@@ -1096,6 +1098,10 @@ mod tests {
             (
                 r#"{"kind":"jsonl_assistant_final"}"#,
                 ResultSource::JsonlAssistantFinal,
+            ),
+            (
+                r#"{"kind":"dsh_headless_final"}"#,
+                ResultSource::DshHeadlessFinal,
             ),
             (
                 r#"{"kind":"file","path":"out.md"}"#,
@@ -2029,5 +2035,415 @@ mod tests {
             wall + Duration::from_secs(70),
         );
         assert_eq!(slept_seconds(start, below), None);
+    }
+
+    /// dsh's model comes from the profile's `agentDefaultModel`, so a route
+    /// asking for one is refused with the place to set it, and effort is not
+    /// offered at all.
+    #[test]
+    fn dsh_route_refuses_a_model_with_the_dsh_setting_and_refuses_effort() {
+        let manifest = dsh_manifest();
+        let mut task = TaskSpec {
+            schema: SCHEMA_V1.to_owned(),
+            task_id: TaskId::new(),
+            revision: 1,
+            create_request_id: "dsh-route-test".to_owned(),
+            owner_id: OwnerId::new("codex:test").unwrap(),
+            objective: "check route".to_owned(),
+            workspace: "/tmp/check-route".to_owned(),
+            route: Route {
+                harness_id: manifest.id.clone(),
+                requested_model: Some("deepseek-chat".to_owned()),
+                requested_effort: None,
+            },
+            required_capabilities: vec!["completion".to_owned()],
+            artifact_contract: ArtifactContract {
+                media_type: "text/plain".to_owned(),
+                max_bytes: 4_096,
+            },
+            acceptance_criteria: vec!["exact answer".to_owned()],
+            budget: AttemptBudget {
+                deadline_seconds: 2,
+                max_attempts: 1,
+            },
+            instructions: TaskInstructions::default(),
+            evidence: brgr_protocol::EvidenceSpec::default(),
+            max_concurrent_children: None,
+            permission: None,
+        };
+        assert!(matches!(
+            manifest.validate_task_route(&task),
+            Err(RunnerError::ConfiguredModelOnly { ref hint, .. })
+                if hint.contains("dsh settings") && hint.contains("agentDefaultModel")
+        ));
+        task.route.requested_model = None;
+        task.route.requested_effort = Some("high".to_owned());
+        assert!(matches!(
+            manifest.validate_task_route(&task),
+            Err(RunnerError::UnsupportedCapability(name)) if name == "effort_select"
+        ));
+    }
+
+    fn dsh_manifest() -> HarnessManifest {
+        let mut manifest = echo_manifest(4_096);
+        manifest.id = "local.dsh".to_owned();
+        manifest.result.source = ResultSource::DshHeadlessFinal;
+        manifest.launch.argv = vec![
+            "--profile".to_owned(),
+            "headless".to_owned(),
+            "--json".to_owned(),
+            "${input.prompt}".to_owned(),
+        ];
+        manifest.launch.resume_argv =
+            vec!["--session-id".to_owned(), "${input.session}".to_owned()];
+        manifest.capabilities = BTreeMap::from([
+            (
+                "completion".to_owned(),
+                Capability {
+                    status: CapabilityStatus::Supported,
+                    semantics: "process_exit_with_completed_final_event".to_owned(),
+                    evidence_ref: None,
+                    tested_identity: None,
+                },
+            ),
+            (
+                "model_select".to_owned(),
+                Capability {
+                    status: CapabilityStatus::Unsupported,
+                    semantics: "configured_default_only".to_owned(),
+                    evidence_ref: None,
+                    tested_identity: None,
+                },
+            ),
+            (
+                "effort_select".to_owned(),
+                Capability {
+                    status: CapabilityStatus::Unsupported,
+                    semantics: "not_documented".to_owned(),
+                    evidence_ref: None,
+                    tested_identity: None,
+                },
+            ),
+        ]);
+        manifest
+    }
+
+    const DSH_COMPLETED: &str = concat!(
+        "{\"type\":\"session\",\"sessionId\":\"session-1\",\"cwd\":\"/w\"}\n",
+        "{\"type\":\"status\",\"phase\":\"turn_start\",\"turn\":1}\n",
+        "{\"type\":\"text\",\"text\":\"working\"}\n",
+        "{\"type\":\"final\",\"sessionId\":\"session-1\",",
+        "\"reason\":{\"kind\":\"completed\"},\"text\":\"answer\"}\n",
+    );
+
+    #[test]
+    fn dsh_completed_final_seals_its_text_and_session() {
+        let completed = extract_dsh_final(DSH_COMPLETED.as_bytes()).unwrap();
+        assert_eq!(completed.text, b"answer");
+        assert_eq!(completed.session.as_deref(), Some("session-1"));
+    }
+
+    #[test]
+    fn dsh_final_with_a_non_completed_reason_is_a_failed_run() {
+        let aborted = concat!(
+            "{\"type\":\"session\",\"sessionId\":\"session-1\"}\n",
+            "{\"type\":\"final\",\"sessionId\":\"session-1\",",
+            "\"reason\":{\"kind\":\"aborted\",\"reason\":{\"kind\":\"user\"}},\"text\":\"\"}\n",
+        );
+        assert!(matches!(
+            extract_dsh_final(aborted.as_bytes()),
+            Err(RunnerError::DshNotCompleted(reason)) if reason == "aborted"
+        ));
+        let error = concat!(
+            "{\"type\":\"final\",\"sessionId\":\"session-1\",",
+            "\"reason\":{\"kind\":\"error\",\"error\":{\"code\":\"quota\",\"message\":\"no budget\"}},",
+            "\"text\":\"\"}\n",
+        );
+        assert!(matches!(
+            extract_dsh_final(error.as_bytes()),
+            Err(RunnerError::DshNotCompleted(reason)) if reason == "error: no budget"
+        ));
+        let no_turn =
+            "{\"type\":\"final\",\"sessionId\":\"session-1\",\"reason\":null,\"text\":\"\"}\n";
+        assert!(matches!(
+            extract_dsh_final(no_turn.as_bytes()),
+            Err(RunnerError::DshNotCompleted(reason)) if reason == "no terminal turn"
+        ));
+    }
+
+    #[test]
+    fn dsh_error_event_fails_with_its_message() {
+        let stream = concat!(
+            "{\"type\":\"session\",\"sessionId\":\"session-1\"}\n",
+            "{\"type\":\"error\",\"message\":\"session \\\"session-1\\\" does not exist\"}\n",
+        );
+        assert!(matches!(
+            extract_dsh_final(stream.as_bytes()),
+            Err(RunnerError::DshError(message))
+                if message == "session \"session-1\" does not exist"
+        ));
+    }
+
+    #[test]
+    fn dsh_stream_cut_off_before_final_fails() {
+        let stream = concat!(
+            "{\"type\":\"session\",\"sessionId\":\"session-1\"}\n",
+            "{\"type\":\"text\",\"text\":\"still working\"}\n",
+        );
+        assert!(matches!(
+            extract_dsh_final(stream.as_bytes()),
+            Err(RunnerError::DshMissingFinal)
+        ));
+    }
+
+    #[test]
+    fn dsh_unknown_event_shape_is_a_typed_error() {
+        for stream in [
+            "{\"type\":\"mystery\"}\n",
+            "{\"kind\":\"completed\"}\n",
+            "{\"type\":\"final\",\"sessionId\":\"s\",\"text\":\"answer\"}\n",
+            "{\"type\":\"final\",\"sessionId\":\"s\",\"reason\":\"completed\",\"text\":\"a\"}\n",
+            "not json\n",
+        ] {
+            assert!(
+                matches!(
+                    extract_dsh_final(stream.as_bytes()),
+                    Err(RunnerError::DshUnexpectedEvent(_) | RunnerError::MalformedJsonl(_))
+                ),
+                "{stream} was not refused as an unknown shape"
+            );
+        }
+    }
+
+    /// Projected text and thinking events can repeat a whole conversation. The
+    /// capture keeps the terminal event, so a long run still seals its answer.
+    #[tokio::test]
+    async fn dsh_capture_keeps_the_final_and_drops_projected_bulk() {
+        use tokio::io::AsyncWriteExt as _;
+
+        let bulk = format!("{}\n", json!({"type": "text", "text": "x".repeat(16_000)}));
+        let raw = format!("{bulk}{DSH_COMPLETED}");
+        let (mut writer, reader) = tokio::io::duplex(8192);
+        let writer_task =
+            tokio::spawn(async move { writer.write_all(raw.as_bytes()).await.unwrap() });
+        let overflow = Arc::new(AtomicBool::new(false));
+        let (semantic, truncated) = read_semantic(
+            reader,
+            4_096,
+            JSONL_TRANSPORT_LIMIT_BYTES,
+            overflow,
+            retain_dsh_event,
+        )
+        .await
+        .unwrap();
+        writer_task.await.unwrap();
+
+        assert!(!truncated);
+        assert!(semantic.len() < 1_024, "{}", semantic.len());
+        assert_eq!(extract_dsh_final(&semantic).unwrap().text, b"answer");
+    }
+
+    #[tokio::test]
+    async fn dsh_completed_fixture_run_seals_the_result() {
+        let workspace = tempfile::tempdir().unwrap();
+        let executable = workspace.path().join("dsh");
+        write_fast_script(
+            &executable,
+            &format!("#!/bin/sh\ncat <<'EOF'\n{DSH_COMPLETED}EOF\n"),
+        );
+        let mut manifest = dsh_manifest();
+        manifest.executable = executable;
+        let output = ProcessRunner::run(
+            &manifest,
+            RunRequest {
+                workspace: workspace.path(),
+                prompt: "answer the task",
+                criteria: None,
+                instructions: None,
+                model: None,
+                effort: None,
+                resume_session: None,
+                permission: None,
+                deadline: Duration::from_mins(1),
+                cancel_path: None,
+                pid_path: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(output.succeeded(&manifest));
+        assert_eq!(output.result, b"answer");
+        assert_eq!(output.session_id.as_deref(), Some("session-1"));
+    }
+
+    #[tokio::test]
+    async fn dsh_aborted_stream_with_exit_one_is_not_successful() {
+        let workspace = tempfile::tempdir().unwrap();
+        let executable = workspace.path().join("dsh");
+        write_fast_script(
+            &executable,
+            "#!/bin/sh\ncat <<'EOF'\n{\"type\":\"session\",\"sessionId\":\"s\"}\n{\"type\":\"final\",\"sessionId\":\"s\",\"reason\":{\"kind\":\"aborted\",\"reason\":{\"kind\":\"user\"}},\"text\":\"\"}\nEOF\nexit 1\n",
+        );
+        let mut manifest = dsh_manifest();
+        manifest.executable = executable;
+        let output = ProcessRunner::run(
+            &manifest,
+            RunRequest {
+                workspace: workspace.path(),
+                prompt: "aborted",
+                criteria: None,
+                instructions: None,
+                model: None,
+                effort: None,
+                resume_session: None,
+                permission: None,
+                deadline: Duration::from_mins(1),
+                cancel_path: None,
+                pid_path: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(!output.succeeded(&manifest));
+        assert!(output.result.is_empty());
+        assert!(output.session_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn dsh_error_event_with_exit_one_quotes_its_message() {
+        let workspace = tempfile::tempdir().unwrap();
+        let executable = workspace.path().join("dsh");
+        write_fast_script(
+            &executable,
+            "#!/bin/sh\ncat <<'EOF'\n{\"type\":\"error\",\"message\":\"no API key configured\"}\nEOF\nexit 1\n",
+        );
+        let mut manifest = dsh_manifest();
+        manifest.executable = executable;
+        let output = ProcessRunner::run(
+            &manifest,
+            RunRequest {
+                workspace: workspace.path(),
+                prompt: "error",
+                criteria: None,
+                instructions: None,
+                model: None,
+                effort: None,
+                resume_session: None,
+                permission: None,
+                deadline: Duration::from_mins(1),
+                cancel_path: None,
+                pid_path: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(!output.succeeded(&manifest));
+        let cause = output.failure_cause().unwrap();
+        assert_eq!(cause.source, CauseSource::ErrorEvent);
+        assert_eq!(cause.text, "no API key configured");
+    }
+
+    #[tokio::test]
+    async fn dsh_completed_stream_with_exit_one_is_not_successful() {
+        let workspace = tempfile::tempdir().unwrap();
+        let executable = workspace.path().join("dsh");
+        write_fast_script(
+            &executable,
+            &format!("#!/bin/sh\ncat <<'EOF'\n{DSH_COMPLETED}EOF\nexit 1\n"),
+        );
+        let mut manifest = dsh_manifest();
+        manifest.executable = executable;
+        let output = ProcessRunner::run(
+            &manifest,
+            RunRequest {
+                workspace: workspace.path(),
+                prompt: "exit one",
+                criteria: None,
+                instructions: None,
+                model: None,
+                effort: None,
+                resume_session: None,
+                permission: None,
+                deadline: Duration::from_mins(1),
+                cancel_path: None,
+                pid_path: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(!output.succeeded(&manifest));
+        assert!(output.result.is_empty());
+    }
+
+    #[tokio::test]
+    async fn dsh_stream_cut_off_before_final_is_a_typed_failure() {
+        let workspace = tempfile::tempdir().unwrap();
+        let executable = workspace.path().join("dsh");
+        write_fast_script(
+            &executable,
+            "#!/bin/sh\ncat <<'EOF'\n{\"type\":\"session\",\"sessionId\":\"s\"}\n{\"type\":\"text\",\"text\":\"unfinished\"}\nEOF\n",
+        );
+        let mut manifest = dsh_manifest();
+        manifest.executable = executable;
+        let result = ProcessRunner::run(
+            &manifest,
+            RunRequest {
+                workspace: workspace.path(),
+                prompt: "cut off",
+                criteria: None,
+                instructions: None,
+                model: None,
+                effort: None,
+                resume_session: None,
+                permission: None,
+                deadline: Duration::from_mins(1),
+                cancel_path: None,
+                pid_path: None,
+            },
+        )
+        .await;
+
+        assert!(matches!(result, Err(RunnerError::DshMissingFinal)));
+    }
+
+    #[tokio::test]
+    async fn dsh_follow_up_passes_the_final_session_id() {
+        let workspace = tempfile::tempdir().unwrap();
+        let executable = workspace.path().join("dsh");
+        write_fast_script(
+            &executable,
+            &format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > argv.txt\ncat <<'EOF'\n{DSH_COMPLETED}EOF\n"
+            ),
+        );
+        let mut manifest = dsh_manifest();
+        manifest.executable = executable;
+        let output = ProcessRunner::run(
+            &manifest,
+            RunRequest {
+                workspace: workspace.path(),
+                prompt: "continue",
+                criteria: None,
+                instructions: None,
+                model: None,
+                effort: None,
+                resume_session: Some("session-1"),
+                permission: None,
+                deadline: Duration::from_mins(1),
+                cancel_path: None,
+                pid_path: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        let argv = std::fs::read_to_string(workspace.path().join("argv.txt")).unwrap();
+        assert!(argv.lines().any(|line| line == "--session-id"), "{argv}");
+        assert!(argv.lines().any(|line| line == "session-1"), "{argv}");
+        assert_eq!(output.session_id.as_deref(), Some("session-1"));
     }
 }

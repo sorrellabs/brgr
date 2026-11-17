@@ -58,6 +58,14 @@ pub enum RunnerError {
     UnexpectedResultShape,
     #[error("JSONL output has no final assistant text")]
     MissingAssistantText,
+    #[error("dsh stream ended without a final event")]
+    DshMissingFinal,
+    #[error("dsh reported an error: {0}")]
+    DshError(String),
+    #[error("dsh run did not complete: {0}")]
+    DshNotCompleted(String),
+    #[error("dsh stream has an unknown event shape: {0}")]
+    DshUnexpectedEvent(String),
     #[error("last assistant message failed: {0}")]
     AssistantError(String),
     #[error("JSONL assistant model identity is unavailable")]

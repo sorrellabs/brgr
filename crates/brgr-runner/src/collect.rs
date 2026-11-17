@@ -34,6 +34,9 @@ pub(crate) fn collect_result(
             extract_jsonl_assistant_final(stdout).map(|result| (result, None))
         }
         ResultSource::StreamJsonResult => extract_stream_json_result(stdout),
+        ResultSource::DshHeadlessFinal => {
+            extract_dsh_final(stdout).map(|completed| (completed.text, completed.session))
+        }
         ResultSource::File { path } => {
             let rendered = substitute(path, values)?;
             let relative = Path::new(&rendered);
@@ -105,6 +108,122 @@ pub(crate) fn collect_result_with_model(
             None
         };
     Ok((result, observed_model, session_id))
+}
+
+/// The terminal `final` event of a `dsh --json` stream.
+pub(crate) struct DshFinal {
+    pub(crate) text: Vec<u8>,
+    /// The harness session identity a later `--session-id` continues.
+    pub(crate) session: Option<String>,
+}
+
+/// Reads the `dsh --profile headless --json` stream strictly.
+///
+/// The stream is a developer preview: a shape this parser does not know is a
+/// typed error, never a guess. A well-formed stream can still be a failed run,
+/// so the result is only sealed when `final` is present and its durable turn
+/// reason is `completed`.
+pub(crate) fn extract_dsh_final(stdout: &[u8]) -> Result<DshFinal, RunnerError> {
+    let mut opening_session = None;
+    let mut final_text = None;
+    let mut final_session = None;
+    let mut incomplete = None;
+    for line in stdout
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+    {
+        let event: serde_json::Value = serde_json::from_slice(line)?;
+        let object = event.as_object().ok_or_else(|| {
+            RunnerError::DshUnexpectedEvent("an event is not a JSON object".to_owned())
+        })?;
+        let kind = event_string(object, "type")?;
+        match kind {
+            "session" => {
+                opening_session = Some(event_string(object, "sessionId")?.to_owned());
+            }
+            "status" | "text" | "thinking" | "tool_call" | "tool_result" => {}
+            "error" => {
+                return Err(RunnerError::DshError(
+                    event_string(object, "message")?.to_owned(),
+                ));
+            }
+            "final" => {
+                if final_text.is_some() || incomplete.is_some() {
+                    return Err(RunnerError::DshUnexpectedEvent(
+                        "a second final event".to_owned(),
+                    ));
+                }
+                let text = event_string(object, "text")?;
+                let session = event_string(object, "sessionId")?;
+                if let Some(opening) = &opening_session
+                    && opening != session
+                {
+                    return Err(RunnerError::DshUnexpectedEvent(
+                        "final sessionId differs from the opening session".to_owned(),
+                    ));
+                }
+                final_session = Some(session.to_owned());
+                match object.get("reason") {
+                    Some(serde_json::Value::Null) => {
+                        incomplete = Some("no terminal turn".to_owned());
+                    }
+                    Some(serde_json::Value::Object(reason)) => {
+                        let reason_kind = reason
+                            .get("kind")
+                            .and_then(serde_json::Value::as_str)
+                            .ok_or_else(|| {
+                                RunnerError::DshUnexpectedEvent(
+                                    "final reason has no string kind".to_owned(),
+                                )
+                            })?;
+                        if reason_kind == "completed" {
+                            final_text = Some(text.to_owned());
+                        } else {
+                            let detail = reason
+                                .get("error")
+                                .and_then(|error| error.get("message"))
+                                .and_then(serde_json::Value::as_str)
+                                .filter(|message| !message.trim().is_empty());
+                            incomplete = Some(match detail {
+                                Some(message) => format!("{reason_kind}: {message}"),
+                                None => reason_kind.to_owned(),
+                            });
+                        }
+                    }
+                    _ => {
+                        return Err(RunnerError::DshUnexpectedEvent(
+                            "final has no reason object or null".to_owned(),
+                        ));
+                    }
+                }
+            }
+            other => {
+                return Err(RunnerError::DshUnexpectedEvent(format!(
+                    "unknown event type `{other}`"
+                )));
+            }
+        }
+    }
+    let Some(text) = final_text else {
+        return match incomplete {
+            Some(reason) => Err(RunnerError::DshNotCompleted(reason)),
+            None => Err(RunnerError::DshMissingFinal),
+        };
+    };
+    Ok(DshFinal {
+        text: text.into_bytes(),
+        session: final_session,
+    })
+}
+
+fn event_string<'a>(
+    object: &'a serde_json::Map<String, serde_json::Value>,
+    name: &str,
+) -> Result<&'a str, RunnerError> {
+    object
+        .get(name)
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| RunnerError::DshUnexpectedEvent(format!("{name} is not a string")))
 }
 
 /// Qwen Code's `-o stream-json` terminal event, pinned to the 0.27.4 envelope:

@@ -89,6 +89,16 @@ where
             )
             .await
         }
+        ResultSource::DshHeadlessFinal => {
+            read_semantic(
+                reader,
+                limit,
+                JSONL_TRANSPORT_LIMIT_BYTES,
+                overflow,
+                retain_dsh_event,
+            )
+            .await
+        }
         _ => capture_bounded(reader, limit, overflow).await,
     }
 }
@@ -263,6 +273,37 @@ pub(crate) fn retain_stream_json_event(line: &[u8], retained: &mut Vec<u8>, limi
         return false;
     }
     retained.extend_from_slice(&bytes);
+    retained.push(b'\n');
+    true
+}
+
+/// The dsh reduction: keeps only the events a run's outcome needs — the
+/// opening `session`, any `error`, and the terminal `final`. Projected `text`,
+/// `thinking`, `status`, `tool_call`, and `tool_result` events can repeat a
+/// whole conversation and none of them decide the result. Anything
+/// unrecognized is kept so the strict parser refuses it rather than lose it
+/// here.
+pub(crate) fn retain_dsh_event(line: &[u8], retained: &mut Vec<u8>, limit: u64) -> bool {
+    if line.is_empty() {
+        return true;
+    }
+    if let Ok(event) = serde_json::from_slice::<Value>(line)
+        && matches!(
+            event.get("type").and_then(Value::as_str),
+            Some("status" | "text" | "thinking" | "tool_call" | "tool_result")
+        )
+    {
+        return true;
+    }
+    if u64::try_from(retained.len())
+        .unwrap_or(u64::MAX)
+        .saturating_add(u64::try_from(line.len()).unwrap_or(u64::MAX))
+        .saturating_add(1)
+        > limit
+    {
+        return false;
+    }
+    retained.extend_from_slice(line);
     retained.push(b'\n');
     true
 }
