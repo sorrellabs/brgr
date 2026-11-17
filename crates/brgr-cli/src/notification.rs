@@ -10,7 +10,9 @@ use std::{
 };
 
 use anyhow::{Context as _, Result, bail};
-use brgr_protocol::{OwnerId, ResultId, TaskId, TaskSpec, TerminalOutcome};
+use brgr_protocol::{
+    IncomingOwner, OfferedPane, OwnerId, ResultId, TaskId, TaskSpec, TerminalOutcome,
+};
 use brgr_store::{
     NotificationTarget, PendingWorkflowNotification, QuestionTarget, Store, StoreError,
     TakeoverState, WorkflowNotificationTarget, WorkflowRunId, WorkflowRunState,
@@ -62,7 +64,7 @@ fn database_identity(path: &Path) -> Result<Option<DatabaseIdentity>> {
 /// prove which pane the new head runs in; this command can, and a head started by
 /// `head handoff` names its own pane, which brgr opened. Best effort: a notice
 /// that cannot be delivered stays queued.
-pub async fn register_incoming_head(paths: &Paths, incoming: &crate::head::IncomingHead) {
+pub async fn register_incoming_head(paths: &Paths, incoming: &IncomingOwner) {
     let Ok(store) = Store::open(&paths.store) else {
         return;
     };
@@ -121,7 +123,7 @@ async fn register_offered_pane(
     store: &Store,
     owner_id: &OwnerId,
     session_id: &str,
-    offered: &crate::head::OfferedPane,
+    offered: &OfferedPane,
 ) -> Result<bool> {
     let binary = PathBuf::from(&offered.herdr_bin);
     if !binary.is_absolute() || !binary.is_file() {

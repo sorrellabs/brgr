@@ -431,6 +431,27 @@ pub(crate) enum ConfigCommand {
     },
 }
 
+/// What a bridge host may do with a workflow command.
+pub(crate) enum WorkflowBridge {
+    /// Not a workflow SDK init.
+    NotInit,
+    /// A `workflow init`, with the directory named on the command line.
+    Init { dir: Option<PathBuf> },
+}
+
+impl Command {
+    /// Classifies a workflow command for the bridge host, which may only let an
+    /// SDK `init` write inside the selected workspace.
+    pub(crate) fn workflow_bridge(&self) -> WorkflowBridge {
+        match self {
+            Self::Workflow {
+                command: crate::workflow::WorkflowCommand::Init { dir, .. },
+            } => WorkflowBridge::Init { dir: dir.clone() },
+            _ => WorkflowBridge::NotInit,
+        }
+    }
+}
+
 #[derive(Subcommand)]
 pub(crate) enum AliasCommand {
     Set {

@@ -44,7 +44,7 @@ pub(crate) fn named(pane: &str) -> Option<String> {
         .ok()
         .flatten()
         .and_then(|session| for_session(&session, Some(pane)))
-        .or_else(|| crate::workflow::trusts_recorded_pane(pane).then(|| pane.to_owned()))
+        .or_else(|| crate::extension::trusts_recorded_pane(pane).then(|| pane.to_owned()))
 }
 
 /// A pane that is alive and runs a harness that can receive `FROM BRGR`. It

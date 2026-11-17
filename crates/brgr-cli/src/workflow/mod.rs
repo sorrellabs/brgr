@@ -3,8 +3,6 @@
 mod driver;
 mod init;
 
-pub(crate) use driver::trusts_recorded_pane;
-
 use std::fmt::Write as _;
 
 use anyhow::{Result, bail};
@@ -54,6 +52,18 @@ pub(crate) enum WorkflowCommand {
         run: String,
         script: std::path::PathBuf,
     },
+}
+
+/// Installs the workflow orchestrator's hooks into the core.
+///
+/// The core calls through these instead of importing `workflow`, so it runs
+/// without the orchestrator.
+pub(crate) fn install_hooks() {
+    crate::extension::install(crate::extension::Hooks {
+        diverged_admission: diverged_error,
+        trusts_recorded_pane: driver::trusts_recorded_pane,
+        parallel_limit_exit: exit_parallel_limit,
+    });
 }
 
 pub(crate) fn is_hidden_drive(command: &WorkflowCommand) -> bool {

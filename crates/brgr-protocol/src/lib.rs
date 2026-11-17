@@ -537,6 +537,28 @@ pub struct Event {
     pub payload: serde_json::Value,
 }
 
+/// An owner surface that has just taken command, for the core to record before
+/// it delivers that owner's queued notices.
+///
+/// The core resolves and delivers notices without knowing which pattern put the
+/// owner in place; a head handoff and any later orchestrator supply this value.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IncomingOwner {
+    pub owner: OwnerId,
+    pub session: String,
+    /// The pane the orchestrator opened for it, when it opened one.
+    pub offered: Option<OfferedPane>,
+}
+
+/// A pane an orchestrator opened for an incoming owner, as it recorded it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OfferedPane {
+    pub pane: String,
+    pub terminal: Option<String>,
+    pub herdr_bin: String,
+    pub herdr_session: Option<String>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum ProtocolError {
     #[error("owner id must contain 1 to 256 bytes")]

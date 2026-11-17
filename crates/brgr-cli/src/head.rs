@@ -6,7 +6,7 @@
 use std::{env, fs, path::PathBuf};
 
 use anyhow::{Context as _, Result, anyhow, bail};
-use brgr_protocol::{OwnerId, TaskId};
+use brgr_protocol::{IncomingOwner, OfferedPane, OwnerId, TaskId};
 use brgr_store::{
     AbandonedClaim, HandoffManifest, RetireOutcome, Store, StoreError, Takeover, TakeoverId,
     TakeoverState,
@@ -107,27 +107,11 @@ pub(crate) enum HeadCommand {
     Exit { takeover: TakeoverId },
 }
 
-/// A head that just took command, for the caller to record its pane.
-pub(crate) struct IncomingHead {
-    pub(crate) owner: OwnerId,
-    pub(crate) session: String,
-    /// The pane `head handoff` opened for it, when it took command with `take`.
-    pub(crate) offered: Option<OfferedPane>,
-}
-
 /// Parse a handoff TASK, keeping clap's uuid error and adding where to find one.
 fn parse_handoff_task(value: &str) -> Result<TaskId, String> {
     value
         .parse()
         .map_err(|error: uuid::Error| format!("{error}; run `brgr status` to find a task id"))
-}
-
-/// The pane a handoff opened for the incoming head, from the stored offer.
-pub(crate) struct OfferedPane {
-    pub(crate) pane: String,
-    pub(crate) terminal: Option<String>,
-    pub(crate) herdr_bin: String,
-    pub(crate) herdr_session: Option<String>,
 }
 
 /// Runs a head command. Returns the head that just took command, for `commit`,
@@ -136,7 +120,7 @@ pub(crate) fn run(
     paths: &Paths,
     command: HeadCommand,
     json_output: bool,
-) -> Result<Option<IncomingHead>> {
+) -> Result<Option<IncomingOwner>> {
     let store = Store::open(&paths.store)?;
     let incoming = incoming_head(paths, &store, &command)?;
     match command {
@@ -212,16 +196,18 @@ fn incoming_head(
     paths: &Paths,
     store: &Store,
     command: &HeadCommand,
-) -> Result<Option<IncomingHead>> {
+) -> Result<Option<IncomingOwner>> {
     Ok(match command {
-        HeadCommand::Commit { takeover } => store.takeover(*takeover)?.map(|record| IncomingHead {
-            owner: record.owner_id,
-            session: record.to_session,
-            offered: None,
-        }),
+        HeadCommand::Commit { takeover } => {
+            store.takeover(*takeover)?.map(|record| IncomingOwner {
+                owner: record.owner_id,
+                session: record.to_session,
+                offered: None,
+            })
+        }
         HeadCommand::Claim { task, .. } => {
             let owner = store.task(*task)?.owner_id;
-            crate::current_session()?.map(|session| IncomingHead {
+            crate::current_session()?.map(|session| IncomingOwner {
                 owner,
                 session,
                 offered: None,
@@ -233,7 +219,7 @@ fn incoming_head(
                 None => offer_owner(paths, offer)?,
             };
             let offered = offered_pane(paths, offer);
-            crate::current_session()?.map(|session| IncomingHead {
+            crate::current_session()?.map(|session| IncomingOwner {
                 owner,
                 session,
                 offered,
