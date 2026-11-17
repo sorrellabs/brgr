@@ -17,6 +17,7 @@ Herdr finally sees brgr's workers: Claude workers report status, carry a sidebar
 - `claude-route claude-code-only|any` decides whether Claude models may run on harnesses other than `local.claude-code`; admission refuses, never reroutes (#415).
 - `brgr harness list` (#405). `harness add` works without `--workspace` and `--prompt` and keeps global git hooks out of its scratch (#406). GJC is a tier 3 harness again (#408). Command Code is recognised from its package path when installed as `cmd` or `index.mjs` (#429).
 - Stopping a worker's TUI host signals only verified descendants (#418).
+- Codex workers are launched without a `shell_environment_policy` override, which made Codex 0.169 hang on every tool call; a Codex worker finds its home from its worktree path (#435).
 - Test processes start from a cleared environment (#412), and the notice tests wait for a whole notice line (#430).
 
 ## 2.15.24 — 2026-11-13
