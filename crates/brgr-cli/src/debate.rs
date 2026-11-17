@@ -141,11 +141,7 @@ fn find_wait_marker(dir: &std::path::Path, task: &str) -> Option<i64> {
         let Ok(pid) = pid_text.parse::<i32>() else {
             continue;
         };
-        if !std::process::Command::new("/bin/kill")
-            .args(["-0", &pid.to_string()])
-            .status()
-            .is_ok_and(|status| status.success())
-        {
+        if !brgr_platform::process::pid_alive(pid.cast_unsigned()) {
             let _ = std::fs::remove_file(entry.path());
             continue;
         }

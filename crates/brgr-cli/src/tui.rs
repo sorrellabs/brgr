@@ -8,7 +8,6 @@ use std::{
 use anyhow::{Result, bail};
 use brgr_protocol::OwnerId;
 use dialoguer::console::Term;
-use tokio::signal::unix::{SignalKind, signal};
 use tokio::time::{Duration, sleep};
 
 use crate::{
@@ -180,33 +179,26 @@ fn apply_event(paths: &Paths, options: &BoardOptions, state: &mut State, event: 
     }
 }
 
-async fn next_event(
-    sigint: &mut tokio::signal::unix::Signal,
-    sigterm: &mut tokio::signal::unix::Signal,
-    sighup: &mut tokio::signal::unix::Signal,
-    sigwinch: &mut tokio::signal::unix::Signal,
-) -> Event {
+async fn next_event(signals: &mut brgr_platform::terminal::Signals) -> Event {
+    use brgr_platform::terminal::TermSignal;
     tokio::select! {
         () = sleep(Duration::from_secs(2)) => Event::Tick,
-        _ = sigint.recv() => Event::Quit,
-        _ = sigterm.recv() => Event::Quit,
-        _ = sighup.recv() => Event::Quit,
-        _ = sigwinch.recv() => Event::Resize,
+        signal = signals.next() => match signal {
+            TermSignal::Resize => Event::Resize,
+            TermSignal::Interrupt | TermSignal::Terminate | TermSignal::Hangup => Event::Quit,
+        },
     }
 }
 
 async fn live_loop(paths: &Paths, options: &BoardOptions) -> Result<()> {
-    let mut sigint = signal(SignalKind::interrupt())?;
-    let mut sigterm = signal(SignalKind::terminate())?;
-    let mut sighup = signal(SignalKind::hangup())?;
-    let mut sigwinch = signal(SignalKind::from_raw(libc::SIGWINCH))?;
+    let mut signals = brgr_platform::terminal::Signals::new()?;
     let _screen = ScreenGuard::enter()?;
     let mut state = load_state(paths, options);
     loop {
         if draw_frame(&state, options.host).is_err() {
             return Ok(());
         }
-        let event = next_event(&mut sigint, &mut sigterm, &mut sighup, &mut sigwinch).await;
+        let event = next_event(&mut signals).await;
         if !apply_event(paths, options, &mut state, event) {
             return Ok(());
         }

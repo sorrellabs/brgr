@@ -53,7 +53,6 @@ use std::{
     env,
     fs::{self},
     io::Write,
-    os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
 };
 
@@ -120,7 +119,7 @@ impl Paths {
         };
         for path in [&paths.home, &paths.launches, &paths.runs, &paths.worktrees] {
             fs::create_dir_all(path)?;
-            fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+            brgr_platform::fs::set_private_dir(path)?;
         }
         Ok(paths)
     }
@@ -227,8 +226,7 @@ fn write_bytes_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     let parent = path.parent().context("output path has no parent")?;
     fs::create_dir_all(parent)?;
     let mut file = NamedTempFile::new_in(parent)?;
-    file.as_file()
-        .set_permissions(fs::Permissions::from_mode(0o600))?;
+    brgr_platform::fs::set_private_file_mode(file.as_file())?;
     file.write_all(bytes)?;
     file.as_file().sync_all()?;
     file.persist(path)?;
@@ -880,9 +878,7 @@ fn write_json_atomic(path: &Path, value: &impl Serialize) -> Result<()> {
     let mut temporary = NamedTempFile::new_in(parent)?;
     serde_json::to_writer_pretty(&mut temporary, value)?;
     temporary.write_all(b"\n")?;
-    temporary
-        .as_file_mut()
-        .set_permissions(fs::Permissions::from_mode(0o600))?;
+    brgr_platform::fs::set_private_file_mode(temporary.as_file())?;
     temporary.as_file_mut().sync_all()?;
     temporary.persist(path)?;
     Ok(())
@@ -893,9 +889,7 @@ fn write_json_new(path: &Path, value: &impl Serialize) -> Result<()> {
     let mut temporary = NamedTempFile::new_in(parent)?;
     serde_json::to_writer_pretty(&mut temporary, value)?;
     temporary.write_all(b"\n")?;
-    temporary
-        .as_file_mut()
-        .set_permissions(fs::Permissions::from_mode(0o600))?;
+    brgr_platform::fs::set_private_file_mode(temporary.as_file())?;
     temporary
         .persist_noclobber(path)
         .map_err(|error| error.error)?;

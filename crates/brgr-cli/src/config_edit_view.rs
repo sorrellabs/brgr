@@ -199,10 +199,9 @@ pub(crate) async fn run(paths: &Paths, json: bool) -> Result<()> {
     let _cursor = CursorGuard(term.clone());
     // console restores termios before raising SIGINT and returning Interrupted.
     // Keep the signal from terminating the process before CursorGuard can run.
-    let mut interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
     tokio::select! {
         result = edit(paths, &term) => result,
-        _ = interrupt.recv() => Ok(()),
+        result = tokio::signal::ctrl_c() => result.map_err(Into::into),
     }
 }
 

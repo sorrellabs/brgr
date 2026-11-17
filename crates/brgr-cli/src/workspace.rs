@@ -4,9 +4,8 @@ use std::{
     collections::BTreeSet,
     env,
     fmt::Write as _,
-    fs::{self, File},
+    fs,
     io::{self, Read as _, Write},
-    os::unix::fs::{MetadataExt as _, PermissionsExt as _},
     path::{Component, Path, PathBuf},
     process::{Command, Stdio},
     thread,
@@ -51,7 +50,10 @@ struct SelectedFile {
 }
 
 enum SelectedAction {
-    Copy { contents: Vec<u8>, mode: u32 },
+    Copy {
+        contents: Vec<u8>,
+        mode: Option<u32>,
+    },
     Delete,
 }
 
@@ -194,23 +196,18 @@ fn read_selected_file(
             if *total_bytes > MAX_SELECTED_TOTAL_BYTES {
                 bail!("selected snapshot exceeds 20 MiB");
             }
-            let file = File::open(&path)?;
-            let opened = file.metadata()?;
-            if before.dev() != opened.dev() || before.ino() != opened.ino() {
+            let Some(file) = brgr_platform::fs::open_matching(&path, &before)? else {
                 bail!(
                     "selected file changed while being opened: {}",
                     relative.display()
                 );
-            }
+            };
             let mut contents = Vec::new();
             file.take(MAX_SELECTED_FILE_BYTES + 1)
                 .read_to_end(&mut contents)?;
             let after = fs::symlink_metadata(&path)?;
             if contents.len() as u64 != before.len()
-                || before.dev() != after.dev()
-                || before.ino() != after.ino()
-                || before.mtime() != after.mtime()
-                || before.mtime_nsec() != after.mtime_nsec()
+                || !brgr_platform::fs::unchanged(&before, &after)
             {
                 bail!(
                     "selected file changed while being captured: {}",
@@ -219,7 +216,7 @@ fn read_selected_file(
             }
             Ok(SelectedAction::Copy {
                 contents,
-                mode: before.permissions().mode() & 0o777,
+                mode: brgr_platform::fs::mode_bits(&before),
             })
         }
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
@@ -279,9 +276,7 @@ pub(crate) fn apply_selected_snapshot(target: &Path, snapshot: &SelectedSnapshot
                 let mut temporary = NamedTempFile::new_in(&parent)?;
                 temporary.write_all(contents)?;
                 temporary.as_file_mut().sync_all()?;
-                temporary
-                    .as_file_mut()
-                    .set_permissions(fs::Permissions::from_mode(*mode))?;
+                brgr_platform::fs::apply_mode_bits(temporary.as_file(), *mode)?;
                 temporary.persist(&destination)?;
             }
             SelectedAction::Delete => {
@@ -348,7 +343,7 @@ pub(crate) fn selected_snapshot_tree(
                     bail!("selected snapshot object could not be written");
                 }
                 let oid = String::from_utf8(output.stdout)?;
-                let mode = if mode & 0o111 == 0 {
+                let mode = if mode.unwrap_or(0o644) & 0o111 == 0 {
                     "100644"
                 } else {
                     "100755"
@@ -503,15 +498,7 @@ fn admission_lock_holder_is_dead(path: &Path) -> bool {
     let Ok(pid) = text.trim().parse::<u32>() else {
         return false;
     };
-    let output = Command::new("/bin/ps")
-        .args(["-p", &pid.to_string(), "-o", "pid="])
-        .output();
-    match output {
-        Ok(output) => {
-            !output.status.success() || String::from_utf8_lossy(&output.stdout).trim().is_empty()
-        }
-        Err(_) => false,
-    }
+    !brgr_platform::process::pid_alive(pid)
 }
 
 /// Removes a task worktree brgr just created when admission did not record the

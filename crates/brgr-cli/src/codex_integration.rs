@@ -4,7 +4,6 @@ use std::{
     fmt::Write as _,
     fs,
     io::Write,
-    os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -166,7 +165,7 @@ pub fn install(brgr_home: &Path) -> Result<Value> {
     };
     let skill_dir = skill_path.parent().context("skill path has no parent")?;
     fs::create_dir_all(skill_dir)?;
-    fs::set_permissions(skill_dir, fs::Permissions::from_mode(0o700))?;
+    brgr_platform::fs::set_private_dir(skill_dir)?;
     let receipt = installation_receipt(&hooks_path, &skill_path, commands, &executable)?;
     let changed = (|| -> Result<()> {
         write_bytes_atomic(&skill_path, SKILL_TEXT.as_bytes())?;
@@ -247,7 +246,7 @@ pub fn claude_install(brgr_home: &Path) -> Result<Value> {
     )?;
     let skill_dir = skill_path.parent().context("skill path has no parent")?;
     fs::create_dir_all(skill_dir)?;
-    fs::set_permissions(skill_dir, fs::Permissions::from_mode(0o700))?;
+    brgr_platform::fs::set_private_dir(skill_dir)?;
     write_bytes_atomic(&skill_path, SKILL_TEXT.as_bytes())?;
     let receipt = SkillReceipt {
         skill_path: skill_path.clone(),
@@ -496,14 +495,10 @@ fn write_bytes_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     let mut temporary = NamedTempFile::new_in(target_parent)?;
     temporary.write_all(bytes)?;
     if target == path {
-        temporary
-            .as_file_mut()
-            .set_permissions(fs::Permissions::from_mode(0o600))?;
+        brgr_platform::fs::set_private_file_mode(temporary.as_file())?;
     } else {
-        let mode = fs::metadata(&target)?.permissions().mode() & 0o777;
-        temporary
-            .as_file_mut()
-            .set_permissions(fs::Permissions::from_mode(mode))?;
+        let mode = brgr_platform::fs::mode_bits(&fs::metadata(&target)?);
+        brgr_platform::fs::apply_mode_bits(temporary.as_file(), mode)?;
     }
     temporary.as_file_mut().sync_all()?;
     temporary.persist(&target)?;

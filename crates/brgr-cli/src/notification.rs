@@ -1,9 +1,7 @@
 use std::{
     env,
-    fs::{self, File, OpenOptions, TryLockError},
+    fs::{self, File, TryLockError},
     io::{Read as _, Seek as _, SeekFrom, Write as _},
-    os::unix::fs::{MetadataExt as _, OpenOptionsExt as _},
-    os::unix::process::CommandExt as _,
     path::{Path, PathBuf},
     process::{Command, Stdio},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -36,8 +34,7 @@ const CLAIM_LEASE_SECONDS: i64 = 40;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct DatabaseIdentity {
-    device: u64,
-    inode: u64,
+    key: brgr_platform::fs::FileKey,
 }
 
 fn database_identity(path: &Path) -> Result<Option<DatabaseIdentity>> {
@@ -50,8 +47,7 @@ fn database_identity(path: &Path) -> Result<Option<DatabaseIdentity>> {
         return Ok(None);
     }
     Ok(Some(DatabaseIdentity {
-        device: metadata.dev(),
-        inode: metadata.ino(),
+        key: brgr_platform::fs::file_key(&metadata),
     }))
 }
 
@@ -500,10 +496,9 @@ fn spawn_dispatcher(
     configure: impl FnOnce(&mut Command),
 ) -> Result<()> {
     let mut command = Command::new(env::current_exe()?);
-    let log = OpenOptions::new()
+    let log = brgr_platform::fs::private_create_options()
         .create(true)
         .append(true)
-        .mode(0o600)
         .open(paths.runs.join(log_name))?;
     configure(&mut command);
     command
@@ -516,7 +511,7 @@ fn spawn_dispatcher(
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::from(log));
-    command.process_group(0);
+    brgr_platform::process::spawn_in_new_group(&mut command);
     command
         .spawn()
         .context("brgr notification dispatcher could not start")?;
@@ -638,12 +633,11 @@ async fn commit_delivery(mut mark: impl FnMut() -> Result<(), StoreError>) -> Re
 }
 
 fn try_notify_lock(path: &Path) -> Result<Option<File>> {
-    let lock = OpenOptions::new()
+    let lock = brgr_platform::fs::private_create_options()
         .read(true)
         .write(true)
         .create(true)
         .truncate(false)
-        .mode(0o600)
         .open(path)?;
     match lock.try_lock() {
         Ok(()) => Ok(Some(lock)),

@@ -3,10 +3,10 @@
 //! it is stopped before the TUI resumes the session in its own private server.
 use super::NativeLaunch;
 use anyhow::{Context as _, Result, bail};
+use brgr_platform::process::GroupSpawn as _;
 use serde_json::{Value, json};
 use std::{
     fs,
-    os::unix::process::CommandExt as _,
     process::{Command, Stdio},
     thread,
     time::{Duration, Instant},
@@ -159,7 +159,7 @@ impl Server {
                 .stdin(Stdio::piped())
                 .stdout(log.reopen()?)
                 .stderr(log.reopen()?)
-                .process_group(0)
+                .in_new_group()
                 .spawn()
                 .context("could not start private OpenCode catalog server")?,
         );
@@ -202,11 +202,9 @@ struct ApiChild(std::process::Child);
 
 impl Drop for ApiChild {
     fn drop(&mut self) {
-        let _ = Command::new("/bin/kill")
-            .args(["-KILL", "--", &format!("-{}", self.0.id())])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
+        if let Ok(tree) = brgr_platform::process::ProcessTree::adopt(self.0.id()) {
+            let _ = tree.kill_now();
+        }
         let _ = self.0.kill();
         let _ = self.0.wait();
     }
@@ -231,7 +229,7 @@ fn api(launch: &NativeLaunch, server: &Server, args: &[&str]) -> Result<Value> {
             .stdin(Stdio::null())
             .stdout(stdout.reopen()?)
             .stderr(stderr.reopen()?)
-            .process_group(0)
+            .in_new_group()
             .spawn()
             .context("could not start OpenCode session API")?,
     );

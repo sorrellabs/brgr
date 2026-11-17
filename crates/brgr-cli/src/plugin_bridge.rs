@@ -1,5 +1,6 @@
 //! A private, pane-lifetime file bridge for brgr commands from sandboxed Codex.
 
+use brgr_platform::process::GroupSpawn;
 use std::{
     env, fs,
     io::{self, Read as _, Write as _},
@@ -84,13 +85,9 @@ impl Drop for ProcessGroupGuard {
     fn drop(&mut self) {
         if self.armed
             && let Some(pid) = self.pid
+            && let Ok(tree) = brgr_platform::process::ProcessTree::adopt(pid)
         {
-            let _ = std::process::Command::new("/bin/kill")
-                .args(["-KILL", "--", &format!("-{pid}")])
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status();
+            let _ = tree.kill_now();
         }
     }
 }
@@ -442,8 +439,7 @@ async fn run_request(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
-    #[cfg(unix)]
-    command.process_group(0);
+    command.in_new_group();
     for (name, value) in [
         ("CODEX_THREAD_ID", request.codex_thread_id.as_ref()),
         ("BRGR_SESSION_ID", request.brgr_session_id.as_ref()),
@@ -540,7 +536,7 @@ async fn read_capped_pipe<T: AsyncReadExt + Unpin>(
             Ok(n) => {
                 let previous = total.fetch_add(n, Ordering::Relaxed);
                 if previous.saturating_add(n) > MAX_OUTPUT_BYTES {
-                    kill_process_group(pid).await;
+                    kill_process_group(pid);
                     break;
                 }
                 bytes.extend_from_slice(&buf[..n]);
@@ -551,22 +547,18 @@ async fn read_capped_pipe<T: AsyncReadExt + Unpin>(
 }
 
 async fn stop_child(child: &mut Child, pid: Option<u32>) {
-    kill_process_group(pid).await;
+    kill_process_group(pid);
     let _ = child.start_kill();
     let _ = timeout(KILL_WAIT, child.wait()).await;
 }
 
-async fn kill_process_group(pid: Option<u32>) {
+fn kill_process_group(pid: Option<u32>) {
     let Some(pid) = pid else {
         return;
     };
-    let _ = tokio::process::Command::new("/bin/kill")
-        .args(["-KILL", "--", &format!("-{pid}")])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .await;
+    if let Ok(tree) = brgr_platform::process::ProcessTree::adopt(pid) {
+        let _ = tree.kill_now();
+    }
 }
 
 #[cfg(test)]

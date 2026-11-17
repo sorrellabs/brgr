@@ -3,9 +3,8 @@
 use std::{
     env,
     fmt::Write as _,
-    fs::{self, File, OpenOptions},
+    fs::{self, File},
     io::Read,
-    os::unix::fs::OpenOptionsExt,
     path::{Path, PathBuf},
 };
 
@@ -296,20 +295,16 @@ pub(crate) async fn run_task(paths: &Paths, mut args: RunArgs, json_output: bool
 }
 
 fn read_objective_file(path: &Path) -> Result<String> {
-    let file = OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-        .open(path)
+    let file = brgr_platform::fs::open_no_follow(path)
         .with_context(|| format!("cannot open objective file {}", path.display()))?;
     read_objective(file, path)
 }
 
 fn read_objective(mut file: File, path: &Path) -> Result<String> {
-    use std::os::unix::fs::FileTypeExt;
     let metadata = file
         .metadata()
         .with_context(|| format!("cannot inspect objective file {}", path.display()))?;
-    if !metadata.is_file() || metadata.file_type().is_fifo() {
+    if !metadata.is_file() || brgr_platform::fs::is_fifo(&metadata.file_type()) {
         bail!("objective file {} is not a regular file", path.display());
     }
     let limit = u64::try_from(brgr_protocol::MAX_OBJECTIVE_BYTES)?;

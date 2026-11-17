@@ -9,9 +9,8 @@
 use std::{
     collections::BTreeSet,
     fmt::Write as _,
-    fs::{self, OpenOptions},
+    fs,
     io::Write as _,
-    os::unix::fs::OpenOptionsExt as _,
     process::{Command, Stdio},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -203,11 +202,10 @@ pub(crate) fn file_issues(paths: &Paths) -> Result<()> {
         .repo
         .clone()
         .context("issue reporting has no repository; run `brgr config set-issue-reporting`")?;
-    let guard = OpenOptions::new()
+    let guard = brgr_platform::fs::private_create_options()
         .create(true)
         .truncate(false)
         .write(true)
-        .mode(0o600)
         .open(paths.home.join("error-report.lock"))?;
     if guard.try_lock().is_err() {
         return Ok(());
@@ -353,19 +351,19 @@ fn gh(args: &[&str], stdin: Option<&str>) -> Result<String> {
 }
 
 fn spawn_filer(paths: &Paths) {
-    use std::os::unix::process::CommandExt as _;
     let Ok(executable) = std::env::current_exe() else {
         return;
     };
-    let _ = Command::new(executable)
+    let mut command = Command::new(executable);
+    command
         .arg("--home")
         .arg(&paths.home)
         .args(["errors", "file"])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .process_group(0)
-        .spawn();
+        .stderr(Stdio::null());
+    brgr_platform::process::spawn_in_new_group(&mut command);
+    let _ = command.spawn();
 }
 
 fn marker(fingerprint: &str) -> String {
@@ -734,11 +732,10 @@ fn save(paths: &Paths, ledger: &Ledger) -> Result<()> {
 }
 
 fn lock(paths: &Paths) -> Result<fs::File> {
-    let file = OpenOptions::new()
+    let file = brgr_platform::fs::private_create_options()
         .create(true)
         .truncate(false)
         .write(true)
-        .mode(0o600)
         .open(paths.home.join("error-ledger.lock"))?;
     file.lock()?;
     Ok(file)

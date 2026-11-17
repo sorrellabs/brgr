@@ -4,7 +4,6 @@ use std::{
     env,
     fs::{self, OpenOptions},
     io::{self},
-    os::unix::{fs::PermissionsExt, process::CommandExt},
     path::Path,
     process::{Command as ProcessCommand, Stdio},
     time::Duration,
@@ -225,7 +224,7 @@ pub(crate) fn spawn_supervisor(paths: &Paths, launch_path: &Path) -> Result<()> 
         .create(true)
         .append(true)
         .open(&log_path)?;
-    stdout.set_permissions(fs::Permissions::from_mode(0o600))?;
+    brgr_platform::fs::set_private_file_mode(&stdout)?;
     let stderr = stdout.try_clone()?;
     let mut command = ProcessCommand::new(executable);
     command
@@ -236,8 +235,8 @@ pub(crate) fn spawn_supervisor(paths: &Paths, launch_path: &Path) -> Result<()> 
         .arg(launch_path)
         .stdin(Stdio::null())
         .stdout(Stdio::from(stdout))
-        .stderr(Stdio::from(stderr))
-        .process_group(0);
+        .stderr(Stdio::from(stderr));
+    brgr_platform::process::spawn_in_new_group(&mut command);
     command
         .spawn()
         .context("failed to start detached supervisor")?;
@@ -510,11 +509,7 @@ pub(crate) fn worker_may_be_running(paths: &Paths, task: TaskId) -> bool {
         Err(error) if error.kind() == io::ErrorKind::NotFound => false,
         Err(_) => true,
         Ok(text) => match text.trim().parse::<u32>() {
-            Ok(pid) if pid > 1 => ProcessCommand::new("/bin/kill")
-                .args(["-0", &pid.to_string()])
-                .stderr(Stdio::null())
-                .status()
-                .is_ok_and(|status| status.success()),
+            Ok(pid) if pid > 1 => brgr_platform::process::pid_alive(pid),
             _ => true,
         },
     }
@@ -538,18 +533,10 @@ pub(crate) fn process_identity(pid: u32) -> Result<RunnerIdentity> {
 }
 
 pub(crate) fn ps_field(pid: &str, field: &str) -> Result<String> {
-    let output = ProcessCommand::new("/bin/ps")
-        .args(["-ww", "-p", pid, "-o"])
-        .arg(format!("{field}="))
-        .output()?;
-    if !output.status.success() {
-        bail!("process {pid} is not observable");
-    }
-    let text = String::from_utf8(output.stdout)?.trim().to_owned();
-    if text.is_empty() {
-        bail!("process {pid} has no {field} identity");
-    }
-    Ok(text)
+    Ok(brgr_platform::process::process_field(
+        pid.parse::<u32>()?,
+        field,
+    )?)
 }
 
 #[cfg(test)]

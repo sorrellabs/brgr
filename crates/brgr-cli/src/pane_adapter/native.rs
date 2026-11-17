@@ -71,12 +71,12 @@ fn shown_in_a_narrow_pane(screen: &str, workspace: &Path) -> bool {
 }
 
 pub(super) fn spawn_session_server(paths: &Paths, task: TaskId) -> Result<()> {
-    use std::os::unix::process::CommandExt as _;
     let log = fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(paths.runs.join(format!("{task}.session.log")))?;
-    Command::new(env::current_exe()?)
+    let mut command = Command::new(env::current_exe()?);
+    command
         .arg("--home")
         .arg(&paths.home)
         .arg("__session")
@@ -86,9 +86,9 @@ pub(super) fn spawn_session_server(paths: &Paths, task: TaskId) -> Result<()> {
         .current_dir(&paths.home)
         .stdin(std::process::Stdio::null())
         .stdout(log.try_clone()?)
-        .stderr(log)
-        .process_group(0)
-        .spawn()?;
+        .stderr(log);
+    brgr_platform::process::spawn_in_new_group(&mut command);
+    command.spawn()?;
     Ok(())
 }
 

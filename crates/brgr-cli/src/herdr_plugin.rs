@@ -3,9 +3,7 @@
 use std::{
     env,
     ffi::OsString,
-    fs,
     io::{self, IsTerminal as _, Write as _},
-    os::unix::fs::PermissionsExt as _,
     path::{Path, PathBuf},
     process::Stdio,
     time::Duration,
@@ -224,7 +222,7 @@ async fn launch_codex(paths: &Paths) -> Result<()> {
         .prefix("brgr-plugin-bridge-")
         .tempdir()
         .context("brgr could not create its private Codex bridge")?;
-    fs::set_permissions(bridge_dir.path(), fs::Permissions::from_mode(0o700))?;
+    brgr_platform::fs::set_private_dir(bridge_dir.path())?;
     let mut child = Command::new(configured_codex.as_deref().unwrap_or(Path::new("codex")))
         .arg("-C")
         .arg(&workspace)

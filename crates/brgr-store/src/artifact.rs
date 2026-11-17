@@ -1,7 +1,6 @@
 use std::{
-    fs::{self, File, OpenOptions},
+    fs::{self, OpenOptions},
     io::{self, Read, Write},
-    os::unix::fs::{MetadataExt, PermissionsExt},
     path::{Path, PathBuf},
 };
 
@@ -50,12 +49,11 @@ impl ArtifactStore {
             });
         }
 
-        let file = File::open(source)?;
-        if !same_regular_file(&metadata, &file.metadata()?) {
+        let Some(file) = brgr_platform::fs::open_matching(source, &metadata)? else {
             return Err(StoreError::ArtifactNotRegularFile {
                 path: source.to_path_buf(),
             });
-        }
+        };
         self.seal_reader(file, media_type, max_bytes)
     }
 
@@ -192,10 +190,9 @@ impl ArtifactStore {
         if metadata.len() != reference.bytes {
             return Err(StoreError::ArtifactIntegrityMismatch);
         }
-        let mut file = File::open(&path)?;
-        if !same_regular_file(&metadata, &file.metadata()?) {
+        let Some(mut file) = brgr_platform::fs::open_matching(&path, &metadata)? else {
             return Err(StoreError::ArtifactNotRegularFile { path });
-        }
+        };
         let mut bytes = Vec::new();
         Read::by_ref(&mut file)
             .take(max_bytes.saturating_add(1))
@@ -208,14 +205,6 @@ impl ArtifactStore {
         }
         Ok(bytes)
     }
-}
-
-fn same_regular_file(before: &fs::Metadata, opened: &fs::Metadata) -> bool {
-    before.file_type().is_file()
-        && opened.file_type().is_file()
-        && before.dev() == opened.dev()
-        && before.ino() == opened.ino()
-        && before.len() == opened.len()
 }
 
 fn sync_directory(path: &Path) -> Result<(), StoreError> {
@@ -231,8 +220,7 @@ fn private_subdirectory(path: &Path) -> Result<(), StoreError> {
         Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
         Err(error) => return Err(StoreError::Io(error)),
     }
-    #[cfg(unix)]
-    fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+    brgr_platform::fs::set_private_dir(path)?;
     Ok(())
 }
 
@@ -404,6 +392,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn opened_artifact_must_match_the_checked_inode_and_size() {
         let root = TempDir::new().unwrap();
@@ -412,12 +401,18 @@ mod tests {
         fs::write(&first, b"first").unwrap();
         fs::write(&second, b"other").unwrap();
         let checked = fs::symlink_metadata(&first).unwrap();
-        let different = File::open(&second).unwrap().metadata().unwrap();
-        assert!(!same_regular_file(&checked, &different));
-        assert!(same_regular_file(
-            &checked,
-            &File::open(&first).unwrap().metadata().unwrap()
-        ));
+        let different = fs::symlink_metadata(&second).unwrap();
+        assert!(
+            brgr_platform::fs::open_matching(&second, &checked)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            brgr_platform::fs::open_matching(&first, &checked)
+                .unwrap()
+                .is_some()
+        );
+        let _ = different;
     }
 
     fn walk_files(root: &Path) -> Vec<PathBuf> {

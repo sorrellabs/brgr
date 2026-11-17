@@ -13,7 +13,6 @@
 use std::{
     fs,
     io::{Read, Seek as _, SeekFrom, Write},
-    os::unix::fs::PermissionsExt as _,
     path::PathBuf,
     process::{Command, Stdio},
     thread,
@@ -110,7 +109,7 @@ pub(crate) fn record(paths: &Paths, signal: &Signal) -> Result<()> {
     let path = session_path(paths, &signal.session)?;
     let dir = path.parent().context("context path has no parent")?;
     fs::create_dir_all(dir)?;
-    fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
+    brgr_platform::fs::set_private_dir(dir)?;
     write_json_atomic(&path, signal)
 }
 

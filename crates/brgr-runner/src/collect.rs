@@ -1,6 +1,6 @@
 //! Collecting a run's final result from stdout, a file, or JSONL events.
 
-use std::{io::Read as _, os::unix::fs::MetadataExt as _, path::Path, process::ExitStatus};
+use std::{io::Read as _, path::Path, process::ExitStatus};
 
 use crate::{
     HarnessManifest, ResultSource, RunRequest, RunnerError,
@@ -61,14 +61,9 @@ pub(crate) fn collect_result(
                     observed_bytes: metadata.len(),
                 });
             }
-            let mut file = std::fs::File::open(&result_path)?;
-            let opened = file.metadata()?;
-            if !opened.is_file()
-                || (metadata.dev(), metadata.ino(), metadata.len())
-                    != (opened.dev(), opened.ino(), opened.len())
-            {
+            let Some(mut file) = brgr_platform::fs::open_matching(&result_path, &metadata)? else {
                 return Err(RunnerError::ResultNotRegularFile(result_path));
-            }
+            };
             let mut bytes = Vec::new();
             file.by_ref()
                 .take(manifest.result.max_bytes.saturating_add(1))

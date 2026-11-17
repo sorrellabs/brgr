@@ -66,7 +66,6 @@ use std::{
     fmt::Write as FmtWrite,
     fs,
     io::Write as IoWrite,
-    os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -167,7 +166,7 @@ impl Registry {
         fs::create_dir_all(root.join("manifests"))?;
         fs::create_dir_all(root.join("activations"))?;
         for path in [&root, &root.join("manifests"), &root.join("activations")] {
-            fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+            brgr_platform::fs::set_private_dir(path)?;
         }
         Ok(Self {
             control_home: root.clone(),
@@ -1390,9 +1389,7 @@ fn digest_bytes(bytes: &[u8]) -> String {
 fn write_json_atomic(path: &Path, bytes: &[u8]) -> Result<(), RegistryError> {
     let parent = path.parent().ok_or(RegistryError::MissingParent)?;
     let mut temporary = NamedTempFile::new_in(parent)?;
-    temporary
-        .as_file_mut()
-        .set_permissions(fs::Permissions::from_mode(0o600))?;
+    brgr_platform::fs::set_private_file_mode(temporary.as_file())?;
     temporary.write_all(bytes)?;
     temporary.write_all(b"\n")?;
     temporary.as_file_mut().sync_all()?;
@@ -1409,7 +1406,7 @@ mod tests {
         LaunchSpec, MANIFEST_SCHEMA_V1, ModelCatalogSpec, ProbeSpec, ResultSource, ResultSpec,
     };
     use std::collections::BTreeMap;
-    use std::os::unix::fs::symlink;
+    use std::os::unix::fs::{PermissionsExt, symlink};
     use std::sync::OnceLock;
 
     /// The first execution of every new executable file is serialized by

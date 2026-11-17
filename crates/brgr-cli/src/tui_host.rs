@@ -7,7 +7,6 @@ use std::fmt::Write as _;
 use std::{
     collections::BTreeMap,
     fs,
-    os::unix::process::CommandExt as _,
     path::{Path, PathBuf},
     process::{Command, Stdio},
 };
@@ -115,7 +114,7 @@ fn native_command(launch: &NativeLaunch) -> Result<Command> {
         .env_clear()
         .envs(&launch.environment);
     if let Some(argv0) = &launch.argv0 {
-        command.arg0(argv0);
+        brgr_platform::process::set_argv0(&mut command, argv0);
     }
     Ok(command)
 }
@@ -242,17 +241,10 @@ pub(crate) fn stop_descendants(path: &Path) {
 }
 
 fn process_parent_table() -> Option<Vec<(u32, u32)>> {
-    let output = Command::new("/bin/ps")
-        .args(["-A", "-o", "pid=,ppid="])
-        .output()
-        .ok()?;
     Some(
-        String::from_utf8_lossy(&output.stdout)
-            .lines()
-            .filter_map(|line| {
-                let mut fields = line.split_whitespace();
-                Some((fields.next()?.parse().ok()?, fields.next()?.parse().ok()?))
-            })
+        brgr_platform::process::process_table()?
+            .into_iter()
+            .map(|entry| (entry.pid, entry.ppid))
             .collect(),
     )
 }
@@ -302,12 +294,7 @@ fn terminate_if_verified_descendant(host: u32, host_birth: &str, pid: u32) -> bo
     if !is_current_descendant(pid, host) {
         return false;
     }
-    let _ = Command::new("/bin/kill")
-        .args(["-TERM", "--", &pid.to_string()])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
+    let _ = brgr_platform::process::terminate_pid(pid);
     true
 }
 
@@ -352,13 +339,7 @@ mod tests {
     }
 
     fn still_alive(pid: u32) -> bool {
-        Command::new("/bin/kill")
-            .args(["-0", "--", &pid.to_string()])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .is_ok_and(|status| status.success())
+        brgr_platform::process::pid_alive(pid)
     }
 
     fn stop(child: &mut std::process::Child) {

@@ -264,15 +264,7 @@ impl WaitMarker {
 }
 
 pub(crate) fn process_signature(pid: i32) -> Option<String> {
-    let output = std::process::Command::new("/bin/ps")
-        .args(["-o", "lstart=", "-p", &pid.to_string()])
-        .output()
-        .ok()?;
-    output
-        .status
-        .success()
-        .then(|| String::from_utf8_lossy(&output.stdout).trim().to_owned())
-        .filter(|value| !value.is_empty())
+    brgr_platform::process::process_field(pid.cast_unsigned(), "lstart").ok()
 }
 impl Drop for WaitMarker {
     fn drop(&mut self) {

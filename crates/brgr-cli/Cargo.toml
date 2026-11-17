@@ -17,6 +17,7 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow.workspace = true
+brgr-platform.workspace = true
 brgr-core.workspace = true
 brgr-protocol.workspace = true
 brgr-registry.workspace = true

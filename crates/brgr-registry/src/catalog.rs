@@ -1,6 +1,6 @@
 //! Locating a harness's model-list command and parsing what it prints.
 
-use std::{collections::BTreeSet, os::unix::fs::PermissionsExt as _, path::PathBuf};
+use std::{collections::BTreeSet, path::PathBuf};
 
 use brgr_runner::ModelCatalogFormat;
 
@@ -11,7 +11,7 @@ pub(crate) fn executable_on_path(name: &str) -> Result<PathBuf, RegistryError> {
         .ok_or_else(|| RegistryError::ModelCatalogExecutableMissing(name.to_owned()))?;
     for directory in std::env::split_paths(&path).filter(|part| part.is_absolute()) {
         let candidate = directory.join(name);
-        if candidate.is_file() && candidate.metadata()?.permissions().mode() & 0o111 != 0 {
+        if brgr_platform::fs::is_executable(&candidate) {
             return Ok(candidate.canonicalize()?);
         }
     }
