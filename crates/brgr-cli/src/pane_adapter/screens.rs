@@ -836,18 +836,7 @@ pub(super) fn resolve(
     if let Screen::Resolve { rule, keys } = &outcome {
         let rule = *rule;
         let identity = dialog_identity(rule, &screen, workspace);
-        let selection = (rule == "workspace-trust")
-            .then(|| trust_selection(&screen))
-            .flatten();
-        // A standing trust dialog whose cursor moved after the press applied
-        // only the cursor key: finish it with the keys the current selection
-        // needs instead of waiting out the hold. A cursor on "No, exit" is
-        // never pressed.
-        let partially_applied = rule == "workspace-trust"
-            && selection.is_some()
-            && answers.selection().is_some()
-            && selection.as_deref() != answers.selection()
-            && selection.as_deref() != Some(squash("No, exit").as_str());
+        let (selection, partially_applied) = trust_progress(rule, &screen, answers);
         if answers.standing(rule, &identity, Instant::now()) && !partially_applied {
             trace(
                 paths,
@@ -920,6 +909,22 @@ pub(super) fn resolve(
         trace(paths, run, pane, stage, status, Some(&screen), label, false);
     }
     Ok(outcome)
+}
+
+/// The workspace-trust selection on `screen`, and whether a standing trust
+/// dialog whose cursor moved after the press applied only the cursor key: it
+/// is then finished with the keys the current selection needs instead of
+/// waiting out the hold. A cursor on "No, exit" is never pressed.
+fn trust_progress(rule: &str, screen: &str, answers: &AnswerMemory) -> (Option<String>, bool) {
+    let selection = (rule == "workspace-trust")
+        .then(|| trust_selection(screen))
+        .flatten();
+    let partially_applied = rule == "workspace-trust"
+        && selection.is_some()
+        && answers.selection().is_some()
+        && selection.as_deref() != answers.selection()
+        && selection.as_deref() != Some(squash("No, exit").as_str());
+    (selection, partially_applied)
 }
 
 /// Whether Herdr has looked at this worker's agent yet. A native worker whose
