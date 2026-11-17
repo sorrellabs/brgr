@@ -135,6 +135,9 @@ pub(crate) fn validate_bridge_host_command(
         Command::Workflow {
             command: crate::workflow::WorkflowCommand::Init { dir, .. },
         } => require_bridge_workspace(dir.as_deref().unwrap_or(current_dir), &workspace_root),
+        Command::Tui(_) => bail!(
+            "brgr tui needs a terminal and is unavailable through the Herdr host bridge; use brgr status --brief"
+        ),
         Command::Workflow { .. }
         | Command::Harness { .. }
         | Command::Integrate { .. }

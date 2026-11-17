@@ -1424,6 +1424,149 @@ fn board_rows_omit_invalid_attempt_state_and_decision_without_valid_result() {
 }
 
 #[test]
+fn board_rows_carry_requested_model_and_effort() {
+    let root = TempDir::new().unwrap();
+    let mut store = Store::open(root.path()).unwrap();
+    let mut item = task();
+    item.route.requested_model = Some("gpt-5.4".to_owned());
+    item.route.requested_effort = Some("high".to_owned());
+    store.record_task(&item, "board-model").unwrap();
+    let rows = BoardStore::open_existing(root.path())
+        .unwrap()
+        .rows(20)
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].requested_model.as_deref(), Some("gpt-5.4"));
+    assert_eq!(rows[0].requested_effort.as_deref(), Some("high"));
+}
+
+#[test]
+fn board_rows_for_session_match_tasks_for_session() {
+    let root = TempDir::new().unwrap();
+    let mut store = Store::open(root.path()).unwrap();
+    let mine = task();
+    store.record_task(&mine, "board-mine").unwrap();
+    store.bind_owner(&mine.owner_id, "session-mine", 1).unwrap();
+    let mut other = task();
+    other.create_request_id = "board-other-session".to_owned();
+    other.owner_id = OwnerId::new("codex:other-owner").unwrap();
+    store.record_task(&other, "board-other-session").unwrap();
+    store
+        .bind_owner(&other.owner_id, "session-other", 1)
+        .unwrap();
+
+    let board = BoardStore::open_existing(root.path())
+        .unwrap()
+        .rows_for_session("session-mine", None, 20)
+        .unwrap();
+    let tasks = store.tasks_for_session("session-mine", None, 20).unwrap();
+    assert_eq!(
+        board.iter().map(|row| row.task_id).collect::<Vec<_>>(),
+        tasks.iter().map(|spec| spec.task_id).collect::<Vec<_>>()
+    );
+    assert_eq!(board.len(), 1);
+    assert_eq!(board[0].task_id, mine.task_id);
+}
+
+#[test]
+fn board_rows_for_session_respect_owner_narrowing() {
+    let root = TempDir::new().unwrap();
+    let mut store = Store::open(root.path()).unwrap();
+    let first = task();
+    store.record_task(&first, "board-narrow-a").unwrap();
+    store
+        .bind_owner(&first.owner_id, "shared-session", 1)
+        .unwrap();
+    let mut second = task();
+    second.create_request_id = "board-narrow-b".to_owned();
+    second.owner_id = OwnerId::new("codex:second-owner").unwrap();
+    store.record_task(&second, "board-narrow-b").unwrap();
+    store
+        .bind_owner(&second.owner_id, "shared-session", 1)
+        .unwrap();
+
+    let all = BoardStore::open_existing(root.path())
+        .unwrap()
+        .rows_for_session("shared-session", None, 20)
+        .unwrap();
+    assert_eq!(all.len(), 2);
+    let narrowed = BoardStore::open_existing(root.path())
+        .unwrap()
+        .rows_for_session("shared-session", Some(&first.owner_id), 20)
+        .unwrap();
+    assert_eq!(narrowed.len(), 1);
+    assert_eq!(narrowed[0].task_id, first.task_id);
+    let expected = store
+        .tasks_for_session("shared-session", Some(&first.owner_id), 20)
+        .unwrap();
+    assert_eq!(narrowed[0].task_id, expected[0].task_id);
+}
+
+#[test]
+fn board_rows_without_owner_bindings_table_still_list_all() {
+    let root = TempDir::new().unwrap();
+    fs::create_dir_all(root.path()).unwrap();
+    let task_id = TaskId::new();
+    let spec = serde_json::json!({
+        "schema": SCHEMA_V1,
+        "task_id": task_id,
+        "revision": 1,
+        "workspace": "/tmp/legacy-project",
+        "route": { "harness_id": "local.fixture" }
+    });
+    let connection = Connection::open(root.path().join("brgr.sqlite3")).unwrap();
+    connection
+        .execute_batch(
+            "CREATE TABLE tasks (
+                task_id TEXT NOT NULL,
+                revision INTEGER NOT NULL,
+                owner_id TEXT NOT NULL,
+                create_request_id TEXT NOT NULL UNIQUE,
+                request_digest TEXT NOT NULL,
+                spec_json TEXT NOT NULL,
+                PRIMARY KEY (task_id, revision)
+            );
+            CREATE TABLE attempts (
+                attempt_id TEXT PRIMARY KEY,
+                task_id TEXT NOT NULL,
+                revision INTEGER NOT NULL,
+                state TEXT NOT NULL
+            );
+            CREATE TABLE results (
+                result_id TEXT PRIMARY KEY,
+                attempt_id TEXT NOT NULL UNIQUE,
+                task_id TEXT NOT NULL,
+                revision INTEGER NOT NULL,
+                result_digest TEXT NOT NULL,
+                envelope_json TEXT NOT NULL
+            );
+            CREATE TABLE decisions (
+                decision_id TEXT PRIMARY KEY,
+                result_id TEXT NOT NULL UNIQUE,
+                decision_json TEXT NOT NULL
+            );",
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO tasks
+             (task_id, revision, owner_id, create_request_id, request_digest, spec_json)
+             VALUES (?1, 1, 'codex:legacy', 'legacy-board', 'digest', ?2)",
+            params![task_id.to_string(), spec.to_string()],
+        )
+        .unwrap();
+    drop(connection);
+
+    let rows = BoardStore::open_existing(root.path())
+        .unwrap()
+        .rows(20)
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].task_id, task_id);
+    assert_eq!(rows[0].harness_id, "local.fixture");
+}
+
+#[test]
 fn recursive_delegation_edges_bind_each_child_to_its_live_parent_attempt() {
     let root = TempDir::new().unwrap();
     let mut store = Store::open(root.path()).unwrap();

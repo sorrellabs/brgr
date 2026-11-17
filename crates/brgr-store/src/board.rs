@@ -6,10 +6,66 @@ use std::{
 };
 
 use crate::StoreError;
-use brgr_protocol::{AttemptState, DecisionVerdict, ResultId, SCHEMA_V1, TaskId, TerminalOutcome};
-use rusqlite::{Connection, OpenFlags, Transaction};
+use brgr_protocol::{
+    AttemptState, DecisionVerdict, OwnerId, ResultId, SCHEMA_V1, TaskId, TerminalOutcome,
+};
+use rusqlite::{Connection, OpenFlags, Params, Transaction, params};
 
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(1);
+
+const BOARD_SELECT: &str = "WITH latest_attempts AS (
+             SELECT a.task_id, a.revision, a.state
+             FROM attempts a
+             WHERE a.rowid = (
+                 SELECT MAX(candidate.rowid) FROM attempts candidate
+                 WHERE candidate.task_id = a.task_id AND candidate.revision = a.revision
+             )
+         ),
+         latest_results AS (
+             SELECT r.result_id, r.task_id, r.revision, r.envelope_json
+             FROM results r
+             WHERE r.rowid = (
+                 SELECT MAX(candidate.rowid) FROM results candidate
+                 WHERE candidate.task_id = r.task_id AND candidate.revision = r.revision
+             )
+         )
+         SELECT CAST(t.task_id AS TEXT), CAST(t.revision AS TEXT),
+                CASE WHEN json_valid(t.spec_json) THEN CASE WHEN json_type(t.spec_json, '$.schema') = 'text' THEN CAST(json_extract(t.spec_json, '$.schema') AS TEXT) END END,
+                CASE WHEN json_valid(t.spec_json) THEN CASE WHEN json_type(t.spec_json, '$.task_id') = 'text' THEN CAST(json_extract(t.spec_json, '$.task_id') AS TEXT) END END,
+                CASE WHEN json_valid(t.spec_json) THEN CASE WHEN json_type(t.spec_json, '$.revision') = 'integer' THEN CAST(json_extract(t.spec_json, '$.revision') AS TEXT) END END,
+                CASE WHEN json_valid(t.spec_json) THEN CASE WHEN json_type(t.spec_json, '$.workspace') = 'text' THEN CAST(json_extract(t.spec_json, '$.workspace') AS TEXT) END END,
+                CASE WHEN json_valid(t.spec_json) THEN CASE WHEN json_type(t.spec_json, '$.route.harness_id') = 'text' THEN CAST(json_extract(t.spec_json, '$.route.harness_id') AS TEXT) END END,
+                CASE WHEN json_valid(t.spec_json) THEN CASE WHEN json_type(t.spec_json, '$.route.requested_model') = 'text' THEN CAST(json_extract(t.spec_json, '$.route.requested_model') AS TEXT) END END,
+                CASE WHEN json_valid(t.spec_json) THEN CASE WHEN json_type(t.spec_json, '$.route.requested_effort') = 'text' THEN CAST(json_extract(t.spec_json, '$.route.requested_effort') AS TEXT) END END,
+                CAST(a.state AS TEXT),
+                CAST(r.result_id AS TEXT),
+                CASE WHEN json_valid(r.envelope_json) THEN CASE WHEN json_type(r.envelope_json, '$.schema') = 'text' THEN CAST(json_extract(r.envelope_json, '$.schema') AS TEXT) END END,
+                CASE WHEN json_valid(r.envelope_json) THEN CASE WHEN json_type(r.envelope_json, '$.task_id') = 'text' THEN CAST(json_extract(r.envelope_json, '$.task_id') AS TEXT) END END,
+                CASE WHEN json_valid(r.envelope_json) THEN CASE WHEN json_type(r.envelope_json, '$.revision') = 'integer' THEN CAST(json_extract(r.envelope_json, '$.revision') AS TEXT) END END,
+                CASE WHEN json_valid(r.envelope_json) THEN CASE WHEN json_type(r.envelope_json, '$.result_id') = 'text' THEN CAST(json_extract(r.envelope_json, '$.result_id') AS TEXT) END END,
+                CASE WHEN json_valid(r.envelope_json) THEN CASE WHEN json_type(r.envelope_json, '$.outcome') = 'text' THEN CAST(json_extract(r.envelope_json, '$.outcome') AS TEXT) END END,
+                CASE WHEN json_valid(d.decision_json) THEN CASE WHEN json_type(d.decision_json, '$.schema') = 'text' THEN CAST(json_extract(d.decision_json, '$.schema') AS TEXT) END END,
+                CASE WHEN json_valid(d.decision_json) THEN CASE WHEN json_type(d.decision_json, '$.task_id') = 'text' THEN CAST(json_extract(d.decision_json, '$.task_id') AS TEXT) END END,
+                CASE WHEN json_valid(d.decision_json) THEN CASE WHEN json_type(d.decision_json, '$.revision') = 'integer' THEN CAST(json_extract(d.decision_json, '$.revision') AS TEXT) END END,
+                CASE WHEN json_valid(d.decision_json) THEN CASE WHEN json_type(d.decision_json, '$.result_id') = 'text' THEN CAST(json_extract(d.decision_json, '$.result_id') AS TEXT) END END,
+                CASE WHEN json_valid(d.decision_json) THEN CASE WHEN json_type(d.decision_json, '$.verdict') = 'text' THEN CAST(json_extract(d.decision_json, '$.verdict') AS TEXT) END END
+         FROM tasks t
+         JOIN (
+             SELECT task_id, MAX(revision) AS revision FROM tasks GROUP BY task_id
+         ) latest
+           ON latest.task_id = t.task_id AND latest.revision = t.revision
+         LEFT JOIN latest_attempts a
+           ON a.task_id = t.task_id AND a.revision = t.revision
+         LEFT JOIN latest_results r
+           ON r.task_id = t.task_id AND r.revision = t.revision
+         LEFT JOIN decisions d ON d.result_id = r.result_id";
+
+const BOARD_ORDER: &str = "
+         ORDER BY t.rowid DESC
+         LIMIT 100";
+
+const BOARD_SESSION_FILTER: &str = "
+         WHERE EXISTS (SELECT 1 FROM owner_bindings b WHERE b.owner_id = t.owner_id AND b.session_id = ?1) AND (?2 IS NULL OR t.owner_id = ?2)";
 
 /// Read-only Herdr board row. Never includes the task objective or artifact bytes.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -18,6 +74,8 @@ pub struct BoardTaskRow {
     pub revision: u32,
     pub workspace: String,
     pub harness_id: String,
+    pub requested_model: Option<String>,
+    pub requested_effort: Option<String>,
     pub attempt_state: AttemptState,
     pub result_outcome: Option<TerminalOutcome>,
     pub decision_verdict: Option<DecisionVerdict>,
@@ -37,6 +95,8 @@ struct ProjectedBoardRow {
     spec_revision: Option<String>,
     workspace: Option<String>,
     harness_id: Option<String>,
+    requested_model: Option<String>,
+    requested_effort: Option<String>,
     state: Option<String>,
     stored_result_id: Option<String>,
     result_schema: Option<String>,
@@ -90,6 +150,33 @@ impl BoardStore {
     ///
     /// Returns an error for a database failure.
     pub fn rows(&self, limit: usize) -> Result<Vec<BoardTaskRow>, StoreError> {
+        self.load_rows(limit, None)
+    }
+
+    /// Lists newest task revisions whose owner is bound to `session_id`.
+    ///
+    /// The optional owner narrows an explicit `BRGR_OWNER_ID` without allowing
+    /// unrelated owners to consume the result limit. This query names
+    /// `owner_bindings`; [`rows`] does not, so an older database without that
+    /// table can still list every owner.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a database failure.
+    pub fn rows_for_session(
+        &self,
+        session_id: &str,
+        owner_id: Option<&OwnerId>,
+        limit: usize,
+    ) -> Result<Vec<BoardTaskRow>, StoreError> {
+        self.load_rows(limit, Some((session_id, owner_id)))
+    }
+
+    fn load_rows(
+        &self,
+        limit: usize,
+        session: Option<(&str, Option<&OwnerId>)>,
+    ) -> Result<Vec<BoardTaskRow>, StoreError> {
         if limit == 0 {
             return Ok(Vec::new());
         }
@@ -97,92 +184,53 @@ impl BoardStore {
         let Some(connection) = self.connection.as_ref() else {
             return Ok(Vec::new());
         };
-        load_board_rows(connection, bounded)
+        load_board_rows(connection, bounded, session)
     }
 }
 
-fn load_board_rows(connection: &Connection, limit: i64) -> Result<Vec<BoardTaskRow>, StoreError> {
+fn load_board_rows(
+    connection: &Connection,
+    limit: i64,
+    session: Option<(&str, Option<&OwnerId>)>,
+) -> Result<Vec<BoardTaskRow>, StoreError> {
     let transaction = connection.unchecked_transaction()?;
-    let rows = load_board_rows_in_transaction(&transaction, limit)?;
+    let rows = load_board_rows_in_transaction(&transaction, limit, session)?;
     transaction.commit()?;
     Ok(rows)
+}
+
+fn all_owners_sql() -> String {
+    format!("{BOARD_SELECT}{BOARD_ORDER}")
+}
+
+fn session_sql() -> String {
+    format!("{BOARD_SELECT}{BOARD_SESSION_FILTER}{BOARD_ORDER}")
 }
 
 fn load_board_rows_in_transaction(
     transaction: &Transaction<'_>,
     limit: i64,
+    session: Option<(&str, Option<&OwnerId>)>,
 ) -> Result<Vec<BoardTaskRow>, StoreError> {
-    let mut statement = transaction.prepare(
-        "WITH latest_attempts AS (
-             SELECT a.task_id, a.revision, a.state
-             FROM attempts a
-             WHERE a.rowid = (
-                 SELECT MAX(candidate.rowid) FROM attempts candidate
-                 WHERE candidate.task_id = a.task_id AND candidate.revision = a.revision
-             )
-         ),
-         latest_results AS (
-             SELECT r.result_id, r.task_id, r.revision, r.envelope_json
-             FROM results r
-             WHERE r.rowid = (
-                 SELECT MAX(candidate.rowid) FROM results candidate
-                 WHERE candidate.task_id = r.task_id AND candidate.revision = r.revision
-             )
-         )
-         SELECT CAST(t.task_id AS TEXT), CAST(t.revision AS TEXT),
-                CASE WHEN json_valid(t.spec_json) THEN CASE WHEN json_type(t.spec_json, '$.schema') = 'text' THEN CAST(json_extract(t.spec_json, '$.schema') AS TEXT) END END,
-                CASE WHEN json_valid(t.spec_json) THEN CASE WHEN json_type(t.spec_json, '$.task_id') = 'text' THEN CAST(json_extract(t.spec_json, '$.task_id') AS TEXT) END END,
-                CASE WHEN json_valid(t.spec_json) THEN CASE WHEN json_type(t.spec_json, '$.revision') = 'integer' THEN CAST(json_extract(t.spec_json, '$.revision') AS TEXT) END END,
-                CASE WHEN json_valid(t.spec_json) THEN CASE WHEN json_type(t.spec_json, '$.workspace') = 'text' THEN CAST(json_extract(t.spec_json, '$.workspace') AS TEXT) END END,
-                CASE WHEN json_valid(t.spec_json) THEN CASE WHEN json_type(t.spec_json, '$.route.harness_id') = 'text' THEN CAST(json_extract(t.spec_json, '$.route.harness_id') AS TEXT) END END,
-                CAST(a.state AS TEXT),
-                CAST(r.result_id AS TEXT),
-                CASE WHEN json_valid(r.envelope_json) THEN CASE WHEN json_type(r.envelope_json, '$.schema') = 'text' THEN CAST(json_extract(r.envelope_json, '$.schema') AS TEXT) END END,
-                CASE WHEN json_valid(r.envelope_json) THEN CASE WHEN json_type(r.envelope_json, '$.task_id') = 'text' THEN CAST(json_extract(r.envelope_json, '$.task_id') AS TEXT) END END,
-                CASE WHEN json_valid(r.envelope_json) THEN CASE WHEN json_type(r.envelope_json, '$.revision') = 'integer' THEN CAST(json_extract(r.envelope_json, '$.revision') AS TEXT) END END,
-                CASE WHEN json_valid(r.envelope_json) THEN CASE WHEN json_type(r.envelope_json, '$.result_id') = 'text' THEN CAST(json_extract(r.envelope_json, '$.result_id') AS TEXT) END END,
-                CASE WHEN json_valid(r.envelope_json) THEN CASE WHEN json_type(r.envelope_json, '$.outcome') = 'text' THEN CAST(json_extract(r.envelope_json, '$.outcome') AS TEXT) END END,
-                CASE WHEN json_valid(d.decision_json) THEN CASE WHEN json_type(d.decision_json, '$.schema') = 'text' THEN CAST(json_extract(d.decision_json, '$.schema') AS TEXT) END END,
-                CASE WHEN json_valid(d.decision_json) THEN CASE WHEN json_type(d.decision_json, '$.task_id') = 'text' THEN CAST(json_extract(d.decision_json, '$.task_id') AS TEXT) END END,
-                CASE WHEN json_valid(d.decision_json) THEN CASE WHEN json_type(d.decision_json, '$.revision') = 'integer' THEN CAST(json_extract(d.decision_json, '$.revision') AS TEXT) END END,
-                CASE WHEN json_valid(d.decision_json) THEN CASE WHEN json_type(d.decision_json, '$.result_id') = 'text' THEN CAST(json_extract(d.decision_json, '$.result_id') AS TEXT) END END,
-                CASE WHEN json_valid(d.decision_json) THEN CASE WHEN json_type(d.decision_json, '$.verdict') = 'text' THEN CAST(json_extract(d.decision_json, '$.verdict') AS TEXT) END END
-         FROM tasks t
-         JOIN (
-             SELECT task_id, MAX(revision) AS revision FROM tasks GROUP BY task_id
-         ) latest
-           ON latest.task_id = t.task_id AND latest.revision = t.revision
-         LEFT JOIN latest_attempts a
-           ON a.task_id = t.task_id AND a.revision = t.revision
-         LEFT JOIN latest_results r
-           ON r.task_id = t.task_id AND r.revision = t.revision
-         LEFT JOIN decisions d ON d.result_id = r.result_id
-         ORDER BY t.rowid DESC
-         LIMIT 100",
-    )?;
-    let mapped = statement.query_map([], |row| {
-        Ok(ProjectedBoardRow {
-            stored_task_id: row.get(0)?,
-            stored_revision: row.get(1)?,
-            spec_schema: row.get(2)?,
-            spec_task_id: row.get(3)?,
-            spec_revision: row.get(4)?,
-            workspace: row.get(5)?,
-            harness_id: row.get(6)?,
-            state: row.get(7)?,
-            stored_result_id: row.get(8)?,
-            result_schema: row.get(9)?,
-            result_task_id: row.get(10)?,
-            result_revision: row.get(11)?,
-            result_id: row.get(12)?,
-            outcome: row.get(13)?,
-            decision_schema: row.get(14)?,
-            decision_task_id: row.get(15)?,
-            decision_revision: row.get(16)?,
-            decision_result_id: row.get(17)?,
-            verdict: row.get(18)?,
-        })
-    })?;
+    match session {
+        None => collect_board_rows(transaction, &all_owners_sql(), [], limit),
+        Some((session_id, owner_id)) => collect_board_rows(
+            transaction,
+            &session_sql(),
+            params![session_id, owner_id.map(OwnerId::as_str)],
+            limit,
+        ),
+    }
+}
+
+fn collect_board_rows(
+    transaction: &Transaction<'_>,
+    sql: &str,
+    params: impl Params,
+    limit: i64,
+) -> Result<Vec<BoardTaskRow>, StoreError> {
+    let mut statement = transaction.prepare(sql)?;
+    let mapped = statement.query_map(params, map_projected_row)?;
     let mut rows = Vec::new();
     for entry in mapped {
         let Some(row) = parse_board_row(entry?) else {
@@ -194,6 +242,32 @@ fn load_board_rows_in_transaction(
         }
     }
     Ok(rows)
+}
+
+fn map_projected_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ProjectedBoardRow> {
+    Ok(ProjectedBoardRow {
+        stored_task_id: row.get(0)?,
+        stored_revision: row.get(1)?,
+        spec_schema: row.get(2)?,
+        spec_task_id: row.get(3)?,
+        spec_revision: row.get(4)?,
+        workspace: row.get(5)?,
+        harness_id: row.get(6)?,
+        requested_model: row.get(7)?,
+        requested_effort: row.get(8)?,
+        state: row.get(9)?,
+        stored_result_id: row.get(10)?,
+        result_schema: row.get(11)?,
+        result_task_id: row.get(12)?,
+        result_revision: row.get(13)?,
+        result_id: row.get(14)?,
+        outcome: row.get(15)?,
+        decision_schema: row.get(16)?,
+        decision_task_id: row.get(17)?,
+        decision_revision: row.get(18)?,
+        decision_result_id: row.get(19)?,
+        verdict: row.get(20)?,
+    })
 }
 
 fn parse_board_row(row: ProjectedBoardRow) -> Option<BoardTaskRow> {
@@ -245,6 +319,8 @@ fn parse_board_row(row: ProjectedBoardRow) -> Option<BoardTaskRow> {
         revision,
         workspace,
         harness_id,
+        requested_model: row.requested_model,
+        requested_effort: row.requested_effort,
         attempt_state,
         result_outcome,
         decision_verdict,

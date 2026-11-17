@@ -554,6 +554,218 @@ fn plugin_board_refresh_failure_is_visible_without_mutating_tasks() {
     assert!(restored_text.contains("candidate"));
 }
 
+fn tui(home: &Path, args: &[&str], envs: &[(&str, &str)]) -> std::process::Output {
+    let mut command = brgr_command();
+    command.arg("--home").arg(home).args(args);
+    for (name, value) in envs {
+        command.env(name, value);
+    }
+    command.output().unwrap()
+}
+
+fn tui_text(home: &Path, args: &[&str], envs: &[(&str, &str)]) -> String {
+    let output = tui(home, args, envs);
+    assert!(
+        output.status.success(),
+        "tui failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout).unwrap()
+}
+
+#[test]
+fn tui_once_renders_the_board_outside_herdr() {
+    let (_temp, home, workspace) = fixture_home();
+    let created = json_output(&run(
+        &home,
+        &[
+            "run",
+            "BRGR_FIXTURE_OK",
+            "--workspace",
+            workspace.to_str().unwrap(),
+            "--foreground",
+        ],
+        &[("BRGR_OWNER_ID", "codex:tui-once")],
+    ));
+    let task_id = created["task_id"].as_str().unwrap();
+    let text = tui_text(&home, &["tui", "--once"], &[]);
+    assert!(text.contains(&task_id[..8]), "{text}");
+    assert!(text.contains("brgr · managed tasks"), "{text}");
+    assert!(text.contains("This board never decides"), "{text}");
+    assert!(!text.contains("BRGR_FIXTURE_OK"), "{text}");
+}
+
+#[test]
+fn tui_shows_model_and_alias_for_a_fixture_run() {
+    let (_temp, home, workspace) = fixture_home();
+    let set = run(
+        &home,
+        &[
+            "config",
+            "alias",
+            "set",
+            "grok",
+            "--harness",
+            "local.fixture",
+            "--model",
+            "fixture-model",
+        ],
+        &[],
+    );
+    assert!(
+        set.status.success(),
+        "{}",
+        String::from_utf8_lossy(&set.stderr)
+    );
+    let created = json_output(&run(
+        &home,
+        &[
+            "run",
+            "BRGR_FIXTURE_OK",
+            "--use",
+            "grok",
+            "--workspace",
+            workspace.to_str().unwrap(),
+            "--foreground",
+        ],
+        &[("BRGR_OWNER_ID", "codex:tui-alias")],
+    ));
+    let task_id = created["task_id"].as_str().unwrap();
+    let text = tui_text(&home, &["tui", "--once"], &[]);
+    assert!(text.contains(&task_id[..8]), "{text}");
+    assert!(text.contains("grok"), "{text}");
+    assert!(text.contains("fixture-model"), "{text}");
+}
+
+#[test]
+fn tui_defaults_to_my_tasks_with_a_session_and_all_without() {
+    let (_temp, home, workspace) = fixture_home();
+    let mine = json_output(&run(
+        &home,
+        &[
+            "run",
+            "BRGR_FIXTURE_OK",
+            "--workspace",
+            workspace.to_str().unwrap(),
+            "--foreground",
+        ],
+        &[
+            ("BRGR_OWNER_ID", "codex:tui-mine"),
+            ("BRGR_SESSION_ID", "session-mine"),
+        ],
+    ));
+    let other = json_output(&run(
+        &home,
+        &[
+            "run",
+            "BRGR_FIXTURE_OK",
+            "--workspace",
+            workspace.to_str().unwrap(),
+            "--foreground",
+        ],
+        &[
+            ("BRGR_OWNER_ID", "codex:tui-other"),
+            ("BRGR_SESSION_ID", "session-other"),
+        ],
+    ));
+    let mine_id = mine["task_id"].as_str().unwrap();
+    let other_id = other["task_id"].as_str().unwrap();
+    let mine_board = tui_text(
+        &home,
+        &["tui", "--once"],
+        &[("BRGR_SESSION_ID", "session-mine")],
+    );
+    assert!(mine_board.contains("my tasks"), "{mine_board}");
+    assert!(mine_board.contains(&mine_id[..8]), "{mine_board}");
+    assert!(!mine_board.contains(&other_id[..8]), "{mine_board}");
+    let all_board = tui_text(&home, &["tui", "--once"], &[]);
+    assert!(all_board.contains("all owners"), "{all_board}");
+    assert!(
+        all_board.contains("no owner session in this terminal"),
+        "{all_board}"
+    );
+    assert!(all_board.contains(&mine_id[..8]), "{all_board}");
+    assert!(all_board.contains(&other_id[..8]), "{all_board}");
+}
+
+#[test]
+fn tui_mine_without_a_session_fails_without_guessing() {
+    let (_temp, home, _) = fixture_home();
+    let failed = tui(&home, &["tui", "--once", "--mine"], &[]);
+    assert!(!failed.status.success());
+    let stderr = String::from_utf8_lossy(&failed.stderr);
+    assert!(
+        stderr.contains(
+            "brgr tui --mine needs an owner session; run it from the owner's session or pass --as SESSION"
+        ),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn tui_refuses_json() {
+    let (_temp, home, _) = fixture_home();
+    let mut command = brgr_command();
+    let failed = command
+        .arg("--home")
+        .arg(&home)
+        .arg("--json")
+        .args(["tui", "--once"])
+        .output()
+        .unwrap();
+    assert!(!failed.status.success());
+    let stderr = String::from_utf8_lossy(&failed.stderr);
+    assert!(stderr.contains("brgr --json status"), "{stderr}");
+    assert!(stderr.contains("brgr status --brief"), "{stderr}");
+}
+
+#[test]
+fn tui_in_a_pipe_prints_one_snapshot_without_escape_codes() {
+    let (_temp, home, workspace) = fixture_home();
+    let created = json_output(&run(
+        &home,
+        &[
+            "run",
+            "BRGR_FIXTURE_OK",
+            "--workspace",
+            workspace.to_str().unwrap(),
+            "--foreground",
+        ],
+        &[("BRGR_OWNER_ID", "codex:tui-pipe")],
+    ));
+    let task_id = created["task_id"].as_str().unwrap();
+    let text = tui_text(&home, &["tui"], &[]);
+    assert!(text.contains(&task_id[..8]), "{text}");
+    assert!(!text.contains('\u{1b}'), "{text:?}");
+}
+
+#[test]
+fn tui_never_prints_objective_or_decision_reason() {
+    let (_temp, home, workspace) = fixture_home();
+    let created = json_output(&run(
+        &home,
+        &[
+            "run",
+            "BRGR_FIXTURE_OK",
+            "--workspace",
+            workspace.to_str().unwrap(),
+            "--foreground",
+        ],
+        &[("BRGR_OWNER_ID", "codex:tui-secret")],
+    ));
+    let task_id = created["task_id"].as_str().unwrap();
+    json_output(&run(
+        &home,
+        &["accept", task_id, "--reason", "SECRET_TUI_DECISION_REASON"],
+        &[("BRGR_OWNER_ID", "codex:tui-secret")],
+    ));
+    let text = tui_text(&home, &["tui", "--once"], &[]);
+    assert!(text.contains(&task_id[..8]), "{text}");
+    assert!(text.contains("accepted"), "{text}");
+    assert!(!text.contains("BRGR_FIXTURE_OK"), "{text}");
+    assert!(!text.contains("SECRET_TUI_DECISION_REASON"), "{text}");
+}
+
 #[test]
 fn plugin_codex_bridge_runs_a_fixture_outside_the_codex_process() {
     let temp = TempDir::new().unwrap();

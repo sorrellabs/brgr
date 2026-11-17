@@ -29,21 +29,23 @@ brgr config set-codex-executable "$(command -v codex)"
 yet reported the pane's Codex session ID, brgr verifies the exact Codex pane
 and reports the bound session before delivering a completion notification.
 
-Herdr exposes three workspace actions: **Open brgr status** opens a live,
-read-only board of the latest 20 tasks; **Open Codex for brgr** starts a new
-Codex pane in the selected worktree or workspace; **Check brgr** reports
-integration and harness health. Opening the Codex pane installs or updates only
-brgr-owned Codex hooks and its skill, then launches Codex with the plugin's
-built binary on `PATH`. A private bridge tied to that pane executes brgr CLI
-commands in the Herdr host, where supervisor process inspection is available;
-Codex keeps its ordinary command sandbox and receives access only to an
-ephemeral bridge directory. The host accepts managed task, result, decision,
-health, and cleanup commands, pins them to the selected workspace and brgr
-control home, and rejects harness mutation or integration commands. Plugin
-installation itself does not run a paid model or activate a harness. Register
-an approved executable with a small authorized scratch run outside the plugin
-Codex pane before using it for a task. The board shows task status, route, and
-decision state without revealing prompts or artifact contents.
+Herdr exposes three workspace actions: **Open brgr status** opens `brgr tui` in
+a pane, a live, read-only board of the latest 20 tasks for every owner;
+**Open Codex for brgr** starts a new Codex pane in the selected worktree or
+workspace; **Check brgr** reports integration and harness health. Opening the
+Codex pane installs or updates only brgr-owned Codex hooks and its skill, then
+launches Codex with the plugin's built binary on `PATH`. A private bridge tied
+to that pane executes brgr CLI commands in the Herdr host, where supervisor
+process inspection is available; Codex keeps its ordinary command sandbox and
+receives access only to an ephemeral bridge directory. The host accepts managed
+task, result, decision, health, and cleanup commands, pins them to the selected
+workspace and brgr control home, and rejects harness mutation or integration
+commands. Plugin installation itself does not run a paid model or activate a
+harness. Register an approved executable with a small authorized scratch run
+outside the plugin Codex pane before using it for a task. The board shows task
+id, project, harness, alias, model, revision, attempt state, result, and
+decision without revealing prompts, artifacts, or decision reasons. The owner
+session decides each sealed result; the board never does.
 
 See [the v2 plugin contract](v2-herdr-plugin.md) for ownership, context,
 recovery, and verification boundaries.
@@ -303,6 +305,15 @@ result exists, whether a decision exists). `brgr status --brief --json` is a
 compact array with keys `task_id`, `state`, `harness`, `elapsed_seconds`,
 `objective_head`.
 
+`brgr tui` is the task board in any terminal, not only the Herdr plugin pane.
+With an owner session it lists that session's tasks; without one it lists every
+owner and says so. `--mine` requires a session (or `--as SESSION`) and does not
+guess. `--all` lists every owner. `--once` prints one snapshot and exits.
+Piped or non-terminal stdout is the same snapshot, with no escape codes.
+`--json` is refused; use `brgr --json status` or `brgr status --brief`. The
+Herdr host bridge refuses it (`brgr status --brief` instead). The board never
+decides.
+
 `--deadline-seconds` counts awake time for a pane or headless run, on macOS and on
 Linux, so machine sleep extends the wall-clock duration before the run times out.
 When wall-clock time exceeds awake time by more than 60 seconds, the sealed result
@@ -320,7 +331,7 @@ brgr integrate claude install   # same skill for Claude Code
 ```
 
 Ask Codex, for example, “이 변경을 검토하면서 실패 사례도 확인해줘.”
-Codex owns the task criteria and the accept/reject decision; brgr owns the
+The owner session owns the task criteria and the accept/reject decision; brgr owns the
 bounded execution, sealed bytes, and durable inbox. The CLI remains an escape
 hatch for inspection and explicit operations:
 

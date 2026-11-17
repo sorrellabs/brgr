@@ -94,7 +94,8 @@ It is ready when `"status"` is `"ok"` and the worker you added shows
 session inside Herdr: an agent reads its skills when a session starts, so one
 that was already running does not know brgr yet.
 
-The Herdr plugin adds a task board and workspace actions on top:
+`brgr tui` is a live, read-only board of the latest 20 tasks in any terminal.
+The Herdr plugin's **Open brgr status** action is the same board, plus workspace actions:
 
 ```bash
 herdr plugin install sorrellabs/brgr --ref v2.15.24
@@ -110,6 +111,7 @@ Inside Herdr, ask your agent in plain words, for example:
 The agent runs commands like these, which you can also run yourself:
 
 ```bash
+brgr tui
 brgr run "Review this change" --harness local.claude-code --criterion "findings cite changed lines"
 brgr result TASK
 brgr accept TASK --reason "criteria verified"

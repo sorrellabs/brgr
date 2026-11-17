@@ -59,6 +59,8 @@ pub(crate) enum Command {
         #[arg(long, conflicts_with_all = ["tree", "verbose"])]
         brief: bool,
     },
+    /// Show the task board in this terminal. Read-only.
+    Tui(TuiArgs),
     /// Show a task's sealed result, optionally acknowledging a failed one.
     Result {
         task: TaskId,
@@ -482,6 +484,19 @@ pub(crate) enum ArtifactCommand {
         #[arg(long)]
         output: PathBuf,
     },
+}
+
+#[derive(Args)]
+pub(crate) struct TuiArgs {
+    /// Print one snapshot and exit.
+    #[arg(long)]
+    pub(crate) once: bool,
+    /// Show tasks for every owner, not only this session.
+    #[arg(long, conflicts_with = "mine")]
+    pub(crate) all: bool,
+    /// Show only this owner session's tasks.
+    #[arg(long, conflicts_with = "all")]
+    pub(crate) mine: bool,
 }
 
 #[derive(Args)]

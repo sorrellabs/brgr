@@ -2,6 +2,7 @@ mod admission;
 #[cfg(test)]
 mod adversary;
 mod aliases;
+mod board;
 mod bridge_host;
 mod caller_pane;
 mod cli;
@@ -37,6 +38,7 @@ mod statusline_install;
 mod supervision;
 mod task_commands;
 mod tree_status;
+mod tui;
 mod tui_host;
 mod watch;
 mod worker_identity;
@@ -316,10 +318,12 @@ async fn plugin_command(paths: &Paths, command: PluginCommand) -> Result<()> {
     }
 }
 
+#[allow(clippy::too_many_lines)] // One arm per clap command, including Tui.
 async fn execute(paths: &Paths, command: Command, json_output: bool) -> Result<()> {
     match command {
         Command::Run(args) => run_task(paths, args, json_output).await,
         Command::Revise(args) => Box::pin(revise_task(paths, args, json_output)).await,
+        Command::Tui(args) => tui::run(paths, &args, json_output).await,
         Command::Artifact { command } => evidence::artifact_command(paths, command, json_output),
         Command::Wait {
             task,
@@ -1017,6 +1021,20 @@ mod tests {
                 .unwrap();
         assert!(
             validate_bridge_host_command(&init_outside.command, root.path(), root.path()).is_err()
+        );
+    }
+
+    #[test]
+    fn bridge_host_refuses_tui() {
+        let root = TempDir::new().unwrap();
+        let tui = Cli::try_parse_from(["brgr", "tui"]).unwrap();
+        let error =
+            validate_bridge_host_command(&tui.command, root.path(), root.path()).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("brgr tui needs a terminal and is unavailable through the Herdr host bridge; use brgr status --brief"),
+            "{error}"
         );
     }
 
