@@ -82,6 +82,7 @@ mod manifest;
 mod prompt;
 
 pub use cause::{CauseSource, FailureCause};
+pub use collect::extract_stream_json_result;
 pub use configured::{MAX_MODEL_CHARS, configured_model};
 pub use error::RunnerError;
 
@@ -139,6 +140,9 @@ pub struct RunRequest<'a> {
     pub model: Option<&'a str>,
     pub effort: Option<&'a str>,
     pub permission: Option<PermissionLevel>,
+    /// A harness session id an earlier run produced, for a follow-up run that
+    /// resumes it (`--resume` on Qwen Code). `None` starts a fresh session.
+    pub resume_session: Option<&'a str>,
     pub deadline: Duration,
     pub cancel_path: Option<&'a Path>,
     pub pid_path: Option<&'a Path>,
@@ -152,6 +156,10 @@ pub struct ExecutionOutput {
     pub result: Vec<u8>,
     /// Native model identity from a completed JSONL assistant event, when available.
     pub observed_model: Option<String>,
+    /// The session the harness named in its terminal result event, when the
+    /// result source carries one. A follow-up run passes it back as
+    /// [`RunRequest::resume_session`].
+    pub session_id: Option<String>,
     pub timed_out: bool,
     pub cancelled: bool,
     pub output_truncated: bool,
@@ -222,6 +230,7 @@ impl ProcessRunner {
             workspace: request.workspace,
             model: request.model,
             effort: request.effort,
+            session: request.resume_session,
         };
         let argv = render_argv(manifest, &request, &substitutions)?;
 
@@ -287,7 +296,7 @@ impl ProcessRunner {
         };
         let output_truncated =
             overflow.load(Ordering::Relaxed) || stdout_truncated || stderr_truncated;
-        let (result, observed_model) = if can_collect_result(
+        let (result, observed_model, session_id) = if can_collect_result(
             status.as_ref(),
             manifest,
             cancelled,
@@ -296,7 +305,7 @@ impl ProcessRunner {
         ) {
             collect_result_with_model(manifest, &request, &substitutions, &stdout)?
         } else {
-            (Vec::new(), None)
+            (Vec::new(), None, None)
         };
 
         Ok(ExecutionOutput {
@@ -305,6 +314,7 @@ impl ProcessRunner {
             stderr,
             result,
             observed_model,
+            session_id,
             timed_out,
             cancelled,
             output_truncated,
@@ -401,6 +411,7 @@ impl ProcessRunner {
             stderr,
             result,
             observed_model: None,
+            session_id: None,
             timed_out,
             cancelled: false,
             output_truncated,
@@ -744,6 +755,7 @@ mod tests {
             launch: LaunchSpec {
                 argv: vec!["@${input.prompt_file}".to_owned()],
                 model_argv: vec![],
+                resume_argv: vec![],
                 effort_argv: vec![],
                 env_allow: vec![],
                 mode: ExecutionMode::OneShot,
@@ -754,6 +766,7 @@ mod tests {
                 source: ResultSource::Stdout,
                 media_type: "text/plain".to_owned(),
                 max_bytes,
+                budget_exit_codes: vec![],
                 success_exit_codes: vec![0],
             },
             capabilities: BTreeMap::new(),
@@ -783,9 +796,12 @@ mod tests {
             workspace: workspace.path(),
             model: None,
             effort: None,
+            session: None,
         };
         assert_eq!(
-            collect_result(&manifest, workspace.path(), &values, b"").unwrap(),
+            collect_result(&manifest, workspace.path(), &values, b"")
+                .unwrap()
+                .0,
             b"sealed fixture"
         );
         manifest.result.max_bytes = 3;
@@ -826,6 +842,7 @@ mod tests {
             instructions: None,
             model: None,
             effort: None,
+            resume_session: None,
             permission: None,
             deadline: Duration::from_secs(2),
             cancel_path: None,
@@ -840,6 +857,7 @@ mod tests {
             workspace: workspace.path(),
             model: None,
             effort: None,
+            session: None,
         };
 
         assert_eq!(
@@ -863,6 +881,7 @@ mod tests {
                 instructions: None,
                 model: Some(model),
                 effort: None,
+                resume_session: None,
                 permission: None,
                 deadline: Duration::from_secs(1),
                 cancel_path: None,
@@ -874,6 +893,7 @@ mod tests {
                 workspace: workspace.path(),
                 model: Some(model),
                 effort: None,
+                session: None,
             };
             assert_eq!(
                 render_argv(&manifest, &request, &substitutions).unwrap(),
@@ -959,6 +979,7 @@ mod tests {
                 instructions: None,
                 model: None,
                 effort: None,
+                resume_session: None,
                 permission: None,
                 deadline: Duration::from_millis(250),
                 cancel_path: None,
@@ -991,6 +1012,7 @@ mod tests {
                 instructions: None,
                 model: None,
                 effort: None,
+                resume_session: None,
                 permission: None,
                 // A hang guard: `echo` ends at once, however slowly it starts.
                 deadline: Duration::from_mins(1),
@@ -1018,6 +1040,7 @@ mod tests {
                 instructions: None,
                 model: None,
                 effort: None,
+                resume_session: None,
                 permission: None,
                 // A hang guard: `echo` ends at once, however slowly it starts.
                 deadline: Duration::from_mins(1),
@@ -1475,6 +1498,7 @@ mod tests {
             instructions: None,
             model: None,
             effort: None,
+            resume_session: None,
             permission: None,
             deadline: Duration::from_secs(1),
             cancel_path: None,
@@ -1486,6 +1510,7 @@ mod tests {
             workspace: workspace.path(),
             model: None,
             effort: None,
+            session: None,
         };
         assert!(matches!(
             collect_result_with_model(&manifest, &request, &values, events),
@@ -1524,6 +1549,7 @@ mod tests {
                 instructions: None,
                 model: None,
                 effort: None,
+                resume_session: None,
                 permission: None,
                 deadline: Duration::from_mins(1),
                 cancel_path: None,
@@ -1573,6 +1599,7 @@ mod tests {
                 instructions: None,
                 model: None,
                 effort: None,
+                resume_session: None,
                 permission: None,
                 deadline: Duration::from_secs(30),
                 cancel_path: Some(&cancel),

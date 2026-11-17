@@ -69,6 +69,11 @@ pub struct LaunchSpec {
     pub effort_argv: Vec<String>,
     #[serde(default)]
     pub env_allow: Vec<String>,
+    /// Arguments appended only to a follow-up run that carries a session the
+    /// harness can resume, e.g. `qwen --resume <id>`. Empty for a harness with
+    /// no resume flag; such a manifest never receives a session.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub resume_argv: Vec<String>,
     pub mode: ExecutionMode,
     /// Arguments for each permission level the harness can honour. Empty for
     /// a manifest that predates levels or a custom one that declares none.
@@ -173,6 +178,11 @@ pub struct ResultSpec {
     pub media_type: String,
     pub max_bytes: u64,
     pub success_exit_codes: Vec<i32>,
+    /// Exit codes that mean the harness stopped on its own run or session
+    /// budget, not on a brgr deadline. A run ending on one is `failed` with a
+    /// reason that names the budget.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub budget_exit_codes: Vec<i32>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -184,7 +194,14 @@ pub struct ResultSpec {
 pub enum ResultSource {
     Stdout,
     JsonlAssistantFinal,
-    File { path: String },
+    /// Qwen Code's `--output-format stream-json` line stream: the terminal
+    /// `type: "result"` event carries the report in `result` and the session
+    /// in `session_id`. Only the pinned envelope parses; anything else is a
+    /// typed error.
+    StreamJsonResult,
+    File {
+        path: String,
+    },
 }
 
 /// Every key a result source may carry, checked before the variant is chosen.
@@ -209,9 +226,10 @@ impl TryFrom<ResultSourceFields> for ResultSource {
         match (fields.kind.as_str(), fields.path) {
             ("stdout", None) => Ok(Self::Stdout),
             ("jsonl_assistant_final", None) => Ok(Self::JsonlAssistantFinal),
+            ("stream_json_result", None) => Ok(Self::StreamJsonResult),
             ("file", Some(path)) => Ok(Self::File { path }),
             ("file", None) => Err("a `file` result source requires `path`".to_owned()),
-            ("stdout" | "jsonl_assistant_final", Some(_)) => Err(format!(
+            ("stdout" | "jsonl_assistant_final" | "stream_json_result", Some(_)) => Err(format!(
                 "a `{}` result source takes no `path`; did you mean `file`?",
                 fields.kind
             )),
@@ -361,6 +379,7 @@ impl HarnessManifest {
             .argv
             .iter()
             .chain(self.launch.permission_argv.all())
+            .chain(&self.launch.resume_argv)
             .chain(
                 self.launch
                     .interactive
@@ -401,6 +420,14 @@ impl HarnessManifest {
         }
         if self.result.success_exit_codes.is_empty() {
             return Err(RunnerError::MissingSuccessExitCode);
+        }
+        if self
+            .result
+            .budget_exit_codes
+            .iter()
+            .any(|code| self.result.success_exit_codes.contains(code))
+        {
+            return Err(RunnerError::InvalidArgument);
         }
         let mut names = BTreeSet::new();
         for name in &self.launch.env_allow {

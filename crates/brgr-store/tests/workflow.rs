@@ -77,6 +77,7 @@ fn failed_result(task: &TaskSpec, attempt_id: AttemptId) -> ResultEnvelope {
         route_observation: None,
         unresolved_effects: vec![],
         slept_seconds: None,
+        harness_session_id: None,
     }
 }
 

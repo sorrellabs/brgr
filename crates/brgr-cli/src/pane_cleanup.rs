@@ -426,6 +426,7 @@ mod tests {
             route_observation: None,
             unresolved_effects: vec![],
             slept_seconds: None,
+            harness_session_id: None,
         };
         mark_pending(temp.path(), task_id, &result).unwrap();
         let saved: PaneReceipt =
@@ -471,6 +472,7 @@ mod tests {
             route_observation: None,
             unresolved_effects: vec![],
             slept_seconds: None,
+            harness_session_id: None,
         };
         mark_pending(temp.path(), task_id, &result).unwrap();
         let saved: PaneReceipt =
@@ -542,6 +544,7 @@ mod tests {
             route_observation: None,
             unresolved_effects: vec![],
             slept_seconds: None,
+            harness_session_id: None,
         };
         store.commit_terminal_result(&owner_id, &result).unwrap();
         store.bind_owner(&owner_id, "session-a", 1).unwrap();
@@ -743,6 +746,7 @@ mod tests {
             route_observation: None,
             unresolved_effects: vec![],
             slept_seconds: None,
+            harness_session_id: None,
         };
         store.commit_terminal_result(&owner_id, &result).unwrap();
         let receipt = PaneReceipt {

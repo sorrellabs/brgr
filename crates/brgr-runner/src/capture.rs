@@ -68,20 +68,59 @@ async fn capture_stdout<R>(
 where
     R: AsyncRead + Unpin,
 {
-    if source == ResultSource::JsonlAssistantFinal {
-        read_jsonl_semantic(reader, limit, JSONL_TRANSPORT_LIMIT_BYTES, overflow).await
-    } else {
-        capture_bounded(reader, limit, overflow).await
+    match source {
+        ResultSource::JsonlAssistantFinal => {
+            read_semantic(
+                reader,
+                limit,
+                JSONL_TRANSPORT_LIMIT_BYTES,
+                overflow,
+                retain_jsonl_event,
+            )
+            .await
+        }
+        ResultSource::StreamJsonResult => {
+            read_semantic(
+                reader,
+                limit,
+                JSONL_TRANSPORT_LIMIT_BYTES,
+                overflow,
+                retain_stream_json_event,
+            )
+            .await
+        }
+        _ => capture_bounded(reader, limit, overflow).await,
     }
 }
 
 // JSONL update events repeat growing message bodies. Keep only events used by
 // result and model verification while bounding the bytes read and retained.
+#[cfg(test)]
 pub(crate) async fn read_jsonl_semantic<R>(
+    reader: R,
+    result_limit: u64,
+    transport_limit: u64,
+    overflow: Arc<AtomicBool>,
+) -> Result<(Vec<u8>, bool), std::io::Error>
+where
+    R: AsyncRead + Unpin,
+{
+    read_semantic(
+        reader,
+        result_limit,
+        transport_limit,
+        overflow,
+        retain_jsonl_event,
+    )
+    .await
+}
+
+pub(crate) async fn read_semantic<R>(
     mut reader: R,
     result_limit: u64,
     transport_limit: u64,
     overflow: Arc<AtomicBool>,
+    retain: fn(&[u8], &mut Vec<u8>, u64) -> bool,
 ) -> Result<(Vec<u8>, bool), std::io::Error>
 where
     R: AsyncRead + Unpin,
@@ -104,7 +143,7 @@ where
                 return Ok((retained, true));
             }
             if *byte == b'\n' {
-                if !retain_jsonl_event(&line, &mut retained, semantic_limit) {
+                if !retain(&line, &mut retained, semantic_limit) {
                     overflow.store(true, Ordering::Relaxed);
                     return Ok((retained, true));
                 }
@@ -117,7 +156,7 @@ where
             }
         }
     }
-    if !line.is_empty() && !retain_jsonl_event(&line, &mut retained, semantic_limit) {
+    if !line.is_empty() && !retain(&line, &mut retained, semantic_limit) {
         overflow.store(true, Ordering::Relaxed);
         return Ok((retained, true));
     }
@@ -165,6 +204,48 @@ pub(crate) fn retain_jsonl_event(line: &[u8], retained: &mut Vec<u8>, limit: u64
             {
                 b"{\"type\":\"turn_end\",\"message\":{\"role\":\"assistant\"}}".to_vec()
             }
+            _ => return true,
+        },
+        Err(_) => line.to_vec(),
+    };
+    if u64::try_from(retained.len())
+        .unwrap_or(u64::MAX)
+        .saturating_add(u64::try_from(bytes.len()).unwrap_or(u64::MAX))
+        .saturating_add(1)
+        > limit
+    {
+        return false;
+    }
+    retained.extend_from_slice(&bytes);
+    retained.push(b'\n');
+    true
+}
+
+/// The stream-json reduction: the terminal `result` event is kept whole
+/// (it is the report and the session id), `assistant` events shrink to the
+/// model identity the observer checks, `system` events shrink to theirs, and
+/// everything else is dropped. Malformed lines are kept so the collector's
+/// own malformed-stream error fires rather than a silent drop.
+pub(crate) fn retain_stream_json_event(line: &[u8], retained: &mut Vec<u8>, limit: u64) -> bool {
+    if line.is_empty() {
+        return true;
+    }
+    let bytes = match serde_json::from_slice::<Value>(line) {
+        Ok(event) => match event.get("type").and_then(Value::as_str) {
+            Some("result") => line.to_vec(),
+            Some("assistant") => serde_json::to_vec(&json!({
+                "type": "assistant",
+                "message": {
+                    "model": event.pointer("/message/model"),
+                },
+            }))
+            .expect("JSON values serialize"),
+            Some("system") => serde_json::to_vec(&json!({
+                "type": "system",
+                "session_id": event.get("session_id"),
+                "model": event.get("model"),
+            }))
+            .expect("JSON values serialize"),
             _ => return true,
         },
         Err(_) => line.to_vec(),

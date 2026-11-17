@@ -64,6 +64,7 @@ pub(crate) fn omp_process_manifest(
         launch: LaunchSpec {
             argv,
             model_argv: vec![],
+            resume_argv: vec![],
             effort_argv: vec![],
             env_allow: vec![
                 "HOME".to_owned(),
@@ -80,6 +81,7 @@ pub(crate) fn omp_process_manifest(
             source: ResultSource::Stdout,
             media_type: "text/markdown".to_owned(),
             max_bytes: launch.spec.artifact_contract.max_bytes,
+            budget_exit_codes: vec![],
             success_exit_codes: vec![0],
         },
         capabilities: activated.capabilities.clone(),

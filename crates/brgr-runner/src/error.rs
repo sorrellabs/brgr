@@ -52,6 +52,10 @@ pub enum RunnerError {
     ResultTooLarge { max_bytes: u64, observed_bytes: u64 },
     #[error("JSONL output has no completed agent_end event")]
     MissingTerminalEvent,
+    #[error("stream-json output has no terminal result event")]
+    MissingResultEvent,
+    #[error("stream-json result event does not match the pinned result shape")]
+    UnexpectedResultShape,
     #[error("JSONL output has no final assistant text")]
     MissingAssistantText,
     #[error("last assistant message failed: {0}")]

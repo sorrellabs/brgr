@@ -358,6 +358,7 @@ impl Supervisor {
                 stderr: vec![],
                 result: report.to_vec(),
                 observed_model: None,
+                session_id: None,
                 timed_out: false,
                 cancelled: false,
                 output_truncated: false,

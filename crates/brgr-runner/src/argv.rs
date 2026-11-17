@@ -10,6 +10,9 @@ pub(crate) struct Substitutions<'a> {
     pub(crate) workspace: &'a Path,
     pub(crate) model: Option<&'a str>,
     pub(crate) effort: Option<&'a str>,
+    /// The harness session a follow-up run resumes; only manifests with a
+    /// `resume_argv` ever see one.
+    pub(crate) session: Option<&'a str>,
 }
 
 pub(crate) fn render_argv(
@@ -24,6 +27,9 @@ pub(crate) fn render_argv(
     }
     if request.effort.is_some() {
         arguments.extend(manifest.launch.effort_argv.clone());
+    }
+    if request.resume_session.is_some() {
+        arguments.extend(manifest.launch.resume_argv.clone());
     }
     arguments
         .iter()
@@ -55,6 +61,7 @@ pub(crate) fn substitute(
     for (placeholder, value) in [
         ("${route.model}", values.model),
         ("${route.effort}", values.effort),
+        ("${input.session}", values.session),
     ] {
         if output.contains(placeholder) {
             output = output.replace(
@@ -82,6 +89,7 @@ mod prompt_tests {
                 workspace: Path::new("/tmp"),
                 model: None,
                 effort: None,
+                session: None,
             },
         )
         .unwrap()
