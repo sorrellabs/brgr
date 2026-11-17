@@ -186,7 +186,9 @@ for config, instructions, debate, and the current verification limits.
 
 Default TUI tasks own their native pane; an additional supervisor pane is not
 created. Set `brgr config set worker-placement tab` for new tabs or `adjacent`
-for a split beside the exact caller. Settings live at `$BRGR_HOME/config.toml`
+for a split beside the exact caller: later workers stack under the first, then
+fill a second column beside them when the area is wide enough, then a new tab
+once both columns are full. Settings live at `$BRGR_HOME/config.toml`
 and do not move existing panes. Legacy auto-worker settings remain readable.
 
 Named routes live under `[aliases]` in `config.toml`; each entry stores a
