@@ -1623,9 +1623,18 @@ esac
     fn opencodes_web_search_prompt_is_not_answered_while_working() {
         let (temp, herdr) = fake_herdr(OPENCODE_WEB_SEARCH);
         let (paths, run) = run_args(&temp);
-        let mut watch = ScreenWatch::with_limit("opencode", Duration::from_hours(1));
+        let mut answers = AnswerMemory::new();
         assert_eq!(
-            resolve(&herdr, "w1:p2", &run, &paths, Some("working"), &mut watch).unwrap(),
+            resolve(
+                &herdr,
+                "w1:p2",
+                &run,
+                &paths,
+                Some("working"),
+                &mut answers,
+                "test"
+            )
+            .unwrap(),
             Screen::Clear
         );
         assert!(!temp.path().join("keys").exists());
@@ -1635,9 +1644,18 @@ esac
     fn claudes_lsp_plugin_recommendation_is_not_answered_while_working() {
         let (temp, herdr) = fake_herdr(CLAUDE_LSP_PLUGIN);
         let (paths, run) = run_args(&temp);
-        let mut watch = ScreenWatch::with_limit("claude", Duration::from_hours(1));
+        let mut answers = AnswerMemory::new();
         assert_eq!(
-            resolve(&herdr, "w1:p2", &run, &paths, Some("working"), &mut watch).unwrap(),
+            resolve(
+                &herdr,
+                "w1:p2",
+                &run,
+                &paths,
+                Some("working"),
+                &mut answers,
+                "test"
+            )
+            .unwrap(),
             Screen::Clear
         );
         assert!(!temp.path().join("keys").exists());
