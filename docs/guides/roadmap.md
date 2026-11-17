@@ -1,6 +1,6 @@
 # Execution Model Roadmap
 
-상태: Phase 1 store/CLI는 v2.14.2, 버려진 Head 인계는 v2.15.0, Dynamic Workflows는 v2.15.10 · 작성 2026-10-14 · 전달 경로 선행 결정 2026-10-29 · 제품 방향과 v3 결정 2026-10-31 · 호스트 중립 중단, v3 재정의 2026-11-11
+상태: Phase 1 store/CLI는 v2.14.2, 버려진 Head 인계는 v2.15.0, Dynamic Workflows는 v2.15.10 · 작성 2026-10-14 · 전달 경로 선행 결정 2026-10-29 · 제품 방향과 v3 결정 2026-10-31 · 호스트 중립 중단, v3 재정의 2026-11-11 · v3 범위 결정 2026-11-17
 
 > 에이전트 세션이 아니라 brgr이 작업의 생명주기를 소유한다.
 
@@ -236,7 +236,7 @@ const { results, stopped_at } = await pipeline([
 
 ## Phase 3.5. 하네스 중립 전달 경로
 
-릴리스 방향: v2.x 패치 · 상태: 결정됨, 미착수 · 추적: [#200](https://github.com/sorrellabs/brgr/issues/200)
+릴리스 방향: v2.x 패치 · 상태: 추적 이슈 [#200](https://github.com/sorrellabs/brgr/issues/200)은 owner 결정으로 닫았다(2026-11-17). 전달 경로를 하나로 모으는 일은 [#442](https://github.com/sorrellabs/brgr/issues/442)(역할이 아니라 부모-자식 관계로 메시지와 알림을 보낸다)에서 한다. 아래는 그 설계 기록이다.
 
 Unified Continuity보다 먼저 한다. 2026-10-29에 정한 순서다.
 
@@ -276,36 +276,61 @@ pane 화면을 읽지 않는 Codex owner 식별은 기존 호출 동작을 바�
 
 ## v3: 브릿저와 오케스트레이터
 
-릴리스 방향: 3.0.0-rc.1로 변경 이유, 방향, 이후 로드맵을 먼저 공개한다(owner 결정 2026-11-11). 그 전까지는 2.x 패치 · 상태: 방향 결정, 설계 전
+릴리스 방향: 3.0.0-rc.1로 변경 이유, 방향, 이후 로드맵을 먼저 공개한다(owner 결정 2026-11-11). 그 전까지는 2.x 패치 · 상태: 3.0 범위 결정(owner 결정 2026-11-17), 추적 [#447](https://github.com/sorrellabs/brgr/issues/447)
 
 이름은 brgr로 유지한다. 3.0은 기능 하나가 아니라 구조와 버전 체계가 바뀌는
 기준점이다. 이후 큰 메이저 변경은 거의 없을 것으로 본다.
 
-**구조.**
+3.0부터는 엄격한 SemVer라서, 공개 표면을 호환되지 않게 바꾸려면 deprecate를 먼저
+거쳐야 한다. 그래서 공개 표면을 바꾸는 일은 3.0 전에 끝내고, 아무것도 깨지 않는
+추가 기능은 3.x minor로 낸다.
+
+**구조.** 3층으로 정했다([#431](https://github.com/sorrellabs/brgr/issues/431)).
 
 - **브릿저(코어)**: 맡기기 -> 봉인된 결과 -> 인박스 -> owner 결정. 자동 수락은 하지
-  않는다. 위의 최소 실행 계약이 곧 브릿저다.
-- **오케스트레이터(선택 설치)**: Dynamic Workflows, debate, 재귀 워커, Head 인계,
-  그리고 새 패턴(loop, 서로 공격하며 다듬는 패턴, advisor). 새 패턴은 기존
-  primitive(워커 실행, 세션 이어가기, 인박스)의 조합으로 만들 수 있는지부터 본다.
+  않는다. 위의 최소 실행 계약이 곧 브릿저다. OS별 코드는 코어 아래의 내부 크레이트
+  `brgr-platform`에 둔다([#421](https://github.com/sorrellabs/brgr/issues/421)).
+  별도 계층이 아니다.
+- **표면(surface)**: 사람과 하네스가 brgr을 만나는 곳. pane 어댑터, Herdr 플러그인,
+  훅, 상태줄, TUI, 사용량 신호(`context_signal`).
+- **오케스트레이터(선택 설치)**: Dynamic Workflows, debate, 재귀 위임, 세션 인계,
+  조건부 인계(`handoff_condition`), 그리고 새 패턴(loop, 서로 공격하며 다듬는 패턴,
+  advisor). 새 패턴은 기존 primitive(실행, 세션 이어가기, 인박스)의 조합으로 만들 수
+  있는지부터 본다.
 
-**함께 하는 일.**
+**3.0 전에 할 일.**
 
-- 설치: brew 또는 curl([#230](https://github.com/sorrellabs/brgr/issues/230)). Herdr
-  플러그인이 `[[build]]`로 cargo 빌드를 요구하는 지금 방식을 배포 방식과 연결한다.
-  yolo 켜기/끄기, 자동 신뢰 같은 기본값은 TUI에서 정하고 config에 저장한다.
+- 3층 분리([#431](https://github.com/sorrellabs/brgr/issues/431)). 1단계(코어가
+  오케스트레이터를 부르는 곳 끊기)는 #438로 들어갔다.
+- 세션 하나로([#439](https://github.com/sorrellabs/brgr/issues/439)): head와 worker의
+  구분을 없앤다. 모든 에이전트 세션이 같은 종류의 노드이고, 위임, 메시지, 알림, 인계,
+  debate가 같은 규칙을 따른다. 모든 패턴이 어떤 하네스와 모델에서든 돈다
+  ([#445](https://github.com/sorrellabs/brgr/issues/445)). Tier는 테스트 엄격도이고,
+  하네스가 할 수 있는 일을 정하지 않는다. Hermes는 지원하지 않는다.
+- 공개 표면을 목록으로 고정하고, 바뀌면 CI가 실패하게 한다
+  ([#448](https://github.com/sorrellabs/brgr/issues/448)).
+- 버전 하나로 맞추고 릴리스에서 확인한다([#449](https://github.com/sorrellabs/brgr/issues/449)).
+- 설치: brew와 curl, checksum과 출처 증명([#450](https://github.com/sorrellabs/brgr/issues/450)).
+  Herdr 플러그인은 cargo로 빌드하지 않고 같은 릴리스 바이너리를 받는다
+  ([#451](https://github.com/sorrellabs/brgr/issues/451)).
+- 기본값을 TUI에서 정하고 config에 저장한다([#452](https://github.com/sorrellabs/brgr/issues/452)).
+  권한과 자동 신뢰도 사용자가 끌 수 있다. 기본값은 full access와 자동 신뢰이고, brgr이
+  스스로 낮추지 않는다(owner 결정 2026-11-17).
+- Claude Code mod: 헤드리스 작업을 바로 보여 준다([#453](https://github.com/sorrellabs/brgr/issues/453)).
+  지금은 5초 폴링이고, mod API의 `process.run`은 끝날 때까지 기다리며 상태 표시는
+  문자열 하나다.
+- 위 일이 끝나면 3.0.0-rc.1을 낸다([#454](https://github.com/sorrellabs/brgr/issues/454)).
+
+**3.x로 할 일.** 3.0 기한 없이 minor로 낸다.
+
 - Herdr 연동: pane 분할을 `layout.export`, `layout.apply`, `layout.set_split_ratio`,
   `pane.move`로 더 정교하게 한다. agents 목록의 계층은 Herdr에 부모/자식 필드가
   없으므로 `└` 같은 글리프 접두어와 parent-id 정렬 토큰으로 먼저 구현한다. 원격
   (SSH, Teleport `tsh`)은 새로 만들지 않고 Herdr의 원격 기능을 쓴다. Herdr 기능
   요청은 Discussions에 사람이 직접 쓴다. 에이전트는 쓰지 않는다.
-- Claude Code mod: 헤드리스 작업을 바로 보여 준다. 지금은 5초 폴링이고, mod API의
-  `process.run`은 끝날 때까지 기다리며 상태 표시는 문자열 하나다. 이 제약 안에서
-  방법을 찾는다.
-- 하네스: Tier 2(Command Code, OMP, OpenCode, Cline)까지 head로 쓸 수 있게 넓힌다.
-  Tier는 테스트 엄격도로 정의한다. Hermes는 지원하지 않는다.
+- 새 오케스트레이터 패턴: loop, 서로 공격하며 다듬는 패턴, advisor.
 - brgr-bot: Discord/Slack에서 brgr을 불러 모델들에게 토론시키고 결과를 가져오는
-  비교·회의 엔진. 이후 head를 brgr 자체로 두는 "headless head"도 열어 둔다.
+  비교·회의 엔진. 이후 brgr 자체가 root인 세션도 열어 둔다.
 
 **버전 규칙(3.0부터).**
 
@@ -317,13 +342,15 @@ pane 화면을 읽지 않는 Codex owner 식별은 기존 호출 동작을 바�
 - 프리릴리스는 rc만 쓴다(`3.1.0-rc.N`). alpha, beta, nightly는 쓰지 않는다. 3.0에서
   beta를 한 번 쓸지는 열려 있다.
 - 문서만 바뀌면 릴리스하지 않는다.
-- 크레이트, 플러그인 매니페스트, mod의 `plugin.json`, README의 `--ref`를 한 버전으로
-  맞춘다.
+- 크레이트, 플러그인 매니페스트, README의 `--ref`를 한 버전으로 맞춘다. mod에는 지금
+  버전 필드가 없다. 둘지는 #449에서 정한다.
 
-**아직 정하지 않은 것.** 브릿저와 오케스트레이터의 경계(owner 식별, 전달, 사용량
-관찰), 오케스트레이터 선택 설치 방식(feature flag, 별도 바이너리, 설치 명령), 2층으로
-충분한지 아니면 표면(surface)이나 실행 계약을 따로 두는 3층인지, Herdr Discussions에
-계층 표시 요청을 올릴지.
+**정한 것과 남은 것.** 2층이냐 3층이냐는 3층으로 정했다(#431). 브릿저와
+오케스트레이터의 경계 중 owner 식별과 전달은 #431 1단계와 #439가, 사용량 관찰은
+#431의 계층 표(`context_signal`은 표면, `handoff_condition`은 오케스트레이터)와
+#445(하네스별 사용량 출처를 레시피로)가 정한다. 남은 것은 오케스트레이터 선택 설치
+방식(feature flag, 별도 바이너리, 설치 명령. owner가 #431 5단계에서 정한다)과, Herdr
+Discussions에 계층 표시 요청을 올릴지다.
 
 ## 호스트 중립 (중단)
 
@@ -332,10 +359,12 @@ agentdriver도 중단한다. Herdr는 brgr의 유일한 TUI 호스트로 남는�
 스파이크 결과([macOS](../evidence/pty-proxy-spike-2026-11-04.md),
 [Linux](../evidence/pty-proxy-spike-linux-2026-11-04.md))와 `spikes/pty-proxy`는
 기록으로 남긴다. 구현 이슈 #311~#314는 닫았다. 이 결정으로 빠진 옛 v3 기준 중
-실사용 검증([#225](https://github.com/sorrellabs/brgr/issues/225)), 에이전트 경험
-측정([#226](https://github.com/sorrellabs/brgr/issues/226)), Linux 지원
-([#229](https://github.com/sorrellabs/brgr/issues/229)), 서명 없는 배포
-([#230](https://github.com/sorrellabs/brgr/issues/230))는 각자 이슈로 남는다.
+실사용 검증([#225](https://github.com/sorrellabs/brgr/issues/225))과 Linux 지원
+([#229](https://github.com/sorrellabs/brgr/issues/229))은 결과를 남기고 닫았다. 에이전트
+경험 측정([#226](https://github.com/sorrellabs/brgr/issues/226))과 서명 없는 배포
+([#230](https://github.com/sorrellabs/brgr/issues/230))는 owner 결정으로 닫았고
+(2026-11-17), 배포는 v3 범위의 [#450](https://github.com/sorrellabs/brgr/issues/450)으로
+다시 넣었다.
 
 ## Phase 4. Unified Continuity
 
@@ -371,7 +400,7 @@ agentdriver도 중단한다. Herdr는 brgr의 유일한 TUI 호스트로 남는�
 | Head Migration | 5 | 4 | 수동 인계, 자동 퇴장, 사용량 조건부 인계(알림과 `--auto`)까지 출시 |
 | Dynamic Workflows | 5 | 5 | Phase 3 완료. 패치로 쌓여 출시한다 |
 | 하네스 중립 전달 경로 | 4 | 2 | 패치. Unified Continuity의 선행 조건 |
-| 브릿저와 오케스트레이터 분리 | 5 | 4 | v3의 기준. 설계 전이라 공수는 추정이다 |
+| 브릿저와 오케스트레이터 분리 | 5 | 4 | v3의 기준. 3층으로 정했고 1단계는 #438. 나머지 공수는 추정이다 |
 | 호스트 중립 | - | - | 중단(owner 결정 2026-11-11) |
 | 하네스 호환성 | 4 | 2 | 매일의 경험이며 전부 패치다 |
 | 계층 탭·위성 UI | 2 | 3 | 현재 로드맵에서 제외한다 |
