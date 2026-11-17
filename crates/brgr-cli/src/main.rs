@@ -16,6 +16,7 @@ mod debate;
 mod error_memo;
 mod evidence;
 mod execution_mode;
+mod extension;
 mod failure_banner;
 #[cfg(test)]
 mod fast_script;
@@ -237,6 +238,7 @@ fn write_bytes_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = calling_cli();
+    workflow::install_hooks();
     if !matches!(
         &cli.command,
         Command::Plugin { .. }

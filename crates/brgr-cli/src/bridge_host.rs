@@ -8,7 +8,9 @@ use std::{
 use anyhow::{Context as _, Result, bail};
 
 use crate::{
-    cli::{ArtifactCommand, Cli, Command, ConfigCommand, ErrorsCommand, HarnessCommand},
+    cli::{
+        ArtifactCommand, Cli, Command, ConfigCommand, ErrorsCommand, HarnessCommand, WorkflowBridge,
+    },
     message, plugin_bridge,
 };
 
@@ -137,15 +139,13 @@ pub(crate) fn validate_bridge_host_command(
         }
         // `workflow init` writes SDK files and does not touch owner state, the
         // store, or a worker. Same confinement as artifact export: the target
-        // directory must already exist inside the selected workspace.
-        Command::Workflow {
-            command: crate::workflow::WorkflowCommand::Init { dir, .. },
-        } => require_bridge_workspace(dir.as_deref().unwrap_or(current_dir), &workspace_root),
+        // directory must already exist inside the selected workspace. The
+        // orchestrator names the command through the extension point.
+        Command::Workflow { .. } => require_bridge_workflow(command, &workspace_root, current_dir),
         Command::Tui(_) => bail!(
             "brgr tui needs a terminal and is unavailable through the Herdr host bridge; use brgr status --brief"
         ),
-        Command::Workflow { .. }
-        | Command::Harness { .. }
+        Command::Harness { .. }
         | Command::Integrate { .. }
         | Command::Prune { .. }
         | Command::Errors {
@@ -166,6 +166,23 @@ pub(crate) fn validate_bridge_host_command(
         | Command::OmpRun { .. } => {
             bail!("internal brgr commands are unavailable through the Herdr host bridge")
         }
+    }
+}
+
+/// Confines a workflow command to the bridge workspace: an SDK `init` may
+/// write inside it, and no other workflow command may run through the host.
+fn require_bridge_workflow(
+    command: &Command,
+    workspace_root: &Path,
+    current_dir: &Path,
+) -> Result<()> {
+    match command.workflow_bridge() {
+        WorkflowBridge::Init { dir } => {
+            require_bridge_workspace(dir.as_deref().unwrap_or(current_dir), workspace_root)
+        }
+        WorkflowBridge::NotInit => bail!(
+            "this brgr command is unavailable through the Herdr host bridge; run it explicitly outside the plugin Codex pane"
+        ),
     }
 }
 

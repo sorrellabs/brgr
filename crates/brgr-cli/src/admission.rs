@@ -34,8 +34,6 @@ use serde::Serialize;
 use serde_json::json;
 use sha2::{Digest, Sha256};
 
-use crate::workflow::{self, diverged_error};
-
 /// Quotes the objective in the default criterion only when the whole string
 /// fits in 512 UTF-8 bytes. Longer objectives get a fixed criterion so a large
 /// prompt is not doubled into `acceptance_criteria`. A valid `str` is already
@@ -1131,7 +1129,9 @@ pub(crate) async fn start_task(
     match commit {
         AdmissionCommit::Created => {}
         AdmissionCommit::Replayed => return Ok(()),
-        AdmissionCommit::ParallelLimit(run_id) => workflow::exit_parallel_limit(&run_id),
+        AdmissionCommit::ParallelLimit(run_id) => {
+            crate::extension::exit_parallel_limit(&run_id);
+        }
     }
     if let Some((owner, result_id, session, epoch)) = &options.acknowledge_previous
         && let Err(error) = store.acknowledge_bound(owner, *result_id, session, *epoch)
@@ -1245,7 +1245,7 @@ fn replay_existing_workflow_step(
         return Ok(false);
     };
     if existing.input_digest != workflow.input_digest {
-        return Err(diverged_error(&workflow.step_key));
+        return Err(crate::extension::diverged_admission(&workflow.step_key));
     }
     print_existing_task_receipt(paths, &store, existing.task_id, json_output, mode)?;
     Ok(true)
@@ -1299,7 +1299,7 @@ fn commit_workflow_step(
         }
         Err(StoreError::WorkflowStepDiverged { step_key, .. }) => {
             recorded.discard();
-            return Err(diverged_error(&step_key));
+            return Err(crate::extension::diverged_admission(&step_key));
         }
         Err(error) => {
             recorded.discard();
