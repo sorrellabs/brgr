@@ -57,6 +57,7 @@ mod error;
 mod recipe;
 
 pub use error::RegistryError;
+pub use recipe::failure_hint_for;
 
 use catalog::{executable_on_path, parse_model_catalog};
 use recipe::{GENERIC, generate_manifest_from, named, recipe_for};
@@ -473,6 +474,11 @@ impl Registry {
                     brgr_runner::CauseSource::ErrorEvent => "last error event:",
                 };
                 reason = format!("{reason}; {mark} {}", cause.text);
+                // A harness whose own words name no cause may leave the cause
+                // only in its log; the recipe that knows where owns the hint.
+                if let Some(hint) = failure_hint_for(&manifest.id, &cause.text) {
+                    reason = format!("{reason} ({hint})");
+                }
             }
             return Err(RegistryError::ScratchRunFailed(reason));
         }
@@ -3610,4 +3616,54 @@ case "$prompt" in
 esac
 exit 0
 "#;
+
+    /// The `harness add` scratch run names the recipe's hint when GJC fails
+    /// with its causeless `Agent run failed.` event, and never when a real
+    /// cause is present (issue #432).
+    #[tokio::test]
+    async fn gjc_scratch_run_failure_points_at_its_log_only_for_a_causeless_event() {
+        let root = tempfile::tempdir().unwrap();
+        let executable = root.path().join("gjc");
+        let help = "--mode=<value> --no-session --no-mcp -p, --print";
+        let registry = Registry::open(root.path().join("registry")).unwrap();
+
+        // A causeless `agent_failed` turn: the failure must carry the hint.
+        write_fast_script(
+            &executable,
+            &format!(
+                "#!/bin/sh\ncase \"$1\" in\n --version) echo 'gjc/0.21.0';;\n --help) echo '{help}';;\n *) printf '%s\\n' '{{\"type\":\"message_end\",\"message\":{{\"role\":\"assistant\",\"content\":[],\"errorMessage\":\"Agent run failed.\"}}}}' '{{\"type\":\"agent_end\",\"stopReason\":\"error\"}}'; exit 1;;\nesac\n"
+            ),
+        );
+        let draft = registry.draft(&executable).await.unwrap();
+        assert_eq!(draft.id, "local.gjc");
+        let error = registry
+            .activate_with_scratch(&draft, &scratch_workspace(&root), "ok", None, None)
+            .await
+            .unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("Agent run failed."), "{message}");
+        assert!(
+            message.contains("(GJC wrote no cause; see ~/.gjc/logs/ for its log.)"),
+            "{message}"
+        );
+
+        // A real cause: it is quoted, and no hint is added.
+        write_fast_script(
+            &executable,
+            &format!(
+                "#!/bin/sh\ncase \"$1\" in\n --version) echo 'gjc/0.21.0';;\n --help) echo '{help}';;\n *) printf '%s\\n' '{{\"type\":\"message_end\",\"message\":{{\"role\":\"assistant\",\"content\":[],\"errorMessage\":\"Connection error. (transport=ConnectionRefused)\"}}}}' '{{\"type\":\"agent_end\",\"stopReason\":\"error\"}}'; exit 1;;\nesac\n"
+            ),
+        );
+        let draft = registry.draft(&executable).await.unwrap();
+        let error = registry
+            .activate_with_scratch(&draft, &scratch_workspace(&root), "ok", None, None)
+            .await
+            .unwrap_err();
+        let message = error.to_string();
+        assert!(
+            message.contains("Connection error. (transport=ConnectionRefused)"),
+            "{message}"
+        );
+        assert!(!message.contains("GJC wrote no cause"), "{message}");
+    }
 }
