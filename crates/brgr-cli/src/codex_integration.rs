@@ -45,6 +45,7 @@ brgr hands bounded work to registered coding agents and seals what they return f
 
 - `brgr_completion`: a result is ready. Check it against the criterion, then decide. It is not acceptance.
 - `brgr_failure`: the run failed or was lost, and `reason` says why. Inspect with `brgr result TASK`; retry with `brgr revise TASK "<corrected objective>"`, or dismiss with `brgr result TASK --ack`. Until you do, every brgr command ends with a stderr note listing it.
+- `brgr_completions`: several results are ready, including failed and lost runs. For each task, read the sealed result, verify its criteria, and decide or acknowledge it.
 - `brgr_question`: the worker is waiting on you. Read it with `brgr message list TASK --for owner`, answer with `brgr message send TASK --to worker --kind reply --reply-to MESSAGE_ID --body "<answer>"`, then `brgr message ack TASK MESSAGE_ID --for owner`.
 - A repeated id is the same notice, not a new one.
 

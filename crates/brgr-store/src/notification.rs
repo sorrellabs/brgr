@@ -266,6 +266,46 @@ impl Store {
         .collect()
     }
 
+    /// Lists undelivered, unacknowledged terminal results for one owner.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid stored IDs or a database failure.
+    pub fn pending_notifications_for_owner(
+        &self,
+        owner_id: &OwnerId,
+    ) -> Result<Vec<PendingNotification>, StoreError> {
+        let mut statement = self.connection.prepare(
+            "SELECT n.result_id, n.task_id, n.owner_id, n.attempts, n.last_error
+             FROM completion_notifications n
+             JOIN inbox_items i ON i.result_id = n.result_id AND i.owner_id = n.owner_id
+             WHERE n.owner_id = ?1 AND n.resolved = 0 AND n.delivered_session IS NULL
+               AND i.acknowledged = 0 ORDER BY n.rowid",
+        )?;
+        let rows = statement.query_map([owner_id.as_str()], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, Option<String>>(4)?,
+            ))
+        })?;
+        rows.map(|row| {
+            let (result, task, owner, attempts, last_error) = row?;
+            Ok(PendingNotification {
+                result_id: result
+                    .parse()
+                    .map_err(|_| StoreError::InvalidNotification)?,
+                task_id: task.parse().map_err(|_| StoreError::InvalidNotification)?,
+                owner_id: OwnerId::new(owner)?,
+                attempts: u64::try_from(attempts).map_err(|_| StoreError::NumericOverflow)?,
+                last_error,
+            })
+        })
+        .collect()
+    }
+
     /// Finds tasks that have undelivered results for a currently bound session.
     ///
     /// # Errors
@@ -392,6 +432,44 @@ impl Store {
             return Err(StoreError::NotificationClaimStale);
         }
         Ok(())
+    }
+
+    /// Completes claimed deliveries only while each owner binding still matches.
+    ///
+    /// A target that changed 0 rows is skipped, not an error: the owner resolved
+    /// it or the claim went stale.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database update fails.
+    pub fn mark_notifications_delivered(
+        &self,
+        targets: &[NotificationTarget],
+        token: &str,
+    ) -> Result<usize, StoreError> {
+        let transaction = self.write_transaction()?;
+        let mut marked = 0;
+        for target in targets {
+            let changed = transaction.execute(
+                &format!(
+                    "UPDATE completion_notifications SET {DELIVERED_SET}
+             WHERE result_id = ?4 AND claim_token = ?5 AND resolved = 0
+               AND delivered_session IS NULL
+               AND {}",
+                    owner_surface_matches("completion_notifications")
+                ),
+                params![
+                    target.session_id,
+                    i64::try_from(target.binding_epoch).map_err(|_| StoreError::NumericOverflow)?,
+                    target.pane_id,
+                    target.result_id.to_string(),
+                    token,
+                ],
+            )?;
+            marked += changed;
+        }
+        transaction.commit()?;
+        Ok(marked)
     }
 
     /// Releases a claim for a later retry, retaining a bounded diagnostic.

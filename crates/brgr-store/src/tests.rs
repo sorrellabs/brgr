@@ -491,6 +491,92 @@ fn completion_delivery_claims_once_and_retargets_after_session_transfer() {
     );
 }
 
+fn seal_for_owner(store: &mut Store, owner: &str, request: &str) -> (TaskSpec, ResultEnvelope) {
+    let mut spec = task();
+    spec.owner_id = OwnerId::new(owner).unwrap();
+    spec.create_request_id = request.to_owned();
+    let attempt = AttemptId::new();
+    store.record_task(&spec, request).unwrap();
+    store.create_attempt(spec.task_id, 1, attempt).unwrap();
+    let result = sealed_result(store, &spec, attempt);
+    store
+        .commit_terminal_result(&spec.owner_id, &result)
+        .unwrap();
+    (spec, result)
+}
+
+fn bind_surface(store: &Store, owner: &OwnerId, session: &str, epoch: u64, pane: &str) {
+    store.bind_owner(owner, session, epoch).unwrap();
+    store
+        .register_owner_surface(owner, session, epoch, pane, None, "/bin/herdr")
+        .unwrap();
+}
+
+#[test]
+fn pending_notifications_for_owner_lists_only_that_owners_open_results() {
+    let root = TempDir::new().unwrap();
+    let mut store = Store::open(root.path()).unwrap();
+    let (asked, open) = seal_for_owner(&mut store, "codex:asked", "asked-open");
+    let (other, delivered) = seal_for_owner(&mut store, "codex:other", "other-delivered");
+    let (asked_ack, acknowledged) = seal_for_owner(&mut store, "codex:asked", "asked-ack");
+    bind_surface(&store, &asked.owner_id, "session-a", 1, "w1:p1");
+    bind_surface(&store, &other.owner_id, "session-b", 1, "w1:p2");
+    let claimed = store
+        .claim_notification(delivered.result_id, "claim-d", 100, 20)
+        .unwrap()
+        .unwrap();
+    store
+        .mark_notification_delivered(&claimed, "claim-d")
+        .unwrap();
+    store
+        .acknowledge(&asked_ack.owner_id, acknowledged.result_id)
+        .unwrap();
+
+    let pending = store
+        .pending_notifications_for_owner(&asked.owner_id)
+        .unwrap();
+    assert_eq!(
+        pending
+            .iter()
+            .map(|notice| notice.result_id)
+            .collect::<Vec<_>>(),
+        vec![open.result_id]
+    );
+}
+
+#[test]
+fn marking_a_batch_delivered_skips_a_result_resolved_meanwhile() {
+    let root = TempDir::new().unwrap();
+    let mut store = Store::open(root.path()).unwrap();
+    let (first, first_result) = seal_for_owner(&mut store, "codex:batch", "batch-first");
+    let (_second, second_result) = seal_for_owner(&mut store, "codex:batch", "batch-second");
+    bind_surface(&store, &first.owner_id, "session-a", 1, "w1:p1");
+    let claimed_first = store
+        .claim_notification(first_result.result_id, "batch", 100, 40)
+        .unwrap()
+        .unwrap();
+    let claimed_second = store
+        .claim_notification(second_result.result_id, "batch", 100, 40)
+        .unwrap()
+        .unwrap();
+    store
+        .acknowledge(&first.owner_id, first_result.result_id)
+        .unwrap();
+    let marked = store
+        .mark_notifications_delivered(&[claimed_first, claimed_second], "batch")
+        .unwrap();
+    assert_eq!(marked, 1);
+    let delivered_session: Option<String> = store
+        .connection
+        .query_row(
+            "SELECT delivered_session FROM completion_notifications WHERE result_id = ?1",
+            [second_result.result_id.to_string()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(delivered_session.as_deref(), Some("session-a"));
+}
+
 #[test]
 fn failed_result_cannot_be_accepted_through_store_api() {
     let root = TempDir::new().unwrap();
@@ -2277,6 +2363,7 @@ const RETRY_DECISIONS: &[(&str, bool)] = &[
     ("register_owner_surface", false),
     ("claim_notification", false),
     ("mark_notification_delivered", false),
+    ("mark_notifications_delivered", false),
     ("release_notification_claim", false),
     ("claim_workflow_notification", false),
     ("mark_workflow_notification_delivered", false),

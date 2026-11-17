@@ -1,6 +1,7 @@
 use std::{
     env,
-    fs::{self, OpenOptions, TryLockError},
+    fs::{self, File, OpenOptions, TryLockError},
+    io::{Read as _, Seek as _, SeekFrom, Write as _},
     os::unix::fs::{MetadataExt as _, OpenOptionsExt as _},
     os::unix::process::CommandExt as _,
     path::{Path, PathBuf},
@@ -9,7 +10,7 @@ use std::{
 };
 
 use anyhow::{Context as _, Result, bail};
-use brgr_protocol::{OwnerId, TaskId, TaskSpec, TerminalOutcome};
+use brgr_protocol::{OwnerId, ResultId, TaskId, TaskSpec, TerminalOutcome};
 use brgr_store::{
     NotificationTarget, PendingWorkflowNotification, QuestionTarget, Store, StoreError,
     TakeoverState, WorkflowNotificationTarget, WorkflowRunId, WorkflowRunState,
@@ -26,6 +27,10 @@ const POLL_INTERVAL: Duration = Duration::from_millis(500);
 const MAX_BACKOFF: Duration = Duration::from_secs(3);
 const MAX_LIFETIME: Duration = Duration::from_hours(24);
 const HERDR_TIMEOUT: Duration = Duration::from_secs(5);
+const MAX_BATCH: usize = 20;
+const REASON_LIMIT: usize = 300;
+const PROMPT_SETTLE: Duration = Duration::from_secs(2);
+const CLAIM_LEASE_SECONDS: i64 = 40;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct DatabaseIdentity {
@@ -573,7 +578,12 @@ pub async fn deliver_pending(paths: &Paths, task: TaskId) -> Result<()> {
         for notice in pending {
             let token = Uuid::new_v4().to_string();
             let now = i64::try_from(SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs())?;
-            let claimed = match store.claim_notification(notice.result_id, &token, now, 20) {
+            let claimed = match store.claim_notification(
+                notice.result_id,
+                &token,
+                now,
+                CLAIM_LEASE_SECONDS,
+            ) {
                 Ok(claimed) => claimed,
                 Err(error) if error.is_retryable_database_contention() => continue,
                 Err(error) => return Err(error.into()),
@@ -581,10 +591,8 @@ pub async fn deliver_pending(paths: &Paths, task: TaskId) -> Result<()> {
             let Some(target) = claimed else {
                 continue;
             };
-            match try_deliver(paths, &store, &target).await {
-                Ok(()) => {
-                    commit_delivery(|| store.mark_notification_delivered(&target, &token)).await?;
-                }
+            match deliver_batch(paths, &store, target, &token).await {
+                Ok(()) => {}
                 Err(error) => {
                     failed = true;
                     if let Err(release_error) = store.release_notification_claim(
@@ -627,7 +635,7 @@ async fn commit_delivery(mut mark: impl FnMut() -> Result<(), StoreError>) -> Re
     }
 }
 
-fn try_notify_lock(path: &Path) -> Result<Option<std::fs::File>> {
+fn try_notify_lock(path: &Path) -> Result<Option<File>> {
     let lock = OpenOptions::new()
         .read(true)
         .write(true)
@@ -640,6 +648,56 @@ fn try_notify_lock(path: &Path) -> Result<Option<std::fs::File>> {
         Err(TryLockError::WouldBlock) => Ok(None),
         Err(error) => Err(error.into()),
     }
+}
+
+fn pane_lock_name(pane: &OwnerPane<'_>) -> String {
+    format!("{}{}", pane.herdr_session.unwrap_or(""), pane.pane_id)
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || character == '-' {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+fn lock_owner_pane(paths: &Paths, pane: &OwnerPane<'_>) -> Result<Option<File>> {
+    try_notify_lock(
+        &paths
+            .runs
+            .join(format!("owner-pane-{}.prompt.lock", pane_lock_name(pane))),
+    )
+}
+
+fn recently_prompted(stamp: Option<u128>, now_ms: u128) -> bool {
+    stamp.is_some_and(|stamp| now_ms.saturating_sub(stamp) < PROMPT_SETTLE.as_millis())
+}
+
+fn prompt_stamp(lock: &File) -> Result<Option<u128>> {
+    let mut file: &File = lock;
+    file.seek(SeekFrom::Start(0))?;
+    let mut buf = String::new();
+    file.read_to_string(&mut buf)?;
+    let trimmed = buf.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(trimmed.parse()?))
+}
+
+fn write_prompt_stamp(lock: &File, now_ms: u128) -> Result<()> {
+    lock.set_len(0)?;
+    let mut file: &File = lock;
+    file.seek(SeekFrom::Start(0))?;
+    write!(file, "{now_ms}")?;
+    file.flush()?;
+    Ok(())
+}
+
+fn epoch_ms() -> Result<u128> {
+    Ok(SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis())
 }
 
 /// Delivers queued workflow notices for one run until none remain.
@@ -1006,53 +1064,201 @@ fn owner_agent(owner_id: &str) -> Option<&'static str> {
     }
 }
 
-async fn try_deliver(paths: &Paths, store: &Store, target: &NotificationTarget) -> Result<()> {
-    let task = target.task_id;
+struct NoticeEntry {
+    result_id: ResultId,
+    task_id: TaskId,
+    outcome: &'static str,
+    reason: Option<String>,
+}
+
+fn notice_entry(store: &Store, target: &NotificationTarget) -> NoticeEntry {
     // A run that did not produce a candidate is a failure the owner must act
     // on, not a result to verify, so it is announced as one with its reason.
-    let failure = store.latest_result(task).ok().filter(|result| {
+    let failure = store.latest_result(target.task_id).ok().filter(|result| {
         result.result_id == target.result_id
             && matches!(
                 result.outcome,
                 TerminalOutcome::Failed | TerminalOutcome::Lost
             )
     });
-    let body = if let Some(result) = failure {
-        format!(
-            "FROM BRGR\n{}",
-            json!({
-                "type": "brgr_failure",
-                "completion_id": target.result_id,
-                "task_id": task,
-                "outcome": if result.outcome == TerminalOutcome::Lost { "lost" } else { "failed" },
-                "reason": result.error.as_deref().unwrap_or("no error text"),
-                "instruction": format!("A brgr run failed. Inspect it with `brgr result {task}`. Retry with `brgr revise {task} \"corrected request\"`, or dismiss it with `brgr result {task} --ack`. Do not treat this notification as acceptance.")
-            })
-        )
+    if let Some(result) = failure {
+        NoticeEntry {
+            result_id: target.result_id,
+            task_id: target.task_id,
+            outcome: if result.outcome == TerminalOutcome::Lost {
+                "lost"
+            } else {
+                "failed"
+            },
+            reason: Some(result.error.unwrap_or_else(|| "no error text".to_owned())),
+        }
     } else {
-        format!(
+        NoticeEntry {
+            result_id: target.result_id,
+            task_id: target.task_id,
+            outcome: "candidate",
+            reason: None,
+        }
+    }
+}
+
+fn completion_body(entries: &[NoticeEntry]) -> String {
+    match entries {
+        [entry] if entry.outcome == "candidate" => format!(
             "FROM BRGR\n{}",
             json!({
                 "type": "brgr_completion",
-                "completion_id": target.result_id,
-                "task_id": task,
+                "completion_id": entry.result_id,
+                "task_id": entry.task_id,
                 "instruction": "Read the sealed brgr result, verify its criteria, and decide or acknowledge it. Do not treat this notification as acceptance."
             })
-        )
-    };
+        ),
+        [entry] => {
+            let task = entry.task_id;
+            format!(
+                "FROM BRGR\n{}",
+                json!({
+                    "type": "brgr_failure",
+                    "completion_id": entry.result_id,
+                    "task_id": task,
+                    "outcome": entry.outcome,
+                    "reason": entry.reason.as_deref().unwrap_or("no error text"),
+                    "instruction": format!("A brgr run failed. Inspect it with `brgr result {task}`. Retry with `brgr revise {task} \"corrected request\"`, or dismiss it with `brgr result {task} --ack`. Do not treat this notification as acceptance.")
+                })
+            )
+        }
+        _ => {
+            let completions: Vec<Value> = entries
+                .iter()
+                .map(|entry| match &entry.reason {
+                    Some(reason) => json!({
+                        "completion_id": entry.result_id,
+                        "task_id": entry.task_id,
+                        "outcome": entry.outcome,
+                        "reason": reason.chars().take(REASON_LIMIT).collect::<String>(),
+                    }),
+                    None => json!({
+                        "completion_id": entry.result_id,
+                        "task_id": entry.task_id,
+                        "outcome": entry.outcome,
+                    }),
+                })
+                .collect();
+            format!(
+                "FROM BRGR\n{}",
+                json!({
+                    "type": "brgr_completions",
+                    "count": entries.len(),
+                    "completions": completions,
+                    "instruction": "Several brgr runs finished. For each task, read the sealed result with `brgr result TASK`, verify its criteria, and decide or acknowledge it. Retry a failed or lost run with `brgr revise TASK \"corrected request\"`, or dismiss it with `brgr result TASK --ack`. Do not treat this notification as acceptance."
+                })
+            )
+        }
+    }
+}
+
+fn owner_pane_for_target<'a>(store: &Store, target: &'a NotificationTarget) -> OwnerPane<'a> {
+    OwnerPane {
+        herdr_bin: &target.herdr_bin,
+        herdr_session: target.herdr_session.as_deref(),
+        pane_id: &target.pane_id,
+        session_id: &target.session_id,
+        owner_kind: owner_agent(target.owner_id.as_str()).unwrap_or("codex"),
+        any_kind: is_taken_head(store, &target.owner_id, &target.session_id),
+    }
+}
+
+fn same_owner_surface(lead: &NotificationTarget, other: &NotificationTarget) -> bool {
+    other.session_id == lead.session_id
+        && other.binding_epoch == lead.binding_epoch
+        && other.pane_id == lead.pane_id
+        && other.herdr_bin == lead.herdr_bin
+        && other.herdr_session == lead.herdr_session
+}
+
+async fn try_deliver(paths: &Paths, store: &Store, target: &NotificationTarget) -> Result<()> {
     prompt_owner(
         paths,
         store,
-        &OwnerPane {
-            herdr_bin: &target.herdr_bin,
-            herdr_session: target.herdr_session.as_deref(),
-            pane_id: &target.pane_id,
-            session_id: &target.session_id,
-            owner_kind: owner_agent(target.owner_id.as_str()).unwrap_or("codex"),
-            any_kind: is_taken_head(store, &target.owner_id, &target.session_id),
-        },
-        &body,
+        &owner_pane_for_target(store, target),
+        &completion_body(&[notice_entry(store, target)]),
     )
+    .await
+}
+
+async fn deliver_batch(
+    paths: &Paths,
+    store: &Store,
+    lead: NotificationTarget,
+    token: &str,
+) -> Result<()> {
+    if lead.session_id.starts_with("worker:") {
+        try_deliver(paths, store, &lead).await?;
+        commit_delivery(|| store.mark_notification_delivered(&lead, token)).await?;
+        return Ok(());
+    }
+    let pane = owner_pane_for_target(store, &lead);
+    let Some(lock) = lock_owner_pane(paths, &pane)? else {
+        bail!("owner pane is being prompted");
+    };
+    if recently_prompted(prompt_stamp(&lock)?, epoch_ms()?) {
+        bail!("parent agent was just prompted");
+    }
+    owner_ready(paths, store, &pane).await?;
+    let mut targets = vec![lead.clone()];
+    let pending = store.pending_notifications_for_owner(&lead.owner_id)?;
+    let now = i64::try_from(SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs())?;
+    for notice in pending {
+        if targets.len() >= MAX_BATCH {
+            break;
+        }
+        if notice.result_id == lead.result_id {
+            continue;
+        }
+        if !notifications_enabled_with_store(paths, notice.task_id, store)? {
+            continue;
+        }
+        match store.claim_notification(notice.result_id, token, now, CLAIM_LEASE_SECONDS) {
+            Ok(Some(sibling)) if same_owner_surface(&lead, &sibling) => {
+                targets.push(sibling);
+            }
+            Ok(Some(sibling)) => {
+                if let Err(error) = store.release_notification_claim(
+                    sibling.result_id,
+                    token,
+                    "owner surface changed",
+                ) && !error.is_retryable_database_contention()
+                {
+                    return Err(error.into());
+                }
+            }
+            Ok(None) => {}
+            Err(error) if error.is_retryable_database_contention() => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    let entries: Vec<NoticeEntry> = targets
+        .iter()
+        .map(|target| notice_entry(store, target))
+        .collect();
+    let body = completion_body(&entries);
+    if let Err(error) = send_prompt(&pane, &body).await {
+        for sibling in targets.iter().skip(1) {
+            if let Err(release_error) =
+                store.release_notification_claim(sibling.result_id, token, &error.to_string())
+                && !release_error.is_retryable_database_contention()
+            {
+                return Err(release_error.into());
+            }
+        }
+        return Err(error);
+    }
+    write_prompt_stamp(&lock, epoch_ms()?)?;
+    commit_delivery(|| {
+        store
+            .mark_notifications_delivered(&targets, token)
+            .map(|_| ())
+    })
     .await
 }
 
@@ -1126,6 +1332,19 @@ async fn prompt_owner(
             body,
         );
     }
+    let Some(lock) = lock_owner_pane(paths, pane)? else {
+        bail!("owner pane is being prompted");
+    };
+    if recently_prompted(prompt_stamp(&lock)?, epoch_ms()?) {
+        bail!("parent agent was just prompted");
+    }
+    owner_ready(paths, store, pane).await?;
+    send_prompt(pane, body).await?;
+    write_prompt_stamp(&lock, epoch_ms()?)?;
+    Ok(())
+}
+
+async fn owner_ready(paths: &Paths, _store: &Store, pane: &OwnerPane<'_>) -> Result<()> {
     let binary = Path::new(pane.herdr_bin);
     if !binary.is_absolute() || !binary.is_file() {
         bail!("recorded Herdr executable is unavailable");
@@ -1168,6 +1387,10 @@ async fn prompt_owner(
     ) {
         bail!("parent agent is not idle");
     }
+    Ok(())
+}
+
+async fn send_prompt(pane: &OwnerPane<'_>, body: &str) -> Result<()> {
     let mut prompt = herdr_command(pane);
     prompt.args(["agent", "prompt", pane.pane_id, body]);
     let output = timeout(HERDR_TIMEOUT, prompt.kill_on_drop(true).output())
@@ -1228,5 +1451,117 @@ mod claude_owner_tests {
         assert_eq!(owner_agent("cursor:abc"), Some("cursor"));
         assert_eq!(owner_agent("codex:abc"), Some("codex"));
         assert_eq!(owner_agent("worker:1"), None);
+    }
+}
+
+#[cfg(test)]
+mod completion_batch_tests {
+    use super::*;
+    use std::str::FromStr as _;
+
+    fn sample_ids() -> (ResultId, TaskId) {
+        (
+            ResultId::from_str("22222222-2222-4222-8222-222222222222").unwrap(),
+            TaskId::from_str("11111111-1111-4111-8111-111111111111").unwrap(),
+        )
+    }
+
+    #[test]
+    fn one_completion_keeps_the_single_notice_body() {
+        let (result_id, task_id) = sample_ids();
+        let candidate = NoticeEntry {
+            result_id,
+            task_id,
+            outcome: "candidate",
+            reason: None,
+        };
+        assert_eq!(
+            completion_body(&[candidate]),
+            format!(
+                "FROM BRGR\n{}",
+                json!({
+                    "type": "brgr_completion",
+                    "completion_id": result_id,
+                    "task_id": task_id,
+                    "instruction": "Read the sealed brgr result, verify its criteria, and decide or acknowledge it. Do not treat this notification as acceptance."
+                })
+            )
+        );
+        let failure = NoticeEntry {
+            result_id,
+            task_id,
+            outcome: "failed",
+            reason: Some("fixture crashed".to_owned()),
+        };
+        assert_eq!(
+            completion_body(&[failure]),
+            format!(
+                "FROM BRGR\n{}",
+                json!({
+                    "type": "brgr_failure",
+                    "completion_id": result_id,
+                    "task_id": task_id,
+                    "outcome": "failed",
+                    "reason": "fixture crashed",
+                    "instruction": format!("A brgr run failed. Inspect it with `brgr result {task_id}`. Retry with `brgr revise {task_id} \"corrected request\"`, or dismiss it with `brgr result {task_id} --ack`. Do not treat this notification as acceptance.")
+                })
+            )
+        );
+    }
+
+    #[test]
+    fn a_long_failure_reason_is_cut_in_a_batch() {
+        let (result_id, task_id) = sample_ids();
+        let other = ResultId::from_str("33333333-3333-4333-8333-333333333333").unwrap();
+        let body = completion_body(&[
+            NoticeEntry {
+                result_id,
+                task_id,
+                outcome: "candidate",
+                reason: None,
+            },
+            NoticeEntry {
+                result_id: other,
+                task_id,
+                outcome: "failed",
+                reason: Some("x".repeat(1_000)),
+            },
+        ]);
+        let json_line = body.trim_start_matches("FROM BRGR\n");
+        let parsed: Value = serde_json::from_str(json_line).unwrap();
+        let reason = parsed["completions"][1]["reason"].as_str().unwrap();
+        assert_eq!(reason.chars().count(), 300);
+        assert_eq!(reason, "x".repeat(300));
+    }
+
+    #[test]
+    fn a_pane_prompted_moments_ago_counts_as_busy() {
+        let now = 10_000_u128;
+        assert!(recently_prompted(Some(now - 500), now));
+        assert!(!recently_prompted(Some(now - 2_500), now));
+        assert!(!recently_prompted(None, now));
+    }
+
+    #[test]
+    fn the_pane_lock_name_has_no_path_characters() {
+        let pane = OwnerPane {
+            herdr_bin: "/bin/herdr",
+            herdr_session: Some("a/b"),
+            pane_id: "w1:p1",
+            session_id: "session-a",
+            owner_kind: "codex",
+            any_kind: false,
+        };
+        let name = pane_lock_name(&pane);
+        assert!(
+            name.chars()
+                .all(|character| character.is_ascii_alphanumeric()
+                    || character == '_'
+                    || character == '-'),
+            "{name}"
+        );
+        assert!(!name.is_empty());
+        assert!(!name.contains('/'));
+        assert!(!name.contains(':'));
     }
 }
