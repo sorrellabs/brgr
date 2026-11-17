@@ -3520,6 +3520,7 @@ mod tests {
                     instructions: None,
                     model: None,
                     effort: None,
+                    resume_session: None,
                     permission: None,
                     deadline: Duration::from_mins(1),
                     cancel_path: None,
