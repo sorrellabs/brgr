@@ -349,7 +349,16 @@ esac
     )
     .unwrap();
     fs::set_permissions(bin.join("gh"), fs::Permissions::from_mode(0o755)).unwrap();
-    for name in ["jq", "shasum", "sha256sum", "cut", "date", "mktemp", "rm", "cat"] {
+    for name in [
+        "jq",
+        "shasum",
+        "sha256sum",
+        "cut",
+        "date",
+        "mktemp",
+        "rm",
+        "cat",
+    ] {
         if let Some(found) = std::env::split_paths(&std::env::var_os("PATH").unwrap())
             .map(|directory| directory.join(name))
             .find(|candidate| candidate.is_file())
