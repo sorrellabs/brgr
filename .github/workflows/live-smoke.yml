@@ -1,0 +1,140 @@
+name: Live smoke
+
+# A real round through every tier 1 harness, on a self-hosted macOS runner.
+#
+# PR CI stays fixture-only (AGENTS.md): it proves brgr in a deterministic
+# sandbox, so it cannot see a harness update break a run that brgr never
+# changed. #435 is the case: Codex CLI 0.169.0 began hanging every tool call
+# when launched the way brgr has since #363, PR CI stayed green, and only the
+# manual pre-tag round caught it.
+#
+# This workflow never runs on `pull_request` or `pull_request_target`. The
+# `brgr-live` runner is a real machine with logged-in harness accounts and an
+# unrestricted network, so code from a fork must never reach it. Do not add
+# either trigger: a pull request would run an unreviewed branch's script there.
+on:
+  schedule:
+    # Nightly, outside working hours.
+    - cron: "17 9 * * *"
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+  issues: write
+
+# One run at a time: two rounds would share the harness logins and the Herdr
+# session, and a queued nightly behind a release round would start too late.
+concurrency:
+  group: live-smoke
+  cancel-in-progress: false
+
+jobs:
+  live-smoke:
+    runs-on: [self-hosted, macOS, brgr-live]
+    env:
+      # A release round is a gate; a nightly is a warning until it repeats.
+      IS_RELEASE: ${{ startsWith(github.ref, 'refs/tags/v') }}
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+
+      - name: Run the live smoke
+        # The script does the work so the same round can be run by hand:
+        #   scripts/live-smoke.sh --artifacts /tmp/live-smoke
+        # It builds brgr, creates its own Herdr workspace for pane mode, and
+        # writes versions, the screen trace and the screens logs to ./artifacts.
+        #
+        # The runner's own shell may carry a BRGR_BIN from wherever the service
+        # was started, and a HERDR_ENV if it was started inside a pane. Neither
+        # may decide what this job tests or where it runs, so both are cleared:
+        # the binary comes from this checkout and the workspace is made here.
+        run: |
+          set -o pipefail
+          unset BRGR_BIN HERDR_ENV HERDR_PANE_ID HERDR_WORKSPACE_ID HERDR_TAB_ID
+          unset BRGR_HOME BRGR_OWNER_ID BRGR_SESSION_ID
+          mkdir -p artifacts
+          scripts/live-smoke.sh --artifacts "$GITHUB_WORKSPACE/artifacts" 2>&1 | tee live-smoke.log
+
+      - name: Keep the run log
+        if: always()
+        run: |
+          if [ -f live-smoke.log ]; then
+            cp live-smoke.log artifacts/live-smoke.log
+          fi
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: live-smoke
+          if-no-files-found: warn
+          # The versions, the screen trace and the screens logs. A screens log
+          # holds the rule name and the keys brgr pressed; the trace holds one
+          # digest per screen decision. Neither holds screen text, a prompt, a
+          # report or a file. Raw harness output stays on the runner.
+          path: |
+            artifacts/versions.txt
+            artifacts/summary.txt
+            artifacts/*.version
+            artifacts/*.screens.log
+            artifacts/*.screens.trace
+            artifacts/live-smoke.log
+            artifacts/failures.jsonl
+
+      - name: File one issue per failed harness
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          [ -f artifacts/failures.jsonl ] || exit 0
+          # One issue per (harness, failure kind). The same title is updated
+          # with a comment after the first report, and the marker in the body
+          # makes the lookup exact. The body carries the harness version and the
+          # redacted error class, never a screen, a prompt or a report.
+          # `|| [ -n "$line" ]` keeps a final record that has no trailing
+          # newline, which would otherwise be skipped and never filed.
+          while IFS= read -r line || [ -n "$line" ]; do
+            [ -n "$line" ] || continue
+            harness="$(jq -r '.harness' <<<"$line")"
+            kind="$(jq -r '.kind' <<<"$line")"
+            version="$(jq -r '.version' <<<"$line")"
+            class="$(jq -r '.class' <<<"$line")"
+            short="${harness#local.}"
+            fingerprint="$(printf '%s' "$harness:$kind" | shasum -a 256 | cut -d' ' -f1 | cut -c1-12)"
+            marker="brgr-live-smoke-fp:$fingerprint"
+            title="[brgr live smoke] $short $kind"
+            body="$(mktemp)"
+            {
+              echo "Filed automatically by the nightly live smoke."
+              echo
+              echo "**Harness:** \`$harness\` · **Kind:** \`$kind\` · **Harness version:** \`$version\`"
+              echo "**Run:** $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID · **Date:** $(date -u +%Y-%m-%d)"
+              echo
+              echo "**Error class:** \`$class\`"
+              echo
+              echo "This text holds only the failure class above. It carries no prompt, report, file content or harness screen: brgr's message is cut at \`last screen:\`, \`last stderr:\`, \`last error event:\` and \`no brgr rule answers\`, and home paths and ids are masked."
+              echo
+              echo "$marker"
+            } >"$body"
+            # `[..][0].number // empty` yields no output for an empty list, not
+            # an empty string: jq prints the whole list when `//` has no left
+            # operand to fall back from. Ask for the number only when there is a
+            # match.
+            number="$(gh issue list --state open --limit 200 \
+              --json number,title \
+              --jq "[.[] | select(.title == \"$title\") | .number][0] // \"\"")"
+            if [ -n "$number" ]; then
+              gh issue comment "$number" --body-file "$body"
+            else
+              gh issue create --title "$title" --body-file "$body"
+            fi
+            rm -f "$body"
+          done <artifacts/failures.jsonl
+
+      - name: Fail a release round loudly
+        if: failure() && env.IS_RELEASE == 'true'
+        run: |
+          echo "::error::a tier 1 harness failed in a live smoke before a tag; do not release"
+          exit 1

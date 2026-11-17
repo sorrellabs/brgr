@@ -882,6 +882,28 @@ cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo run -p brgr-cli -- --help
 ```
 
+### Live smoke
+
+PR CI is fixture-only, so it cannot see a harness update break a run that brgr
+never changed. `scripts/live-smoke.sh` runs the manual tier 1 round instead:
+it builds brgr, uses its own `--home`, registers Claude Code, Codex CLI, Cursor
+CLI and Devin CLI on their cheapest models, and runs one tiny pane-mode task
+per harness (start, sealed result, accept, then a check that the pane closed and
+the worktree was removed). A failing harness is named and makes it exit non-zero.
+It prints the plan without calling a harness:
+
+```bash
+scripts/live-smoke.sh --check
+```
+
+`.github/workflows/live-smoke.yml` runs the same script nightly, on manual
+dispatch and on a release tag, on the `brgr-live` self-hosted macOS runner where
+the harness logins live. It never runs on `pull_request` or
+`pull_request_target`, so fork code cannot reach that machine. It uploads the
+brgr version, each harness `--version`, the screen trace and the screens logs,
+and opens one issue per harness and failure kind with the harness version and
+the redacted error class. It never uploads a prompt or screen text.
+
 The local store defaults to `~/Library/Application Support/brgr` on macOS and `$XDG_DATA_HOME/brgr` or `~/.local/share/brgr` on Linux. Harness
 output, help text, manifests, and reports are treated as untrusted data.
 Before upgrading, retain a recoverable copy of the private registry and store.
