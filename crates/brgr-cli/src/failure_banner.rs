@@ -154,4 +154,12 @@ mod tests {
         assert_eq!(text.matches(" failed: x").count(), 3, "{text}");
         assert!(text.contains("and 2 more"), "{text}");
     }
+
+    #[test]
+    fn a_provider_failure_banner_names_the_network_not_an_approval() {
+        let reason = "the Herdr-backed worker did not provide a valid final result: the opencode provider/network recovery window exhausted after 600s (harness retrying); last screen: Timed out waiting for response headers";
+        let text = note(&[item(TerminalOutcome::Lost, reason, false)]).unwrap();
+        assert!(text.contains("provider/network"), "{text}");
+        assert!(!text.contains("waiting for an approval"), "{text}");
+    }
 }

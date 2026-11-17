@@ -4,6 +4,8 @@ use std::{
     fs::{self, OpenOptions},
     io::Read,
     path::PathBuf,
+    process::Command,
+    time::Duration,
 };
 
 use crate::cli::{
@@ -17,7 +19,7 @@ use crate::{
 };
 use anyhow::{Context, Result, bail};
 use brgr_registry::{ActivationReceipt, Health, Registry};
-use brgr_runner::HarnessManifest;
+use brgr_runner::{HarnessManifest, ProcessRunner};
 use brgr_store::Store;
 use serde_json::json;
 
@@ -93,6 +95,9 @@ pub(crate) async fn harness(
             let receipt = recertify_harness(&registry, &harness, workspace, prompt).await?;
             print_value(&serde_json::to_value(receipt)?, json_output);
         }
+        HarnessCommand::List => {
+            print_value(&json!(doctor_harnesses(&registry).await), json_output);
+        }
         HarnessCommand::Status { harness } => {
             let configured = crate::config::Config::load(&paths.config)?.defaults.harness;
             let harness = match harness {
@@ -126,15 +131,19 @@ pub(crate) async fn add_harness(
         }
         registry.add(&args.executable).await?
     } else {
-        let workspace = args
-            .workspace
-            .context("harness add needs --workspace for an authorized scratch run")?;
-        let prompt = args
-            .prompt
-            .context("harness add needs --prompt for an authorized scratch run")?;
+        let prompt = args.prompt.unwrap_or_else(|| RECERTIFY_PROMPT.to_owned());
+        let owned_scratch = match args.workspace {
+            Some(_) => None,
+            None => Some(scratch_git_workspace()?),
+        };
+        let workspace = match (&args.workspace, &owned_scratch) {
+            (Some(path), _) => path.clone(),
+            (None, Some(dir)) => dir.path().to_path_buf(),
+            (None, None) => unreachable!("omitted workspace owns a scratch dir"),
+        };
         let manifest = registry.draft(&args.executable).await?;
         registry.contract_test(&manifest).await?;
-        registry
+        let receipt = registry
             .activate_with_scratch(
                 &manifest,
                 &workspace,
@@ -142,7 +151,9 @@ pub(crate) async fn add_harness(
                 args.model.as_deref(),
                 args.effort.as_deref(),
             )
-            .await?
+            .await?;
+        drop(owned_scratch);
+        receipt
     };
     // Returned as stored, so `harness add` prints what is on disk.
     let receipt = registry.record_registered_path(&receipt.harness_id, &args.executable)?;
@@ -160,6 +171,49 @@ pub(crate) async fn add_harness(
 /// Default scratch prompt for a re-certification. Any nonempty, successful
 /// answer certifies, so the shortest one keeps the paid run cheap.
 pub(crate) const RECERTIFY_PROMPT: &str = "say ok";
+
+/// A throwaway git repository for `harness add` when the caller omitted
+/// `--workspace`. One commit so a harness that expects a repo can start; the
+/// `TempDir` removes it after the scratch run.
+fn scratch_git_workspace() -> Result<tempfile::TempDir> {
+    let scratch = tempfile::Builder::new()
+        .prefix("brgr-harness-add-")
+        .tempdir()
+        .context("cannot create a scratch directory for harness add")?;
+    let git = |args: &[&str]| -> Result<()> {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(scratch.path())
+            .args(args)
+            .output()
+            .context("git is unavailable for a scratch workspace")?;
+        if !output.status.success() {
+            bail!(
+                "cannot prepare a scratch git workspace: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        Ok(())
+    };
+    git(&["init", "-b", "main"])?;
+    fs::write(scratch.path().join("README"), "brgr scratch\n")
+        .context("cannot write the scratch git workspace")?;
+    git(&["add", "README"])?;
+    git(&[
+        "-c",
+        "user.name=brgr",
+        "-c",
+        "user.email=brgr@invalid",
+        "-c",
+        "commit.gpgsign=false",
+        "-c",
+        "core.hooksPath=/dev/null",
+        "commit",
+        "-m",
+        "scratch",
+    ])?;
+    Ok(scratch)
+}
 
 /// The failure a re-certification reports when the certified executable is
 /// gone and no path the owner registered through resolves to a file. It
@@ -318,12 +372,16 @@ pub(crate) fn integrate(paths: &Paths, command: IntegrateCommand, json_output: b
                 ClaudeCommand::Uninstall => codex_integration::claude_uninstall(&paths.home)?,
             };
             let status_line = match command {
-                ClaudeCommand::Install { context: true } => Some(statusline_install::install(
+                ClaudeCommand::Install {
+                    context: true,
+                    workers,
+                } => Some(statusline_install::install(
                     &paths.home,
                     statusline_install::Harness::Claude,
                     &std::env::current_exe()?,
+                    workers,
                 )?),
-                ClaudeCommand::Install { context: false } => None,
+                ClaudeCommand::Install { context: false, .. } => None,
                 ClaudeCommand::Status => Some(statusline_install::status(
                     &paths.home,
                     statusline_install::Harness::Claude,
@@ -341,9 +399,12 @@ pub(crate) fn integrate(paths: &Paths, command: IntegrateCommand, json_output: b
         IntegrateCommand::Cursor { command } => {
             let harness = statusline_install::Harness::Cursor;
             let outcome = match command {
-                CursorCommand::Install => {
-                    statusline_install::install(&paths.home, harness, &std::env::current_exe()?)?
-                }
+                CursorCommand::Install => statusline_install::install(
+                    &paths.home,
+                    harness,
+                    &std::env::current_exe()?,
+                    false,
+                )?,
                 CursorCommand::Status => statusline_install::status(&paths.home, harness)?,
                 CursorCommand::Uninstall => statusline_install::uninstall(&paths.home, harness)?,
             };
@@ -406,7 +467,7 @@ async fn doctor_harnesses(registry: &Registry) -> Vec<serde_json::Value> {
     match registry.registered_harness_ids() {
         Ok(ids) => {
             for id in ids {
-                let health = match registry.health_probed(&id).await {
+                let mut health = match registry.health_probed(&id).await {
                     Ok(status) => {
                         let action = registry
                             .recertify_action_for(&id)
@@ -420,6 +481,7 @@ async fn doctor_harnesses(registry: &Registry) -> Vec<serde_json::Value> {
                         "reason": error.to_string(),
                     }),
                 };
+                attach_listing_fields(&mut health, registry, &id).await;
                 harnesses.push(health);
             }
         }
@@ -627,6 +689,35 @@ pub(crate) fn require_healthy_harness(id: &str, health: Health, action: &str) ->
 
 pub(crate) fn doctor_harness_value(id: &str, health: Health, action: &str) -> serde_json::Value {
     harness_health_value("id", id, health, action)
+}
+
+async fn attach_listing_fields(value: &mut serde_json::Value, registry: &Registry, id: &str) {
+    let Ok(manifest) = registry.stored_manifest(id) else {
+        return;
+    };
+    let Some(object) = value.as_object_mut() else {
+        return;
+    };
+    object.insert(
+        "executable".to_owned(),
+        json!(manifest.executable.to_string_lossy()),
+    );
+    let version = match ProcessRunner::probe(
+        &manifest.executable,
+        &manifest.probe.version_argv,
+        Duration::from_secs(15),
+    )
+    .await
+    {
+        Ok(output) => String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .next()
+            .unwrap_or("")
+            .trim()
+            .to_owned(),
+        Err(_) => String::new(),
+    };
+    object.insert("version".to_owned(), json!(version));
 }
 
 pub(crate) fn harness_health_value(

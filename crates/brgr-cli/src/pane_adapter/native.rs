@@ -434,21 +434,13 @@ pub(super) fn native_ready(herdr: &Herdr, pane: &str, kind: &str, alive: bool) -
             alive
                 && herdr
                     .screen(pane)
-                    .is_some_and(|screen| editor_ready(&screen, kind))
+                    .is_some_and(|screen| ready_after_start(&screen, kind))
         }
     }
 }
 
-fn editor_ready(screen: &str, kind: &str) -> bool {
+fn composer_on_screen(screen: &str) -> bool {
     if screen.contains("trust this folder") {
-        return false;
-    }
-    let brand = match kind {
-        "claude" => "Claude Code",
-        "command-code" => "Command",
-        _ => "",
-    };
-    if !brand.is_empty() && !screen.contains(brand) {
         return false;
     }
     screen.lines().any(|line| {
@@ -463,6 +455,37 @@ fn editor_ready(screen: &str, kind: &str) -> bool {
             })
         })
     })
+}
+
+fn editor_ready(screen: &str, kind: &str) -> bool {
+    let brand = match kind {
+        "claude" => "Claude Code",
+        "gjc" => "GJC",
+        "command-code" => "Command",
+        _ => "",
+    };
+    if !brand.is_empty() && !screen.contains(brand) {
+        return false;
+    }
+    composer_on_screen(screen)
+}
+
+fn turn_in_progress(screen: &str, kind: &str) -> bool {
+    if kind != "claude" {
+        return false;
+    }
+    if screen.contains("esc to interrupt") {
+        return true;
+    }
+    screen.lines().any(|line| {
+        line.match_indices("… (").any(|(index, marker)| {
+            line[index + marker.len()..].starts_with(|c: char| c.is_ascii_digit())
+        })
+    })
+}
+
+fn ready_after_start(screen: &str, kind: &str) -> bool {
+    composer_on_screen(screen) && !turn_in_progress(screen, kind)
 }
 
 pub(crate) fn deliver_owner_notice(
@@ -611,13 +634,15 @@ fn prepare_native_config(run: &PaneRunArgs, paths: &Paths) -> Result<(PathBuf, P
             &mut argv,
         )?;
     }
+    let executable = run
+        .native_executable
+        .clone()
+        .context("native executable is absent")?;
     write_json_atomic(
         &config,
         &crate::tui_host::NativeLaunch {
-            executable: run
-                .native_executable
-                .clone()
-                .context("native executable is absent")?,
+            argv0: crate::tui_host::launch_argv0(&executable, &run.kind),
+            executable,
             digest: launch
                 .executable_digest
                 .context("native executable digest is absent")?,
@@ -699,31 +724,81 @@ pub(super) fn send_first_prompt(
     run: &PaneRunArgs,
     text: &str,
     paths: &Paths,
+    answers: &mut AnswerMemory,
 ) -> Result<()> {
     let mut watch = ScreenWatch::new(&run.kind);
     retry_unsent(
         SHELL_READY,
         SHELL_POLL,
-        || send_prompt(herdr, name, pane, run, text, paths),
+        || {
+            // Never type into a pane that shows the harness's own
+            // provider/network error. It is not an approval and takes no key.
+            if let Some(screen) = herdr.screen(pane)
+                && matches!(
+                    screens::classify_for(&run.kind, &screen, &run.workspace),
+                    Screen::Provider { .. }
+                )
+            {
+                return Err(
+                    Unsent("native TUI is showing a provider/network error".to_owned()).into(),
+                );
+            }
+            send_prompt(herdr, name, pane, run, text, paths)
+        },
         || {
             let status = herdr.status(pane).ok();
-            match screens::resolve(herdr, pane, run, paths, status.as_deref())? {
-                Screen::Resolve { rule, .. } => watch.pressed(rule),
-                Screen::Unknown(text) => watch.observe(&Screen::Unknown(text)),
-                Screen::Clear => {
-                    watch.reset();
-                    Ok(())
-                }
-            }
+            answer_between_attempts(
+                herdr,
+                pane,
+                run,
+                paths,
+                status.as_deref(),
+                &mut watch,
+                answers,
+                "first-prompt",
+            )
+            .map(|_| ())
         },
     )
 }
 
+/// Looks at the screen between prompt attempts. Shared with the test that
+/// hands one pane/run answer from the first prompt to the drive loop.
+#[allow(clippy::too_many_arguments)]
+fn answer_between_attempts(
+    herdr: &Herdr,
+    pane: &str,
+    run: &PaneRunArgs,
+    paths: &Paths,
+    status: Option<&str>,
+    watch: &mut ScreenWatch,
+    answers: &mut AnswerMemory,
+    stage: &str,
+) -> Result<Screen> {
+    let outcome = screens::resolve(herdr, pane, run, paths, status, answers, stage)?;
+    match &outcome {
+        Screen::Resolve { rule, .. } => watch.pressed(rule)?,
+        Screen::Provider { state, quote } => watch.observe_at(
+            &Screen::Provider {
+                state: *state,
+                quote: quote.clone(),
+            },
+            Instant::now(),
+        )?,
+        Screen::Unknown(text) => watch.observe(&Screen::Unknown(text.clone()))?,
+        Screen::Clear => watch.reset(),
+        Screen::Answered { .. } => {}
+    }
+    Ok(outcome)
+}
+
+#[allow(clippy::too_many_lines)]
 pub(super) fn start_native(
     herdr: &Herdr,
     pane: &str,
     run: &PaneRunArgs,
     notices: &mut Notices<'_>,
+    answers: &mut AnswerMemory,
 ) -> Result<()> {
     let paths = notices.paths;
     let (state, config) = prepare_native_config(run, paths)?;
@@ -754,6 +829,7 @@ pub(super) fn start_native(
         thread::sleep(SHELL_POLL);
     }
     let mut announced = false;
+    let mut attention = Attention::None;
     let mut watch = ScreenWatch::new(&run.kind);
     let mut settle = ReadySettle::default();
     loop {
@@ -761,14 +837,37 @@ pub(super) fn start_native(
             bail!("native TUI exited before accepting the task");
         }
         let status = herdr.status(pane).ok();
-        match screens::resolve(herdr, pane, run, paths, status.as_deref())? {
+        match screens::resolve(
+            herdr,
+            pane,
+            run,
+            paths,
+            status.as_deref(),
+            answers,
+            "start-native",
+        )? {
+            Screen::Provider { state, quote } => {
+                note_provider(notices, run, pane, state, &quote, &mut attention);
+                settle.reset();
+                watch.observe_at(
+                    &Screen::Provider {
+                        state,
+                        quote: quote.clone(),
+                    },
+                    Instant::now(),
+                )?;
+                thread::sleep(POLL);
+                continue;
+            }
             Screen::Resolve { rule, .. } => {
+                recover_provider(notices, &mut attention);
                 watch.pressed(rule)?;
                 settle.reset();
                 thread::sleep(POLL);
                 continue;
             }
             Screen::Unknown(text) => {
+                recover_provider(notices, &mut attention);
                 settle.reset();
                 if !announced {
                     notices.tell(&run.kind, pane, &format!("The {} agent is on a screen no brgr rule answers: {text}. Use brgr input if it needs a key.", run.kind));
@@ -776,7 +875,16 @@ pub(super) fn start_native(
                 }
                 watch.observe(&Screen::Unknown(text))?;
             }
-            Screen::Clear => watch.reset(),
+            Screen::Clear => {
+                recover_provider(notices, &mut attention);
+                watch.reset();
+            }
+            Screen::Answered { .. } => {
+                recover_provider(notices, &mut attention);
+                settle.reset();
+                thread::sleep(POLL);
+                continue;
+            }
         }
         let detected_ready = herdr.call(&["agent", "get", pane]).is_ok_and(|value| {
             value.pointer("/result/agent/agent").and_then(Value::as_str) == Some(run.kind.as_str())
@@ -794,7 +902,7 @@ pub(super) fn start_native(
             || status.is_none()
             || matches!(status.as_deref(), Some("unknown"))
             || working_but_idle
-            || run.kind.as_str() == "command-code")
+            || matches!(run.kind.as_str(), "gjc" | "command-code"))
             && (prompt || detected_ready)
             && !menu_on_screen(herdr, pane);
         if settle.held(ready, Instant::now()) {
@@ -812,6 +920,62 @@ pub(super) fn start_native(
     }
     Ok(())
 }
+
+/// Labelled synthetic: the bottom of a real Claude worker pane with the
+/// spinner rows removed, so the start banner has scrolled away and the
+/// composer is idle. A finished-worker capture was not available.
+#[cfg(test)]
+pub(super) const CLAUDE_IDLE_NO_BANNER: &str = "\
+  Read README.md
+  ⎿  Done
+
+  Smoke test complete.
+
+
+
+
+
+
+
+
+
+
+
+
+────────
+❯
+────────
+  src brgr/task-1cf44e8d Fable5.2·M ctx█░░░ 10% 5h28% 7d31% $1.44
+  ⏵⏵ bypass permissions on (shift+tab to cycle)
+";
+
+/// 22-row screen captured from worker pane `w4:p2` (task `1cf44e8d`): a Claude
+/// worker mid-turn after its start banner has scrolled away.
+#[cfg(test)]
+pub(super) const CLAUDE_WORKING_NO_BANNER: &str = "\
+  Read README.md
+  ⎿  Done
+
+  Smoke test complete.
+
+
+
+
+
+
+
+
+
+
+✻ Warping… (1m 33s · ↓ 5.4k tokens · thinking more)
+  ⎿  Tip: Use /btw to ask a quick side question without interrupting Claude's current work
+
+────────
+❯
+────────
+  src brgr/task-1cf44e8d Fable5.2·M ctx█░░░ 10% 5h28% 7d31% $1.44
+  ⏵⏵ bypass permissions on (shift+tab to cycle)
+";
 
 #[cfg(test)]
 mod tests {
@@ -1035,5 +1199,159 @@ mod tests {
             &screen.replace("915c0be5", "915c0be5-extra"),
             workspace
         ));
+    }
+
+    #[test]
+    fn a_claude_composer_is_ready_after_its_banner_has_scrolled_away() {
+        assert!(composer_on_screen(CLAUDE_IDLE_NO_BANNER));
+        assert!(ready_after_start(CLAUDE_IDLE_NO_BANNER, "claude"));
+    }
+
+    #[test]
+    fn a_claude_turn_in_progress_is_not_ready_after_start() {
+        assert!(!ready_after_start(CLAUDE_WORKING_NO_BANNER, "claude"));
+        let interrupting = "working\nesc to interrupt\n────────\n❯ \n────────\n";
+        assert!(!ready_after_start(interrupting, "claude"));
+    }
+
+    #[test]
+    fn the_first_prompt_still_waits_for_the_claude_banner() {
+        assert!(!editor_ready(CLAUDE_IDLE_NO_BANNER, "claude"));
+        assert!(editor_ready("Claude Code v2.1.325\n❯ \n", "claude"));
+    }
+
+    #[test]
+    fn a_folder_trust_prompt_is_not_ready_after_start() {
+        let screen =
+            "Accessing workspace:\n\n/repo/task one/\n\n❯ No, exit\nYes, I trust this folder\n";
+        assert!(!ready_after_start(screen, "claude"));
+    }
+
+    #[test]
+    fn other_harnesses_are_read_the_same_after_start() {
+        assert!(ready_after_start(CODEX_IDLE_COMPOSER, "codex"));
+        assert!(ready_after_start(CLAUDE_WORKING_NO_BANNER, "codex"));
+    }
+
+    /// After Herdr detects a Claude worker, it can report `idle` for a dialog
+    /// no rule covers. Sending the first prompt must still wait.
+    #[test]
+    fn an_unknown_screen_blocks_sending_the_first_prompt_even_when_herdr_reports_idle() {
+        let screen = "Choose a theme\n› 1. Dark\n  2. Light\n";
+        assert!(matches!(
+            screens::classify(screen, Path::new("/repo/task")),
+            Screen::Unknown(_)
+        ));
+        let temp = tempfile::tempdir().unwrap();
+        let binary = temp.path().join("herdr");
+        fs::write(temp.path().join("screen"), screen).unwrap();
+        crate::fast_script::write_fast_script(
+            &binary,
+            r#"#!/bin/sh
+d=$(/usr/bin/dirname "$0")
+case "$1 $2" in
+ 'pane read') /bin/cat "$d/screen";;
+ 'agent get') printf '%s\n' '{"result":{"agent":{"agent":"claude","agent_status":"idle"}}}';;
+ *) exit 8;;
+esac
+"#,
+        );
+        let herdr = Herdr {
+            binary: binary.into_os_string(),
+            session: None,
+        };
+        assert!(
+            !native_ready(&herdr, "w1:p2", "claude", true),
+            "an unknown Claude dialog must not count as ready for the first prompt while idle"
+        );
+
+        // start_native resets settle on Unknown, then may still see Herdr idle
+        // plus detected_ready. The reset is what keeps the first prompt unsent.
+        let start = Instant::now();
+        let mut settle = ReadySettle::default();
+        settle.reset();
+        assert!(!settle.held(true, start));
+        settle.reset();
+        assert!(
+            !settle.held(true, start + READY_SETTLE),
+            "an unknown screen that keeps resetting never reaches the settle window"
+        );
+    }
+
+    /// Sequence B: the first prompt answers the trust screen, then the drive
+    /// loop meets the identical screen with a fresh stage watch. The answer
+    /// made at the first-prompt entry must hold for the drive entry.
+    #[test]
+    fn native_first_prompt_answer_is_held_in_drive() {
+        let screen =
+            "Accessing workspace:\n\n/repo/task\n\n❯ No, exit\n  Yes, I trust this folder\n";
+        let temp = tempfile::tempdir().unwrap();
+        let binary = temp.path().join("herdr");
+        fs::write(temp.path().join("screen"), screen).unwrap();
+        crate::fast_script::write_fast_script(
+            &binary,
+            r#"#!/bin/sh
+d=$(/usr/bin/dirname "$0")
+case "$1 $2" in
+ 'pane read') /bin/cat "$d/screen";;
+ 'pane send-keys') echo "$@" >> "$d/keys";;
+ 'agent get') printf '%s\n' '{"result":{"agent":{"agent":"claude","agent_status":"idle"}}}';;
+ *) exit 8;;
+esac
+"#,
+        );
+        let herdr = Herdr {
+            binary: binary.into_os_string(),
+            session: None,
+        };
+        let paths = Paths::new(Some(temp.path().join("home"))).unwrap();
+        let run = PaneRunArgs {
+            caller: None,
+            native_executable: None,
+            opencode_model: None,
+            prompt_file: PathBuf::new(),
+            workspace: PathBuf::from("/repo/task"),
+            task: TaskId::new(),
+            revision: 1,
+            kind: "claude".to_owned(),
+            agent_args: Vec::new(),
+            keep_pane: false,
+        };
+        let mut answers = AnswerMemory::new();
+        let mut prompt_watch = ScreenWatch::with_limit("claude", Duration::from_hours(1));
+        assert!(matches!(
+            answer_between_attempts(
+                &herdr,
+                "w1:p2",
+                &run,
+                &paths,
+                Some("idle"),
+                &mut prompt_watch,
+                &mut answers,
+                "first-prompt",
+            )
+            .unwrap(),
+            Screen::Resolve { .. }
+        ));
+        // drive creates its own stage watch but keeps the pane/run answers.
+        let mut drive_watch = ScreenWatch::with_limit("claude", Duration::from_hours(1));
+        assert_eq!(
+            answer_between_attempts(
+                &herdr,
+                "w1:p2",
+                &run,
+                &paths,
+                Some("blocked"),
+                &mut drive_watch,
+                &mut answers,
+                "drive-blocked",
+            )
+            .unwrap(),
+            Screen::Answered {
+                rule: "workspace-trust"
+            }
+        );
+        let keys = fs::read_to_string(temp.path().join("keys")).unwrap();
+        assert_eq!(keys.trim(), "pane send-keys w1:p2 down enter");
     }
 }

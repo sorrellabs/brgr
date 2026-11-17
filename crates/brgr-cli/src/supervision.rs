@@ -123,19 +123,27 @@ async fn supervise_inner(
         paths,
         &supervisor.reconcile_after_restart(|attempt| observe_attempt(paths, attempt))?,
     );
+    crate::worker_line::refresh(paths);
     write_json_atomic(&paths.supervisor(launch.spec.task_id), &receipt)?;
     let (task_id, revision) = (launch.spec.task_id, launch.spec.revision);
     let harness = launch.spec.route.harness_id.clone();
     let task_workspace = launch.spec.workspace.clone();
-    let result = supervisor
-        .run_fresh_controlled(
-            launch.spec,
-            &manifest,
-            Some(&cancel_path),
-            Some(&pid_path),
-            Some(&receipt.identity),
-        )
-        .await;
+    let run = supervisor.run_fresh_controlled(
+        launch.spec,
+        &manifest,
+        Some(&cancel_path),
+        Some(&pid_path),
+        Some(&receipt.identity),
+    );
+    tokio::pin!(run);
+    let mut tick = tokio::time::interval(crate::worker_line::heartbeat());
+    let result = loop {
+        tokio::select! {
+            result = &mut run => break result,
+            _ = tick.tick() => crate::worker_line::refresh(paths),
+        }
+    };
+    crate::worker_line::refresh(paths);
     if launch.pane_mode
         && !result
             .as_ref()
@@ -145,7 +153,7 @@ async fn supervise_inner(
     }
     let result = result?;
     crate::error_memo::record_result(paths, &harness, &result);
-    let _ = fs::remove_file(cancel_path);
+    let _ = fs::remove_file(&cancel_path);
     let _ = fs::remove_file(paths.supervisor(result.task_id));
     print_supervised_receipt(result, mode, json_output, harness, task_workspace, task_id)
 }
@@ -340,6 +348,7 @@ pub(crate) fn reconcile_pending(paths: &Paths) -> Result<()> {
             eprintln!("brgr cleanup pending: {error:#}");
         }
     }
+    crate::worker_line::refresh(paths);
     Ok(())
 }
 

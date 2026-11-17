@@ -969,6 +969,32 @@ mod tests {
     }
 
     #[test]
+    fn provider_failure_quote_is_removed_from_error_memo_and_fingerprint() {
+        let error = "the Herdr-backed worker did not provide a valid final result: the opencode provider/network recovery window exhausted after 600s (harness retrying); last screen: Timed out waiting for response headers for alice@example.com";
+        let class = classify(error);
+        assert!(class.contains("provider/network"), "{class}");
+        assert!(!class.contains("Timed out"), "{class}");
+        let sample = redact(error, 400);
+        assert!(!sample.contains("Timed out"), "{sample}");
+        assert!(!sample.contains("alice"), "{sample}");
+        // One class for the same failure whatever its quote: the fingerprint
+        // ignores the text after the marker.
+        let other = error.replace(
+            "Timed out waiting for response headers for alice@example.com",
+            "Timed out waiting for response data",
+        );
+        assert_eq!(
+            fingerprint(&classify(error)),
+            fingerprint(&classify(&other))
+        );
+        // The timeout-attributed form is cut at the same marker.
+        let timeout = "the Herdr-backed worker did not provide a valid final result: the attempt deadline elapsed while the harness had a provider/network problem (stopped); last screen: Timed out waiting for response data";
+        let class = classify(timeout);
+        assert!(class.contains("provider/network"), "{class}");
+        assert!(!class.contains("Timed out"), "{class}");
+    }
+
+    #[test]
     fn redaction_truncates_long_text() {
         assert_eq!(redact(&"word ".repeat(200), 50).chars().count(), 50);
     }

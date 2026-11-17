@@ -20,7 +20,7 @@ Model and effort remain native harness choices when omitted everywhere.
 brgr config init
 brgr config set harness local.claude-code
 brgr config set effort medium --harness local.claude-code
-brgr config set worker-placement tab
+brgr config set worker-placement adjacent|below|tab
 brgr config set deadline-seconds 1800
 brgr config set argv '["--native-option","value"]' --harness HARNESS
 brgr config show

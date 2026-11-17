@@ -25,7 +25,7 @@ use std::{fmt::Write as _, fs, io::Read, path::Path};
 use std::os::unix::fs::PermissionsExt;
 
 use artifact::ArtifactStore;
-pub use board::{BoardStore, BoardTaskRow};
+pub use board::{BoardStore, BoardTaskRow, SessionCounts};
 use brgr_protocol::{
     ArtifactRef, AttemptId, AttemptState, Decision, Event, EventId, EventKind, ResultEnvelope,
     ResultId, RouteObservation, SCHEMA_V1, TaskSpec,

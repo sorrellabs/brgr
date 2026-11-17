@@ -30,7 +30,28 @@ pub(crate) const PANE_NAME_PLACEHOLDERS: [&str; 6] = [
 pub enum WorkerPlacement {
     #[default]
     Adjacent,
+    Below,
     Tab,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ClaudeRoute {
+    #[default]
+    ClaudeCodeOnly,
+    Any,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RoutesConfig {
+    pub claude: ClaudeRoute,
+}
+
+impl RoutesConfig {
+    fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -46,6 +67,8 @@ pub struct Config {
     pub recertify: RecertifyConfig,
     #[serde(skip_serializing_if = "HandoffConfig::is_default")]
     pub handoff: HandoffConfig,
+    #[serde(skip_serializing_if = "RoutesConfig::is_default")]
+    pub routes: RoutesConfig,
     #[serde(skip_serializing_if = "CallingOptions::is_unset")]
     pub defaults: CallingOptions,
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
@@ -216,6 +239,22 @@ impl Config {
     }
 
     pub(crate) fn set(&mut self, key: &str, value: &str, harness: Option<&str>) -> Result<()> {
+        if key == "claude-route" {
+            if harness.is_some() {
+                bail!("unknown calling option {key}");
+            }
+            self.routes.claude = match value {
+                "claude-code-only" => ClaudeRoute::ClaudeCodeOnly,
+                "any" => ClaudeRoute::Any,
+                _ => bail!("claude-route must be claude-code-only or any"),
+            };
+            if self.routes.claude == ClaudeRoute::ClaudeCodeOnly
+                && let Some(note) = crate::claude_route::tightening_note(self)
+            {
+                eprintln!("{note}");
+            }
+            return Ok(());
+        }
         let options = if let Some(id) = harness {
             validate_id(id)?;
             self.harnesses.entry(id.to_owned()).or_default()
@@ -227,7 +266,19 @@ impl Config {
                 validate_id(value)?;
                 options.harness = Some(value.to_owned());
             }
-            "model" => options.model = Some(nonempty(value)?.to_owned()),
+            "model" => {
+                let model = nonempty(value)?.to_owned();
+                if let Some(id) = harness
+                    && self.routes.claude == ClaudeRoute::ClaudeCodeOnly
+                    && id != brgr_registry::CLAUDE_CODE_HARNESS_ID
+                    && crate::claude_route::is_claude_model(&model)
+                {
+                    bail!(
+                        "claude-route is claude-code-only: Claude model `{model}` cannot be the default for {id}, which brgr would refuse. Point it at local.claude-code, or first run `brgr config set claude-route any`."
+                    );
+                }
+                options.model = Some(model);
+            }
             "effort" => options.effort = Some(nonempty(value)?.to_owned()),
             "notifications" => {
                 options.notifications = Some(
@@ -260,8 +311,9 @@ impl Config {
             "worker-placement" if harness.is_none() => {
                 self.herdr.worker_placement = match value {
                     "adjacent" => WorkerPlacement::Adjacent,
+                    "below" => WorkerPlacement::Below,
                     "tab" => WorkerPlacement::Tab,
-                    _ => bail!("worker-placement must be adjacent or tab"),
+                    _ => bail!("worker-placement must be adjacent, below or tab"),
                 }
             }
             _ => bail!("unknown calling option {key}"),
@@ -485,6 +537,9 @@ pub(crate) fn initialize(paths: &crate::Paths, json_output: bool) -> Result<()> 
 pub(crate) async fn check(paths: &crate::Paths, config: &Config, json_output: bool) -> Result<()> {
     let registry = brgr_registry::Registry::open_with_control_home(&paths.registry, &paths.home)?;
     validate_argv(&config.defaults.argv)?;
+    if let Some(error) = crate::claude_route::saved_route_refusal(config) {
+        bail!("{error}");
+    }
     let mut checked = Vec::new();
     // With no default configured and several harnesses registered, only the
     // per-harness entries are checked: a run would ask for one by name.
@@ -497,10 +552,6 @@ pub(crate) async fn check(paths: &crate::Paths, config: &Config, json_output: bo
         .chain(default.iter())
         .collect::<std::collections::BTreeSet<_>>()
     {
-        // A section left from before its support was removed configures nothing.
-        if id == brgr_registry::REMOVED_HARNESS_ID {
-            continue;
-        }
         let (manifest, _) = crate::admission::load_harness(&registry, id, false).await?;
         let options = config.calling(id);
         validate_manifest_argv(&options.argv, &manifest)?;
@@ -537,7 +588,14 @@ pub(crate) async fn check(paths: &crate::Paths, config: &Config, json_output: bo
         checked.push(id);
     }
     crate::print_value(
-        &serde_json::json!({"status":"ok","harnesses":checked,"default_presentation":"tui","default_permission":"full","instructions":paths.home.join("BRGR.md")}),
+        &serde_json::json!({
+            "status":"ok",
+            "harnesses":checked,
+            "default_presentation":"tui",
+            "default_permission":"full",
+            "claude_route":config.routes.claude,
+            "instructions":paths.home.join("BRGR.md")
+        }),
         json_output,
     );
     Ok(())
@@ -680,23 +738,202 @@ mod tests {
         config.reset_pane_name_template();
         assert_eq!(config.herdr.pane_name_template, DEFAULT_PANE_NAME_TEMPLATE);
     }
+
+    #[test]
+    fn below_placement_loads_and_round_trips() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("config.toml");
+        fs::write(&path, "[herdr]\nworker_placement = 'below'\n").unwrap();
+        assert_eq!(
+            Config::load(&path).unwrap().herdr.worker_placement,
+            WorkerPlacement::Below
+        );
+        let mut config = Config::default();
+        config.set("worker-placement", "below", None).unwrap();
+        assert_eq!(config.herdr.worker_placement, WorkerPlacement::Below);
+        let error = config
+            .set("worker-placement", "elsewhere", None)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("adjacent") && error.contains("below") && error.contains("tab"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn claude_route_round_trips_and_an_unknown_value_fails_closed() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        fs::create_dir_all(&home).unwrap();
+        let path = home.join("config.toml");
+        Config::update(&path, &home, |config| {
+            config.set("claude-route", "any", None)?;
+            Ok(true)
+        })
+        .unwrap();
+        let loaded = Config::load(&path).unwrap();
+        assert_eq!(loaded.routes.claude, ClaudeRoute::Any);
+        assert!(
+            fs::read_to_string(&path)
+                .unwrap()
+                .contains("[routes]\nclaude = \"any\"")
+        );
+        assert!(
+            Config::default()
+                .set("claude-route", "sometimes", None)
+                .is_err()
+        );
+        fs::write(&path, "[routes]\nclaude = \"sometimes\"\n").unwrap();
+        assert!(Config::load(&path).is_err());
+        fs::write(&path, "[routes]\nother = \"any\"\n").unwrap();
+        assert!(Config::load(&path).is_err());
+    }
+
+    #[test]
+    fn claude_route_cannot_be_set_per_harness() {
+        let error = Config::default()
+            .set("claude-route", "any", Some("local.opencode"))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("unknown calling option claude-route"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn setting_a_claude_default_model_on_another_harness_is_refused_under_claude_code_only() {
+        let mut config = Config::default();
+        let error = config
+            .set("model", "litellm/claude-opus-5-5", Some("local.opencode"))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("claude-route is claude-code-only"),
+            "{error}"
+        );
+        config
+            .set("model", "litellm/claude-opus-5-5", None)
+            .unwrap();
+        assert_eq!(
+            config.defaults.model.as_deref(),
+            Some("litellm/claude-opus-5-5")
+        );
+        config
+            .set("model", "sonnet", Some("local.claude-code"))
+            .unwrap();
+        config
+            .set("model", "litellm/grok-4.6", Some("local.opencode"))
+            .unwrap();
+        config.set("claude-route", "any", None).unwrap();
+        config
+            .set("model", "litellm/claude-opus-5-5", Some("local.opencode"))
+            .unwrap();
+    }
+
+    #[test]
+    fn config_check_lists_every_saved_route_the_setting_would_refuse() {
+        let mut config = Config::default();
+        config.aliases.insert(
+            "fable".into(),
+            crate::aliases::Alias {
+                harness: "local.opencode".into(),
+                model: Some("litellm/claude-fable-5-2".into()),
+                effort: None,
+            },
+        );
+        config
+            .harnesses
+            .entry("local.opencode".into())
+            .or_default()
+            .model = Some("litellm/claude-opus-5-5".into());
+        let error = crate::claude_route::saved_route_refusal(&config).expect("violations");
+        assert!(
+            error.contains("alias fable (local.opencode, litellm/claude-fable-5-2)"),
+            "{error}"
+        );
+        assert!(
+            error.contains("default model of local.opencode (litellm/claude-opus-5-5)"),
+            "{error}"
+        );
+        config.set("claude-route", "any", None).unwrap();
+        assert!(crate::claude_route::saved_route_refusal(&config).is_none());
+    }
 }
 
 #[cfg(test)]
 mod serialize_tests {
     use super::*;
+    use serde::Deserialize;
 
     /// Earlier releases refuse unknown tables and share this file, so saving an
     /// unrelated setting must not add the tables they do not know.
     #[test]
     fn a_default_config_writes_no_table_an_older_release_would_refuse() {
         let text = toml::to_string_pretty(&Config::default()).unwrap();
-        for table in ["[issues]", "[defaults]", "[harnesses"] {
+        for table in ["[issues]", "[defaults]", "[harnesses", "[routes]"] {
             assert!(!text.contains(table), "{table} written:\n{text}");
         }
         let mut config = Config::default();
         config.issues.auto_file = true;
         let text = toml::to_string_pretty(&config).unwrap();
         assert!(text.contains("[issues]"), "{text}");
+    }
+
+    /// Frozen copy of the 2.15.24 enum. A new default value would make older
+    /// releases refuse a freshly written config.toml.
+    #[test]
+    fn only_the_below_choice_is_unreadable_by_an_older_release() {
+        #[derive(Debug, Deserialize)]
+        struct OldFile {
+            herdr: OldHerdr,
+        }
+        #[derive(Debug, Deserialize)]
+        struct OldHerdr {
+            #[serde(default)]
+            worker_placement: OldWorkerPlacement,
+        }
+        #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Deserialize)]
+        #[serde(rename_all = "snake_case")]
+        enum OldWorkerPlacement {
+            #[default]
+            Adjacent,
+            Tab,
+        }
+
+        let default_text = toml::to_string_pretty(&Config::default()).unwrap();
+        let parsed: OldFile = toml::from_str(&default_text).unwrap();
+        assert_eq!(parsed.herdr.worker_placement, OldWorkerPlacement::Adjacent);
+
+        let mut tab = Config::default();
+        tab.herdr.worker_placement = WorkerPlacement::Tab;
+        let tab_text = toml::to_string_pretty(&tab).unwrap();
+        let parsed: OldFile = toml::from_str(&tab_text).unwrap();
+        assert_eq!(parsed.herdr.worker_placement, OldWorkerPlacement::Tab);
+
+        let mut below = Config::default();
+        below.herdr.worker_placement = WorkerPlacement::Below;
+        let below_text = toml::to_string_pretty(&below).unwrap();
+        assert!(
+            toml::from_str::<OldFile>(&below_text).is_err(),
+            "{below_text}"
+        );
+    }
+
+    #[test]
+    fn a_default_claude_route_writes_no_routes_table_an_older_release_would_refuse() {
+        let text = toml::to_string_pretty(&Config::default()).unwrap();
+        assert!(!text.contains("[routes]"), "{text}");
+        let mut config = Config::default();
+        config.set("claude-route", "any", None).unwrap();
+        let text = toml::to_string_pretty(&config).unwrap();
+        assert!(text.contains("[routes]"), "{text}");
+        assert!(text.contains("claude = \"any\""), "{text}");
+        config
+            .set("claude-route", "claude-code-only", None)
+            .unwrap();
+        let text = toml::to_string_pretty(&config).unwrap();
+        assert!(!text.contains("[routes]"), "{text}");
     }
 }

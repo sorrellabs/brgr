@@ -61,14 +61,33 @@ fn settle(home: &Path, task: &str, owner: &[(&str, &str)]) -> Option<Value> {
         .then(|| json_output(&run(home, &["result", task], owner)))
 }
 
-/// The owner pane's prompt file once a line satisfies `delivered`.
+/// The owner pane's prompt file once a line satisfies `delivered` and every
+/// notice in it is whole.
+///
+/// The owner's shell appends a prompt that exceeds its write buffer in more
+/// than one write, so a prefix such as `FROM BRGR` is visible before its JSON
+/// line is. Waiting on that prefix alone hands back a partly written notice.
 fn delivered_prompt(prompts: &Path, delivered: impl Fn(&str) -> bool) -> Option<String> {
     let mut text = String::new();
     wait_until(|| {
         text = fs::read_to_string(prompts).unwrap_or_default();
-        delivered(&text)
+        delivered(&text) && notices_are_whole(&text)
     })
     .then_some(text)
+}
+
+/// Whether every `FROM BRGR` notice start in `text` carries its whole JSON line.
+///
+/// A parsed notice alone is not proof: the file may hold one finished notice
+/// and the beginning of a later one still being written.
+fn notices_are_whole(text: &str) -> bool {
+    let lines: Vec<&str> = text.lines().collect();
+    lines.iter().enumerate().all(|(index, line)| {
+        *line != "FROM BRGR"
+            || lines
+                .get(index + 1)
+                .is_some_and(|json| serde_json::from_str::<Value>(json.trim()).is_ok())
+    })
 }
 
 fn run(home: &Path, args: &[&str], envs: &[(&str, &str)]) -> std::process::Output {
@@ -552,6 +571,289 @@ fn plugin_board_refresh_failure_is_visible_without_mutating_tasks() {
     let restored_text = String::from_utf8(restored.stdout).unwrap();
     assert!(restored_text.contains(&task_id[..8]));
     assert!(restored_text.contains("candidate"));
+}
+
+fn tui(home: &Path, args: &[&str], envs: &[(&str, &str)]) -> std::process::Output {
+    let mut command = brgr_command();
+    command.arg("--home").arg(home).args(args);
+    for (name, value) in envs {
+        command.env(name, value);
+    }
+    command.output().unwrap()
+}
+
+fn tui_text(home: &Path, args: &[&str], envs: &[(&str, &str)]) -> String {
+    let output = tui(home, args, envs);
+    assert!(
+        output.status.success(),
+        "tui failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout).unwrap()
+}
+
+fn project_cell(text: &str, task_id: &str) -> String {
+    let short = &task_id[..8];
+    let row = text
+        .lines()
+        .find(|line| line.starts_with(short))
+        .unwrap_or_else(|| panic!("no row for {short}: {text}"));
+    row.split_whitespace()
+        .nth(1)
+        .unwrap_or_else(|| panic!("no project cell: {row}"))
+        .to_owned()
+}
+
+#[test]
+fn board_shows_the_source_repository_name_for_a_worktree_task() {
+    let temp = TempDir::new().unwrap();
+    let home = temp.path().join("brgr");
+    let repository = temp.path().join("brgr-live3-repo");
+    fs::create_dir_all(&repository).unwrap();
+    seed_git_repo(&repository);
+    add_fixture(&home, &brgr_fixture(), &temp.path().join("scratch"));
+    let created = json_output(&run(
+        &home,
+        &[
+            "run",
+            "BRGR_FIXTURE_OK",
+            "--workspace",
+            repository.to_str().unwrap(),
+            "--foreground",
+        ],
+        &[("BRGR_OWNER_ID", "codex:board-project")],
+    ));
+    let task_id = created["task_id"].as_str().unwrap();
+    let envs = [
+        ("BRGR_OWNER_ID", "codex:board-project"),
+        ("HERDR_ENV", "1"),
+        ("HERDR_PLUGIN_ID", "brgr"),
+    ];
+    let board =
+        String::from_utf8(run(&home, &["plugin", "board", "--once"], &envs).stdout).unwrap();
+    let tui = tui_text(&home, &["tui", "--once"], &[]);
+    assert_eq!(project_cell(&board, task_id), "brgr-live3-repo", "{board}");
+    assert_eq!(project_cell(&tui, task_id), "brgr-live3-repo", "{tui}");
+}
+
+#[test]
+fn board_keeps_the_workspace_folder_without_a_worktree() {
+    let (_temp, home, workspace) = fixture_home();
+    let created = json_output(&run(
+        &home,
+        &[
+            "run",
+            "BRGR_FIXTURE_OK",
+            "--workspace",
+            workspace.to_str().unwrap(),
+            "--foreground",
+        ],
+        &[("BRGR_OWNER_ID", "codex:board-no-worktree")],
+    ));
+    let task_id = created["task_id"].as_str().unwrap();
+    let envs = [
+        ("BRGR_OWNER_ID", "codex:board-no-worktree"),
+        ("HERDR_ENV", "1"),
+        ("HERDR_PLUGIN_ID", "brgr"),
+    ];
+    let board =
+        String::from_utf8(run(&home, &["plugin", "board", "--once"], &envs).stdout).unwrap();
+    let tui = tui_text(&home, &["tui", "--once"], &[]);
+    assert_eq!(project_cell(&board, task_id), "work", "{board}");
+    assert_eq!(project_cell(&tui, task_id), "work", "{tui}");
+}
+
+#[test]
+fn tui_once_renders_the_board_outside_herdr() {
+    let (_temp, home, workspace) = fixture_home();
+    let created = json_output(&run(
+        &home,
+        &[
+            "run",
+            "BRGR_FIXTURE_OK",
+            "--workspace",
+            workspace.to_str().unwrap(),
+            "--foreground",
+        ],
+        &[("BRGR_OWNER_ID", "codex:tui-once")],
+    ));
+    let task_id = created["task_id"].as_str().unwrap();
+    let text = tui_text(&home, &["tui", "--once"], &[]);
+    assert!(text.contains(&task_id[..8]), "{text}");
+    assert!(text.contains("brgr · managed tasks"), "{text}");
+    assert!(text.contains("This board never decides"), "{text}");
+    assert!(!text.contains("BRGR_FIXTURE_OK"), "{text}");
+}
+
+#[test]
+fn tui_shows_model_and_alias_for_a_fixture_run() {
+    let (_temp, home, workspace) = fixture_home();
+    let set = run(
+        &home,
+        &[
+            "config",
+            "alias",
+            "set",
+            "grok",
+            "--harness",
+            "local.fixture",
+            "--model",
+            "fixture-model",
+        ],
+        &[],
+    );
+    assert!(
+        set.status.success(),
+        "{}",
+        String::from_utf8_lossy(&set.stderr)
+    );
+    let created = json_output(&run(
+        &home,
+        &[
+            "run",
+            "BRGR_FIXTURE_OK",
+            "--use",
+            "grok",
+            "--workspace",
+            workspace.to_str().unwrap(),
+            "--foreground",
+        ],
+        &[("BRGR_OWNER_ID", "codex:tui-alias")],
+    ));
+    let task_id = created["task_id"].as_str().unwrap();
+    let text = tui_text(&home, &["tui", "--once"], &[]);
+    assert!(text.contains(&task_id[..8]), "{text}");
+    assert!(text.contains("grok"), "{text}");
+    assert!(text.contains("fixture-model"), "{text}");
+}
+
+#[test]
+fn tui_defaults_to_my_tasks_with_a_session_and_all_without() {
+    let (_temp, home, workspace) = fixture_home();
+    let mine = json_output(&run(
+        &home,
+        &[
+            "run",
+            "BRGR_FIXTURE_OK",
+            "--workspace",
+            workspace.to_str().unwrap(),
+            "--foreground",
+        ],
+        &[
+            ("BRGR_OWNER_ID", "codex:tui-mine"),
+            ("BRGR_SESSION_ID", "session-mine"),
+        ],
+    ));
+    let other = json_output(&run(
+        &home,
+        &[
+            "run",
+            "BRGR_FIXTURE_OK",
+            "--workspace",
+            workspace.to_str().unwrap(),
+            "--foreground",
+        ],
+        &[
+            ("BRGR_OWNER_ID", "codex:tui-other"),
+            ("BRGR_SESSION_ID", "session-other"),
+        ],
+    ));
+    let mine_id = mine["task_id"].as_str().unwrap();
+    let other_id = other["task_id"].as_str().unwrap();
+    let mine_board = tui_text(
+        &home,
+        &["tui", "--once"],
+        &[("BRGR_SESSION_ID", "session-mine")],
+    );
+    assert!(mine_board.contains("my tasks"), "{mine_board}");
+    assert!(mine_board.contains(&mine_id[..8]), "{mine_board}");
+    assert!(!mine_board.contains(&other_id[..8]), "{mine_board}");
+    let all_board = tui_text(&home, &["tui", "--once"], &[]);
+    assert!(all_board.contains("all owners"), "{all_board}");
+    assert!(
+        all_board.contains("no owner session in this terminal"),
+        "{all_board}"
+    );
+    assert!(all_board.contains(&mine_id[..8]), "{all_board}");
+    assert!(all_board.contains(&other_id[..8]), "{all_board}");
+}
+
+#[test]
+fn tui_mine_without_a_session_fails_without_guessing() {
+    let (_temp, home, _) = fixture_home();
+    let failed = tui(&home, &["tui", "--once", "--mine"], &[]);
+    assert!(!failed.status.success());
+    let stderr = String::from_utf8_lossy(&failed.stderr);
+    assert!(
+        stderr.contains(
+            "brgr tui --mine needs an owner session; run it from the owner's session or pass --as SESSION"
+        ),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn tui_refuses_json() {
+    let (_temp, home, _) = fixture_home();
+    let mut command = brgr_command();
+    let failed = command
+        .arg("--home")
+        .arg(&home)
+        .arg("--json")
+        .args(["tui", "--once"])
+        .output()
+        .unwrap();
+    assert!(!failed.status.success());
+    let stderr = String::from_utf8_lossy(&failed.stderr);
+    assert!(stderr.contains("brgr --json status"), "{stderr}");
+    assert!(stderr.contains("brgr status --brief"), "{stderr}");
+}
+
+#[test]
+fn tui_in_a_pipe_prints_one_snapshot_without_escape_codes() {
+    let (_temp, home, workspace) = fixture_home();
+    let created = json_output(&run(
+        &home,
+        &[
+            "run",
+            "BRGR_FIXTURE_OK",
+            "--workspace",
+            workspace.to_str().unwrap(),
+            "--foreground",
+        ],
+        &[("BRGR_OWNER_ID", "codex:tui-pipe")],
+    ));
+    let task_id = created["task_id"].as_str().unwrap();
+    let text = tui_text(&home, &["tui"], &[]);
+    assert!(text.contains(&task_id[..8]), "{text}");
+    assert!(!text.contains('\u{1b}'), "{text:?}");
+}
+
+#[test]
+fn tui_never_prints_objective_or_decision_reason() {
+    let (_temp, home, workspace) = fixture_home();
+    let created = json_output(&run(
+        &home,
+        &[
+            "run",
+            "BRGR_FIXTURE_OK",
+            "--workspace",
+            workspace.to_str().unwrap(),
+            "--foreground",
+        ],
+        &[("BRGR_OWNER_ID", "codex:tui-secret")],
+    ));
+    let task_id = created["task_id"].as_str().unwrap();
+    json_output(&run(
+        &home,
+        &["accept", task_id, "--reason", "SECRET_TUI_DECISION_REASON"],
+        &[("BRGR_OWNER_ID", "codex:tui-secret")],
+    ));
+    let text = tui_text(&home, &["tui", "--once"], &[]);
+    assert!(text.contains(&task_id[..8]), "{text}");
+    assert!(text.contains("accepted"), "{text}");
+    assert!(!text.contains("BRGR_FIXTURE_OK"), "{text}");
+    assert!(!text.contains("SECRET_TUI_DECISION_REASON"), "{text}");
 }
 
 #[test]
@@ -1225,6 +1527,7 @@ PY
     echo idle > "$d/state"
     echo '{"result":{"agent":{"agent":"claude","agent_status":"idle","pane_id":"w9:p2"}}}';;
   'agent prompt')
+    : > "$d/prompted"
     if [ -e "$d/prompt-refused" ]; then
       echo '{"error":{"code":"agent_not_ready","message":"agent w9:p2 is not an active named agent"}}' >&2
       exit 1
@@ -1273,9 +1576,42 @@ PY
       exit 0
     fi
     s=$(/bin/cat "$d/state")
+    if [ -e "$d/provider" ] && [ ! -e "$d/provider-recovered" ] \
+       && { [ -e "$d/prompted" ] || [ -e "$d/provider-at-startup" ]; }; then
+      if [ -e "$d/provider-recover-after" ]; then
+        n=$(/bin/cat "$d/provider-tick" 2>/dev/null || echo 0)
+        n=$((n + 1)); echo "$n" > "$d/provider-tick"
+        if [ "$n" -gt "$(/bin/cat "$d/provider-recover-after")" ]; then
+          : > "$d/provider-recovered"
+        fi
+      fi
+      if [ ! -e "$d/provider-recovered" ]; then
+        if [ -e "$d/provider-idle" ]; then s=idle
+        elif [ -e "$d/provider-working" ]; then s=working
+        elif [ -e "$d/provider-unknown" ]; then s=unknown
+        else s=blocked; fi
+      fi
+    fi
     printf '{"result":{"agent":{"agent":"claude","agent_status":"%s","pane_id":"w9:p2"}}}\n' "$s"
     if [ "$s" = working ]; then echo idle > "$d/state"; fi;;
   'pane read')
+    if [ -e "$d/provider" ] && [ ! -e "$d/provider-recovered" ] \
+       && { [ -e "$d/prompted" ] || [ -e "$d/provider-at-startup" ]; }; then
+      if [ -e "$d/provider-flip" ]; then
+        n=$(/bin/cat "$d/provider-flip-tick" 2>/dev/null || echo 0)
+        n=$((n + 1)); echo "$n" > "$d/provider-flip-tick"
+        if [ "$n" -le 3 ]; then
+          printf '%s\n' "⚠ Retrying in ${n}s · attempt $n · Timed out waiting for response headers" 'Build · grok-4.6 · 1h 0m'
+        else
+          printf '%s\n' 'Build · grok-4.6 · 1h 0m' 'Error: Timed out waiting for response headers'
+        fi
+      elif [ -e "$d/provider-retry" ]; then
+        printf '%s\n' '⚠ Retrying in 1s · attempt 11 · Timed out waiting for response headers' 'Build · grok-4.6 · 1h 0m'
+      else
+        printf '%s\n' 'Build · grok-4.6 · 1h 0m' 'Error: Timed out waiting for response headers'
+      fi
+      exit 0
+    fi
     if [ -e "$d/dialog" ] && [ -s "$d/paste" ]; then
       printf '%s\n' 'Pick a region' '› 1. us-east' '  2. eu-west'
       exit 0
@@ -1298,6 +1634,12 @@ PY
   'pane rename')
     if [ -e "$d/rename-fails" ]; then
       echo '{"error":{"code":"invalid_label","message":"the pane label is invalid"}}' >&2
+      exit 1
+    fi
+    echo '{"result":{"type":"ok"}}';;
+  'agent rename')
+    if [ -e "$d/agent-rename-fails" ]; then
+      echo '{"error":{"code":"invalid_name","message":"the agent name is invalid"}}' >&2
       exit 1
     fi
     echo '{"result":{"type":"ok"}}';;
@@ -1613,6 +1955,38 @@ fn the_pane_name_is_set_again_after_the_agent_has_started() {
     );
 }
 
+/// Herdr's agents sidebar shows the agent name, not the pane label. The name
+/// is a sanitized harness short and task prefix so Herdr 0.9.5 will accept it.
+/// The pane label stays the rendered template.
+#[test]
+fn the_agent_name_is_a_sanitized_harness_and_task_prefix() {
+    let fixture = pane_fixture();
+    let ran = fixture.run(&[]);
+    assert_eq!(ran["outcome"], "candidate", "{ran}");
+    let task = ran["task_id"].as_str().unwrap();
+    let calls = fixture.state("calls.log");
+    let start = calls
+        .find("agent start")
+        .or_else(|| calls.find("pane run w9:p2"))
+        .unwrap_or_else(|| panic!("the agent was never started: {calls}"));
+    let rename = format!("agent rename w9:p2 claude-{}", &task[..8]);
+    let named = calls
+        .find(&rename)
+        .unwrap_or_else(|| panic!("the agent was not named {rename:?}: {calls}"));
+    assert!(
+        named > start,
+        "the agent was named before it existed: {calls}"
+    );
+    assert!(
+        calls.contains("pane rename w9:p2 claude-code/anthropic: Explain the build"),
+        "the pane label changed: {calls}"
+    );
+    assert!(
+        !calls.contains("agent rename w9:p2 claude-code/anthropic: Explain the build"),
+        "the agent was named with the pane label: {calls}"
+    );
+}
+
 /// An empty template is the off switch: no rename, and the creation arguments
 /// are the ones brgr used before naming existed.
 #[test]
@@ -1627,6 +2001,7 @@ fn an_empty_pane_name_template_leaves_pane_creation_unchanged() {
     assert_eq!(ran["outcome"], "candidate", "{ran}");
     let calls = fixture.state("calls.log");
     assert!(!calls.contains("pane rename"), "{calls}");
+    assert!(!calls.contains("agent rename"), "{calls}");
     assert!(
         calls.contains("pane split --pane w9:p1 --direction right"),
         "{calls}"
@@ -1664,6 +2039,23 @@ fn a_failed_pane_rename_does_not_fail_the_run() {
     let fixture = pane_fixture();
     fs::create_dir_all(&fixture.state).unwrap();
     fs::write(fixture.state.join("rename-fails"), "").unwrap();
+    let ran = fixture.run(&[]);
+    assert_eq!(ran["outcome"], "candidate", "{ran}");
+    let task = ran["task_id"].as_str().unwrap();
+    let result = json_output(&run(
+        &fixture.home,
+        &["result", task],
+        &[("BRGR_OWNER_ID", "codex:pane-test")],
+    ));
+    assert_eq!(result["artifacts"][0]["text"], "PANE_REPORT_OK", "{result}");
+}
+
+/// Naming is display only: a Herdr that refuses the agent name does not cost the run.
+#[test]
+fn a_failed_agent_rename_does_not_fail_the_run() {
+    let fixture = pane_fixture();
+    fs::create_dir_all(&fixture.state).unwrap();
+    fs::write(fixture.state.join("agent-rename-fails"), "").unwrap();
     let ran = fixture.run(&[]);
     assert_eq!(ran["outcome"], "candidate", "{ran}");
     let task = ran["task_id"].as_str().unwrap();
@@ -1935,6 +2327,260 @@ fn an_unclassified_agent_stuck_on_an_unknown_dialog_fails_on_the_screen_deadline
         calls.matches("pane send-keys").count(),
         1,
         "only the prompt's own Enter may be sent: {calls}"
+    );
+}
+
+/// Every message the worker side sent its owner for this task, with whether it
+/// was later withdrawn.
+fn task_message_bodies(fixture: &PaneFixture, task: &str) -> Vec<(String, bool)> {
+    let store = brgr_store::Store::open(fixture.home.join("store")).unwrap();
+    let task_id: brgr_protocol::TaskId = task.parse().unwrap();
+    let attempt = store.latest_message_attempt(task_id).unwrap();
+    store
+        .task_messages(
+            task_id,
+            attempt,
+            brgr_store::MessageDirection::WorkerToOwner,
+            true,
+        )
+        .unwrap()
+        .into_iter()
+        .map(|message| (message.body, message.acknowledged))
+        .collect()
+}
+
+fn write_provider_flags(fixture: &PaneFixture, flags: &[&str]) {
+    fs::create_dir_all(&fixture.state).unwrap();
+    for flag in flags {
+        fs::write(fixture.state.join(flag), "").unwrap();
+    }
+}
+
+/// A provider/network screen is not an approval. It is reported as a model or
+/// network failure with its quoted diagnostic, and nothing is pressed on it.
+#[test]
+fn blocked_provider_sends_network_note_not_approval() {
+    let fixture = pane_fixture();
+    write_provider_flags(&fixture, &["no-report", "provider"]);
+    let ran = fixture.run_on_with_env(
+        "local.opencode",
+        &[],
+        &[
+            ("BRGR_TEST_PROVIDER_LIMIT_MS", "1500"),
+            ("BRGR_TEST_REPORT_GRACE_MS", "600000"),
+        ],
+    );
+    assert_eq!(ran["outcome"], "lost", "{ran}");
+    let error = ran["error"].as_str().unwrap_or_default();
+    assert!(error.contains("provider/network"), "{error}");
+    assert!(
+        error.contains("Timed out waiting for response headers"),
+        "{error}"
+    );
+    assert!(!error.contains("waiting for an approval"), "{error}");
+    let calls = fixture.state("calls.log");
+    assert!(
+        !calls.contains("pane send-keys"),
+        "nothing may be pressed on a provider screen: {calls}"
+    );
+    let task = ran["task_id"].as_str().unwrap();
+    let bodies: String = task_message_bodies(&fixture, task)
+        .into_iter()
+        .map(|(body, _)| body)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(bodies.contains("provider/network"), "{bodies}");
+    assert!(
+        bodies.contains("Timed out waiting for response headers"),
+        "{bodies}"
+    );
+    assert!(
+        !bodies.contains("waiting for an approval"),
+        "an approval note was sent: {bodies}"
+    );
+}
+
+/// An unclassified Herdr status must not hide a provider diagnostic behind the
+/// stillness filter, and it is never the unknown screen.
+#[test]
+fn retrying_unclassified_provider_is_seen_before_stillness() {
+    let fixture = pane_fixture();
+    write_provider_flags(
+        &fixture,
+        &[
+            "no-report",
+            "provider",
+            "provider-unknown",
+            "provider-retry",
+        ],
+    );
+    let ran = fixture.run_on_with_env(
+        "local.opencode",
+        &[],
+        &[
+            ("BRGR_TEST_PROVIDER_LIMIT_MS", "1500"),
+            ("BRGR_TEST_REPORT_GRACE_MS", "600000"),
+        ],
+    );
+    assert_eq!(ran["outcome"], "lost", "{ran}");
+    let error = ran["error"].as_str().unwrap_or_default();
+    assert!(error.contains("provider/network"), "{error}");
+    assert!(!error.contains("no brgr rule answers"), "{error}");
+    assert!(
+        !fixture.state("calls.log").contains("pane send-keys"),
+        "{}",
+        fixture.state("calls.log")
+    );
+}
+
+/// An idle provider error gets no report reminder and no mailbox input.
+#[test]
+fn idle_provider_gets_no_report_reminder_or_mailbox_input() {
+    let fixture = pane_fixture();
+    write_provider_flags(&fixture, &["no-report", "provider", "provider-idle"]);
+    let ran = fixture.run_on_with_env(
+        "local.opencode",
+        &[],
+        &[
+            ("BRGR_TEST_PROVIDER_LIMIT_MS", "1500"),
+            ("BRGR_TEST_REPORT_GRACE_MS", "200"),
+        ],
+    );
+    assert_eq!(ran["outcome"], "lost", "{ran}");
+    let error = ran["error"].as_str().unwrap_or_default();
+    assert!(error.contains("provider/network"), "{error}");
+    assert!(
+        !error.contains("finished without writing its report"),
+        "{error}"
+    );
+    let calls = fixture.state("calls.log");
+    assert_eq!(calls.matches("agent prompt").count(), 1, "{calls}");
+    assert!(!calls.contains("pane send-text"), "{calls}");
+    assert!(!calls.contains("pane send-keys"), "{calls}");
+}
+
+/// A provider error during startup is not a prompt the harness may swallow.
+#[test]
+fn startup_provider_does_not_accept_first_prompt() {
+    let fixture = pane_fixture();
+    write_provider_flags(&fixture, &["provider", "provider-at-startup"]);
+    let ran = fixture.run_on_with_env(
+        "local.opencode",
+        &[],
+        &[
+            ("BRGR_TEST_PROVIDER_LIMIT_MS", "1500"),
+            ("BRGR_TEST_REPORT_GRACE_MS", "600000"),
+        ],
+    );
+    assert_eq!(ran["outcome"], "lost", "{ran}");
+    let error = ran["error"].as_str().unwrap_or_default();
+    assert!(error.contains("provider/network"), "{error}");
+    let calls = fixture.state("calls.log");
+    assert!(!calls.contains("agent prompt"), "{calls}");
+    assert!(!calls.contains("pane send-text"), "{calls}");
+}
+
+/// Retrying to stopped is one transition note, not one per countdown change,
+/// and the terminal reason names the stopped harness.
+#[test]
+fn provider_attention_transitions_replace_notes_without_spam() {
+    let fixture = pane_fixture();
+    write_provider_flags(&fixture, &["no-report", "provider", "provider-flip"]);
+    let ran = fixture.run_on_with_env(
+        "local.opencode",
+        &[],
+        &[
+            ("BRGR_TEST_PROVIDER_LIMIT_MS", "6000"),
+            ("BRGR_TEST_REPORT_GRACE_MS", "600000"),
+        ],
+    );
+    assert_eq!(ran["outcome"], "lost", "{ran}");
+    let error = ran["error"].as_str().unwrap_or_default();
+    assert!(error.contains("harness stopped"), "{error}");
+    let task = ran["task_id"].as_str().unwrap();
+    let notes: Vec<String> = task_message_bodies(&fixture, task)
+        .into_iter()
+        .map(|(body, _)| body)
+        .filter(|body| body.contains("provider/network"))
+        .collect();
+    assert_eq!(
+        notes.len(),
+        2,
+        "expected one retrying and one stopped note: {notes:?}"
+    );
+    assert!(notes.iter().any(|note| note.contains("is retrying")));
+    assert!(
+        notes
+            .iter()
+            .any(|note| note.contains("has stopped retrying"))
+    );
+    assert!(
+        !notes
+            .iter()
+            .any(|note| note.contains("waiting for an approval")),
+        "{notes:?}"
+    );
+    assert!(
+        !fixture.state("calls.log").contains("pane send-keys"),
+        "{}",
+        fixture.state("calls.log")
+    );
+}
+
+/// A provider incident is cleared by fresh screen evidence, and the run then
+/// finishes normally: the report the worker already wrote is sealed.
+#[test]
+fn provider_recovery_allows_existing_run_to_finish() {
+    let fixture = pane_fixture();
+    write_provider_flags(&fixture, &["no-seal", "provider", "provider-recover-after"]);
+    fs::write(fixture.state.join("provider-recover-after"), "1").unwrap();
+    let ran = fixture.run_on_with_env(
+        "local.opencode",
+        &[],
+        &[("BRGR_TEST_REPORT_GRACE_MS", "200")],
+    );
+    assert_eq!(ran["outcome"], "candidate", "{ran}");
+    assert!(
+        !fixture.state("calls.log").contains("pane send-keys"),
+        "{}",
+        fixture.state("calls.log")
+    );
+}
+
+/// A withdrawn transient note is acknowledged at terminal exit; the failure
+/// result itself stays unacknowledged for the owner.
+#[test]
+fn provider_terminal_exit_withdraws_transient_note_not_failure_ack() {
+    let fixture = pane_fixture();
+    write_provider_flags(&fixture, &["no-report", "provider"]);
+    let ran = fixture.run_on_with_env(
+        "local.opencode",
+        &[],
+        &[
+            ("BRGR_TEST_PROVIDER_LIMIT_MS", "1500"),
+            ("BRGR_TEST_REPORT_GRACE_MS", "600000"),
+        ],
+    );
+    assert_eq!(ran["outcome"], "lost", "{ran}");
+    let task = ran["task_id"].as_str().unwrap();
+    let notes = task_message_bodies(&fixture, task);
+    let provider_notes: Vec<_> = notes
+        .iter()
+        .filter(|(body, _)| body.contains("provider/network"))
+        .collect();
+    assert!(!provider_notes.is_empty(), "{notes:?}");
+    assert!(
+        provider_notes.iter().all(|(_, acknowledged)| *acknowledged),
+        "a transient note outlived the run: {provider_notes:?}"
+    );
+    let store = brgr_store::Store::open(fixture.home.join("store")).unwrap();
+    let task_id: brgr_protocol::TaskId = task.parse().unwrap();
+    let owner = store.task(task_id).unwrap().owner_id;
+    let inbox = store.inbox(&owner, false).unwrap();
+    assert!(
+        inbox.iter().any(|item| !item.acknowledged
+            && item.result.outcome == brgr_protocol::TerminalOutcome::Lost),
+        "the failure result must stay unacknowledged: {inbox:?}"
     );
 }
 
@@ -4095,6 +4741,486 @@ fn idle_codex_parent_receives_completion_without_another_user_turn() {
     assert_eq!(fs::read_to_string(prompts).unwrap(), prompt);
 }
 
+fn write_codex_notice_herdr(herdr: &Path, flip_to_working: bool) {
+    let prompt = if flip_to_working {
+        "'agent prompt') printf '%s\\n' \"$4\" >> \"$BRGR_TEST_PROMPTS\"; printf working > \"$BRGR_TEST_AGENT_STATE\"; printf '{}\\n';;"
+    } else {
+        "'agent prompt') printf '%s\\n' \"$4\" >> \"$BRGR_TEST_PROMPTS\"; printf '{}\\n';;"
+    };
+    write_fast_script(
+        herdr,
+        &format!(
+            "#!/bin/sh\nif [ \"$1\" = --session ]; then shift 2; fi\ncase \"$1 $2\" in\n 'agent get') state=$(/bin/cat \"$BRGR_TEST_AGENT_STATE\"); printf '{{\"result\":{{\"agent\":{{\"agent\":\"codex\",\"pane_id\":\"w1:p1\",\"agent_status\":\"%s\",\"agent_session\":{{\"value\":\"session-a\"}}}}}}}}\\n' \"$state\";;\n {prompt}\n *) exit 2;;\nesac\n"
+        ),
+    );
+}
+
+fn codex_notice_envs<'a>(
+    herdr: &'a str,
+    agent_state: &'a str,
+    prompts: &'a str,
+) -> [(&'a str, &'a str); 10] {
+    [
+        ("CODEX_THREAD_ID", "session-a"),
+        ("BRGR_OWNER_ID", "codex:session-a"),
+        ("BRGR_SESSION_ID", "session-a"),
+        ("HERDR_ENV", "1"),
+        ("HERDR_PANE_ID", "w1:p1"),
+        ("HERDR_WORKSPACE_ID", "w1"),
+        ("HERDR_BIN_PATH", herdr),
+        ("HERDR_SESSION", "fixture-herdr"),
+        ("BRGR_TEST_AGENT_STATE", agent_state),
+        ("BRGR_TEST_PROMPTS", prompts),
+    ]
+}
+
+fn wait_for_sealed(store: &brgr_store::Store, task: &str) {
+    assert!(
+        wait_until(|| store.latest_result(task.parse().unwrap()).is_ok()),
+        "the run never sealed a result"
+    );
+}
+
+fn launch_ok(home: &Path, workspace: &Path, envs: &[(&str, &str)]) -> String {
+    json_output(&run(
+        home,
+        &[
+            "run",
+            "BRGR_FIXTURE_OK",
+            "--workspace",
+            workspace.to_str().unwrap(),
+        ],
+        envs,
+    ))["task_id"]
+        .as_str()
+        .unwrap()
+        .to_owned()
+}
+
+fn from_brgr_count(text: &str) -> usize {
+    text.matches("FROM BRGR").count()
+}
+
+fn notice_json_lines(text: &str) -> Vec<Value> {
+    text.split("FROM BRGR")
+        .filter_map(|part| {
+            let line = part
+                .lines()
+                .map(str::trim)
+                .find(|line| line.starts_with('{'))?;
+            serde_json::from_str(line).ok()
+        })
+        .collect()
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    let mut child = Command::new("/usr/bin/shasum")
+        .args(["-a", "256"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(bytes).unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(output.status.success(), "shasum failed: {output:?}");
+    String::from_utf8(output.stdout)
+        .unwrap()
+        .split_whitespace()
+        .next()
+        .unwrap()
+        .to_owned()
+}
+
+fn clone_registered_harness(home: &Path, from_id: &str, to_id: &str) {
+    let mut manifest: Value = serde_json::from_slice(
+        &fs::read(
+            home.join("registry")
+                .join("manifests")
+                .join(format!("{from_id}.json")),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    manifest["id"] = json!(to_id);
+    let manifest_bytes = serde_json::to_vec_pretty(&manifest).unwrap();
+    let digest = sha256_hex(&manifest_bytes);
+    fs::write(
+        home.join("registry")
+            .join("manifests")
+            .join(format!("{to_id}.json")),
+        &manifest_bytes,
+    )
+    .unwrap();
+    let mut activation: Value = serde_json::from_slice(
+        &fs::read(
+            home.join("registry")
+                .join("activations")
+                .join(format!("{from_id}.json")),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    activation["harness_id"] = json!(to_id);
+    activation["manifest_digest"] = json!(digest);
+    fs::write(
+        home.join("registry")
+            .join("activations")
+            .join(format!("{to_id}.json")),
+        serde_json::to_vec_pretty(&activation).unwrap(),
+    )
+    .unwrap();
+}
+
+fn add_failing_fixture(home: &Path, temp: &Path) -> PathBuf {
+    let executable = temp.join("fixture");
+    write_fast_script(
+        &executable,
+        "#!/bin/sh\ncase \"$1\" in\n --version) echo 'fixture v-failed-notice-fixture'; exit 0;;\n --help) printf '%s\\n' '-p, --print' '--mode=<value>' '--no-session' '--no-mcp' '--model' '--thinking'; exit 0;;\nesac\nfor item in \"$@\"; do case \"$item\" in @*) prompt=${item#@};; esac; done\nif /usr/bin/grep -q BRGR_FIXTURE_OK \"$prompt\"; then\n printf '%s\\n' '{\"type\":\"message_end\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"BRGR_FIXTURE_OK\"}]}}'\n printf '%s\\n' '{\"type\":\"agent_end\",\"stopReason\":\"completed\"}'\nelse\n exit 7\nfi\n",
+    );
+    add_fixture(home, &executable, &temp.join("scratch"));
+    executable
+}
+
+#[test]
+fn completions_that_finish_together_reach_the_owner_in_one_notice() {
+    let temp = TempDir::new().unwrap();
+    let home = temp.path().join("brgr");
+    let workspace = temp.path().join("work");
+    let herdr = temp.path().join("herdr");
+    let agent_state = temp.path().join("agent-state");
+    let prompts = temp.path().join("prompts");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::write(&agent_state, "working").unwrap();
+    write_codex_notice_herdr(&herdr, true);
+    add_fixture(&home, &brgr_fixture(), &temp.path().join("scratch"));
+    let herdr_s = herdr.to_str().unwrap();
+    let agent_s = agent_state.to_str().unwrap();
+    let prompts_s = prompts.to_str().unwrap();
+    let envs = codex_notice_envs(herdr_s, agent_s, prompts_s);
+    let a = launch_ok(&home, &workspace, &envs);
+    let b = launch_ok(&home, &workspace, &envs);
+    let c = launch_ok(&home, &workspace, &envs);
+    let store = brgr_store::Store::open(home.join("store")).unwrap();
+    wait_for_sealed(&store, &a);
+    wait_for_sealed(&store, &b);
+    wait_for_sealed(&store, &c);
+    thread::sleep(Duration::from_millis(700));
+    assert!(!prompts.exists(), "busy Codex parent was prompted");
+    fs::write(&agent_state, "idle").unwrap();
+    let prompt = delivered_prompt(&prompts, |text| text.contains("FROM BRGR"))
+        .expect("completion was not delivered");
+    thread::sleep(Duration::from_millis(700));
+    let text = fs::read_to_string(&prompts).unwrap();
+    assert_eq!(from_brgr_count(&text), 1, "{text}");
+    for task in [&a, &b, &c] {
+        assert_eq!(
+            text.matches(task.as_str()).count(),
+            1,
+            "task {task} is not named exactly once in the one notice: {text}"
+        );
+        assert!(
+            wait_until(|| store
+                .pending_notifications_for_task(task.parse().unwrap())
+                .unwrap()
+                .is_empty()),
+            "the delivered completion stayed pending"
+        );
+    }
+    assert!(prompt.contains("\"type\":\"brgr_completions\""), "{prompt}");
+    assert!(prompt.contains("\"count\":3"), "{prompt}");
+}
+
+#[test]
+fn a_completion_that_lands_while_the_owner_is_busy_arrives_at_the_next_idle() {
+    let temp = TempDir::new().unwrap();
+    let home = temp.path().join("brgr");
+    let workspace = temp.path().join("work");
+    let herdr = temp.path().join("herdr");
+    let agent_state = temp.path().join("agent-state");
+    let prompts = temp.path().join("prompts");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::write(&agent_state, "working").unwrap();
+    write_codex_notice_herdr(&herdr, true);
+    add_fixture(&home, &brgr_fixture(), &temp.path().join("scratch"));
+    let herdr_s = herdr.to_str().unwrap();
+    let agent_s = agent_state.to_str().unwrap();
+    let prompts_s = prompts.to_str().unwrap();
+    let envs = codex_notice_envs(herdr_s, agent_s, prompts_s);
+    let a = launch_ok(&home, &workspace, &envs);
+    let store = brgr_store::Store::open(home.join("store")).unwrap();
+    wait_for_sealed(&store, &a);
+    fs::write(&agent_state, "idle").unwrap();
+    delivered_prompt(&prompts, |text| text.contains(&a)).expect("A was not delivered");
+    let b = launch_ok(&home, &workspace, &envs);
+    let c = launch_ok(&home, &workspace, &envs);
+    wait_for_sealed(&store, &b);
+    wait_for_sealed(&store, &c);
+    thread::sleep(Duration::from_millis(700));
+    let first = fs::read_to_string(&prompts).unwrap();
+    assert_eq!(from_brgr_count(&first), 1, "{first}");
+    fs::write(&agent_state, "idle").unwrap();
+    let text = delivered_prompt(&prompts, |content| from_brgr_count(content) >= 2)
+        .expect("the second notice was not delivered");
+    thread::sleep(Duration::from_millis(700));
+    let text = fs::read_to_string(&prompts).unwrap_or(text);
+    assert_eq!(from_brgr_count(&text), 2, "{text}");
+    assert_eq!(text.matches(a.as_str()).count(), 1, "{text}");
+    assert_eq!(text.matches(b.as_str()).count(), 1, "{text}");
+    assert_eq!(text.matches(c.as_str()).count(), 1, "{text}");
+    let notices = notice_json_lines(&text);
+    assert_eq!(notices.len(), 2, "{text}");
+    assert!(
+        notices[1]["task_id"] == b
+            || notices[1]["task_id"] == c
+            || notices[1]["type"] == "brgr_completions"
+    );
+}
+
+#[test]
+fn an_owner_that_stays_idle_gets_each_completion_exactly_once() {
+    let temp = TempDir::new().unwrap();
+    let home = temp.path().join("brgr");
+    let workspace = temp.path().join("work");
+    let herdr = temp.path().join("herdr");
+    let agent_state = temp.path().join("agent-state");
+    let prompts = temp.path().join("prompts");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::write(&agent_state, "working").unwrap();
+    write_codex_notice_herdr(&herdr, false);
+    add_fixture(&home, &brgr_fixture(), &temp.path().join("scratch"));
+    let herdr_s = herdr.to_str().unwrap();
+    let agent_s = agent_state.to_str().unwrap();
+    let prompts_s = prompts.to_str().unwrap();
+    let envs = codex_notice_envs(herdr_s, agent_s, prompts_s);
+    let a = launch_ok(&home, &workspace, &envs);
+    let b = launch_ok(&home, &workspace, &envs);
+    let store = brgr_store::Store::open(home.join("store")).unwrap();
+    wait_for_sealed(&store, &a);
+    wait_for_sealed(&store, &b);
+    fs::write(&agent_state, "idle").unwrap();
+    let first = delivered_prompt(&prompts, |text| text.contains(&a) && text.contains(&b))
+        .expect("the first notice was not delivered");
+    assert_eq!(from_brgr_count(&first), 1, "{first}");
+    let c = launch_ok(&home, &workspace, &envs);
+    wait_for_sealed(&store, &c);
+    let text = delivered_prompt(&prompts, |content| from_brgr_count(content) >= 2)
+        .expect("C was not delivered");
+    thread::sleep(Duration::from_millis(700));
+    let text = fs::read_to_string(&prompts).unwrap_or(text);
+    assert_eq!(from_brgr_count(&text), 2, "{text}");
+    let notices = notice_json_lines(&text);
+    assert_eq!(notices.len(), 2, "{text}");
+    assert!(notices[1].to_string().contains(&c), "{text}");
+    assert!(!notices[1].to_string().contains(&a), "{text}");
+    assert!(!notices[1].to_string().contains(&b), "{text}");
+    for task in [&a, &b, &c] {
+        let result = store.latest_result(task.parse().unwrap()).unwrap();
+        assert_eq!(
+            text.matches(&result.result_id.to_string()).count(),
+            1,
+            "completion_id for {task} was not unique: {text}"
+        );
+    }
+}
+
+#[test]
+fn a_failed_run_in_a_batch_keeps_its_outcome_and_reason() {
+    let temp = TempDir::new().unwrap();
+    let home = temp.path().join("brgr");
+    let workspace = temp.path().join("work");
+    let herdr = temp.path().join("herdr");
+    let agent_state = temp.path().join("agent-state");
+    let prompts = temp.path().join("prompts");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::write(&agent_state, "working").unwrap();
+    write_codex_notice_herdr(&herdr, true);
+    add_failing_fixture(&home, temp.path());
+    let herdr_s = herdr.to_str().unwrap();
+    let agent_s = agent_state.to_str().unwrap();
+    let prompts_s = prompts.to_str().unwrap();
+    let envs = codex_notice_envs(herdr_s, agent_s, prompts_s);
+    let ok = launch_ok(&home, &workspace, &envs);
+    let fail = json_output(&run(
+        &home,
+        &["run", "FAIL", "--workspace", workspace.to_str().unwrap()],
+        &envs,
+    ))["task_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let store = brgr_store::Store::open(home.join("store")).unwrap();
+    wait_for_sealed(&store, &ok);
+    wait_for_sealed(&store, &fail);
+    fs::write(&agent_state, "idle").unwrap();
+    let prompt = delivered_prompt(&prompts, |text| text.contains("FROM BRGR"))
+        .expect("the batch was not delivered");
+    let notices = notice_json_lines(&prompt);
+    assert_eq!(notices.len(), 1, "{prompt}");
+    let body = &notices[0];
+    assert_eq!(body["type"], "brgr_completions", "{prompt}");
+    let entries = body["completions"].as_array().unwrap();
+    let failed = entries
+        .iter()
+        .find(|entry| entry["task_id"] == fail)
+        .unwrap();
+    let candidate = entries.iter().find(|entry| entry["task_id"] == ok).unwrap();
+    assert_eq!(failed["outcome"], "failed");
+    assert!(
+        failed["reason"]
+            .as_str()
+            .is_some_and(|reason| !reason.is_empty()),
+        "{failed}"
+    );
+    assert_eq!(candidate["outcome"], "candidate");
+    assert!(candidate.get("reason").is_none() || candidate["reason"].is_null());
+}
+
+/// The owner's shell appends a prompt longer than its write buffer in more than
+/// one write, so `FROM BRGR` is visible before the JSON line is complete. A
+/// wait on that prefix used to hand the notice tests a partial read, which
+/// parsed as zero notices.
+#[test]
+fn a_notice_is_not_delivered_until_its_json_line_is_complete() {
+    let temp = TempDir::new().unwrap();
+    let prompts = temp.path().join("prompts");
+    let body = format!(
+        "FROM BRGR\n{}",
+        json!({
+            "type": "brgr_completions",
+            "count": 1,
+            "completions": [{"task_id": "7b6f4c4e-8a5f-4c5f-9c1a-2f0f3f4f5f6f", "outcome": "failed"}],
+        })
+    );
+    // The first write ends inside the JSON line, as the shell's buffer cutoff
+    // does, and the second write lands while the wait is still polling.
+    let split = body.find('{').unwrap() + 10;
+    fs::write(&prompts, &body[..split]).unwrap();
+    let writer = {
+        let prompts = prompts.clone();
+        let rest = body[split..].to_owned();
+        thread::spawn(move || {
+            thread::sleep(Duration::from_millis(400));
+            let mut file = fs::OpenOptions::new().append(true).open(&prompts).unwrap();
+            file.write_all(rest.as_bytes()).unwrap();
+        })
+    };
+    let prompt = delivered_prompt(&prompts, |text| text.contains("FROM BRGR"))
+        .expect("the notice was not delivered");
+    writer.join().unwrap();
+    let notices = notice_json_lines(&prompt);
+    assert_eq!(notices.len(), 1, "read a partly written notice: {prompt:?}");
+    assert_eq!(notices[0]["type"], "brgr_completions", "{prompt}");
+}
+
+#[test]
+fn a_result_decided_before_the_owner_is_idle_is_left_out_of_the_notice() {
+    let temp = TempDir::new().unwrap();
+    let home = temp.path().join("brgr");
+    let workspace = temp.path().join("work");
+    let herdr = temp.path().join("herdr");
+    let agent_state = temp.path().join("agent-state");
+    let prompts = temp.path().join("prompts");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::write(&agent_state, "working").unwrap();
+    write_codex_notice_herdr(&herdr, true);
+    add_fixture(&home, &brgr_fixture(), &temp.path().join("scratch"));
+    let herdr_s = herdr.to_str().unwrap();
+    let agent_s = agent_state.to_str().unwrap();
+    let prompts_s = prompts.to_str().unwrap();
+    let envs = codex_notice_envs(herdr_s, agent_s, prompts_s);
+    let a = launch_ok(&home, &workspace, &envs);
+    let b = launch_ok(&home, &workspace, &envs);
+    let c = launch_ok(&home, &workspace, &envs);
+    let store = brgr_store::Store::open(home.join("store")).unwrap();
+    wait_for_sealed(&store, &a);
+    wait_for_sealed(&store, &b);
+    wait_for_sealed(&store, &c);
+    json_output(&run(
+        &home,
+        &["accept", &a, "--reason", "looks good"],
+        &envs,
+    ));
+    fs::write(&agent_state, "idle").unwrap();
+    let prompt = delivered_prompt(&prompts, |text| text.contains("FROM BRGR"))
+        .expect("the remaining completions were not delivered");
+    thread::sleep(Duration::from_millis(700));
+    let text = fs::read_to_string(&prompts).unwrap_or(prompt);
+    assert!(!text.contains(&a), "{text}");
+    assert_eq!(text.matches(b.as_str()).count(), 1, "{text}");
+    assert_eq!(text.matches(c.as_str()).count(), 1, "{text}");
+}
+
+#[test]
+fn a_harness_with_notifications_off_is_left_out_of_a_batch() {
+    let temp = TempDir::new().unwrap();
+    let home = temp.path().join("brgr");
+    let workspace = temp.path().join("work");
+    let herdr = temp.path().join("herdr");
+    let agent_state = temp.path().join("agent-state");
+    let prompts = temp.path().join("prompts");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::write(&agent_state, "working").unwrap();
+    write_codex_notice_herdr(&herdr, true);
+    add_fixture(&home, &brgr_fixture(), &temp.path().join("scratch"));
+    clone_registered_harness(&home, "local.fixture", "local.other");
+    set_dispatcher_notifications(&home, false);
+    let herdr_s = herdr.to_str().unwrap();
+    let agent_s = agent_state.to_str().unwrap();
+    let prompts_s = prompts.to_str().unwrap();
+    let envs = codex_notice_envs(herdr_s, agent_s, prompts_s);
+    let disabled = json_output(&run(
+        &home,
+        &[
+            "run",
+            "BRGR_FIXTURE_OK",
+            "--workspace",
+            workspace.to_str().unwrap(),
+            "--harness",
+            "local.fixture",
+        ],
+        &envs,
+    ))["task_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let enabled = json_output(&run(
+        &home,
+        &[
+            "run",
+            "BRGR_FIXTURE_OK",
+            "--workspace",
+            workspace.to_str().unwrap(),
+            "--harness",
+            "local.other",
+        ],
+        &envs,
+    ))["task_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let store = brgr_store::Store::open(home.join("store")).unwrap();
+    wait_for_sealed(&store, &disabled);
+    wait_for_sealed(&store, &enabled);
+    fs::write(&agent_state, "idle").unwrap();
+    let prompt = delivered_prompt(&prompts, |text| text.contains("FROM BRGR"))
+        .expect("the enabled completion was not delivered");
+    thread::sleep(Duration::from_millis(700));
+    let text = fs::read_to_string(&prompts).unwrap_or(prompt);
+    assert_eq!(from_brgr_count(&text), 1, "{text}");
+    let notices = notice_json_lines(&text);
+    assert_eq!(notices[0]["type"], "brgr_completion", "{text}");
+    assert_eq!(notices[0]["task_id"], enabled, "{text}");
+    assert!(!text.contains(&disabled), "{text}");
+    assert_eq!(
+        store
+            .pending_notifications_for_task(disabled.parse().unwrap())
+            .unwrap()
+            .len(),
+        1,
+        "the disabled harness notice should stay pending"
+    );
+}
+
 #[test]
 fn idle_codex_parent_is_told_a_run_failed_with_its_reason() {
     let temp = TempDir::new().unwrap();
@@ -5904,6 +7030,105 @@ fn harness_add_prints_the_registered_symlink_it_stored() {
     assert_eq!(printed, activation_receipt(&home));
 }
 
+#[test]
+fn harness_list_shows_each_registered_harness_id_executable_version_and_health() {
+    let temp = TempDir::new().unwrap();
+    let home = temp.path().join("brgr");
+    let fixture = brgr_fixture();
+    add_fixture(&home, &fixture, &temp.path().join("scratch"));
+
+    let listed = json_output(&run(&home, &["harness", "list"], &[]));
+    let harnesses = listed
+        .as_array()
+        .expect("harness list is a JSON array of registered harnesses");
+    assert_eq!(harnesses.len(), 1, "{listed}");
+    assert_eq!(harnesses[0]["id"], "local.fixture");
+    assert_eq!(
+        harnesses[0]["executable"].as_str().unwrap(),
+        fixture.to_str().unwrap()
+    );
+    assert_eq!(harnesses[0]["version"], "fixture v-fixture");
+    assert_eq!(harnesses[0]["health"], "healthy");
+
+    let doctor = run(&home, &["doctor"], &[]);
+    let report: Value = serde_json::from_slice(&doctor.stdout).unwrap();
+    assert_eq!(listed, report["harnesses"]);
+}
+
+#[test]
+fn harness_add_without_workspace_creates_and_removes_a_temporary_git_scratch() {
+    let temp = TempDir::new().unwrap();
+    let home = temp.path().join("brgr");
+    let executable = temp.path().join("fixture");
+    fs::write(
+        &executable,
+        "#!/bin/sh\n\
+case \"$1\" in\n\
+  --version) printf 'fixture v-fixture\\n'; exit 0;;\n\
+  --help)\n\
+    printf '%s\\n' '-p, --print' '--mode=<value>' '--no-session' '--no-mcp' '--model' '--thinking'\n\
+    exit 0;;\n\
+esac\n\
+printf '%s\\n' \"$PWD\" > \"$0.workspace\"\n\
+/usr/bin/git rev-parse --is-inside-work-tree > \"$0.git\"\n\
+/usr/bin/git rev-parse HEAD > \"$0.head\"\n\
+printf '%s\\n' '{\"type\":\"message_end\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"ok\"}]}}'\n\
+printf '%s\\n' '{\"type\":\"agent_end\",\"stopReason\":\"completed\"}'\n",
+    )
+    .unwrap();
+    fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+
+    let receipt = json_output(&run(
+        &home,
+        &["harness", "add", executable.to_str().unwrap()],
+        &[],
+    ));
+    assert!(
+        receipt["scratch_result_digest"].as_str().is_some(),
+        "{receipt}"
+    );
+
+    let marker = |suffix: &str| {
+        let mut name = executable.file_name().unwrap().to_os_string();
+        name.push(suffix);
+        executable.with_file_name(name)
+    };
+    let workspace = fs::read_to_string(marker(".workspace")).unwrap();
+    let workspace = workspace.trim();
+    assert!(
+        !Path::new(workspace).exists(),
+        "temporary scratch {workspace} was left behind"
+    );
+    assert_eq!(fs::read_to_string(marker(".git")).unwrap().trim(), "true");
+    let head = fs::read_to_string(marker(".head")).unwrap();
+    assert!(
+        head.trim().len() >= 40 && head.trim().bytes().all(|byte| byte.is_ascii_hexdigit()),
+        "{head}"
+    );
+}
+
+#[test]
+fn harness_add_help_documents_workspace_and_prompt() {
+    let output = brgr_command()
+        .args(["harness", "add", "--help"])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("--workspace"), "{stdout}");
+    assert!(stdout.contains("--prompt"), "{stdout}");
+    let lower = stdout.to_ascii_lowercase();
+    assert!(
+        lower.contains("optional") || lower.contains("omit") || lower.contains("default"),
+        "{stdout}"
+    );
+    assert!(lower.contains("git"), "{stdout}");
+    assert!(
+        lower.contains("does not") || lower.contains("not modify") || lower.contains("delete"),
+        "{stdout}"
+    );
+}
+
 /// A re-certification while the certified path still exists (the CLI was
 /// updated in place) keeps the symlink the harness was registered through,
 /// so a later upgrade that deletes the versioned directory can still follow it.
@@ -6613,14 +7838,6 @@ fn named_process_harness_cannot_activate_without_authorized_scratch() {
     let temp = TempDir::new().unwrap();
     let home = temp.path().join("brgr");
     let fixture = brgr_fixture();
-    let denied = run(&home, &["harness", "add", fixture.to_str().unwrap()], &[]);
-    assert!(!denied.status.success());
-    assert!(
-        !home
-            .join("registry/activations/local.fixture.json")
-            .exists()
-    );
-
     let unsafe_scratch = home.join("store");
     fs::create_dir_all(&unsafe_scratch).unwrap();
     let overlapping = run(
@@ -11906,73 +13123,6 @@ fn as_session_ignores_another_sessions_stale_owner_identity() {
     );
 }
 
-/// Registers `local.gjc` the way an installation from before its removal has it.
-fn register_removed_harness(home: &Path) {
-    for directory in ["manifests", "activations"] {
-        let directory = home.join("registry").join(directory);
-        fs::copy(
-            directory.join("local.fixture.json"),
-            directory.join("local.gjc.json"),
-        )
-        .unwrap();
-    }
-}
-
-#[test]
-fn a_run_on_a_registered_gjc_is_refused_without_creating_a_task() {
-    let (_temp, home, workspace) = fixture_home();
-    register_removed_harness(&home);
-    let output = run(
-        &home,
-        &[
-            "run",
-            "BRGR_FIXTURE_OK",
-            "--harness",
-            "local.gjc",
-            "--workspace",
-            workspace.to_str().unwrap(),
-        ],
-        &[("BRGR_OWNER_ID", "codex:removed-harness")],
-    );
-    assert!(!output.status.success());
-    assert!(
-        String::from_utf8_lossy(&output.stderr).contains("support for GJC was removed"),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let status = run(
-        &home,
-        &["status"],
-        &[("BRGR_OWNER_ID", "codex:removed-harness")],
-    );
-    assert!(
-        !String::from_utf8_lossy(&status.stdout).contains("local.gjc"),
-        "{}",
-        String::from_utf8_lossy(&status.stdout)
-    );
-}
-
-#[test]
-fn doctor_does_not_report_a_registered_gjc() {
-    let (_temp, home, _workspace) = fixture_home();
-    register_removed_harness(&home);
-    let output = run(&home, &["doctor"], &[]);
-    let text = String::from_utf8_lossy(&output.stdout);
-    assert!(!text.contains("local.gjc"), "{text}");
-    assert!(text.contains("local.fixture"), "{text}");
-}
-
-#[test]
-fn a_config_section_for_gjc_keeps_loading() {
-    let (_temp, home, _workspace) = fixture_home();
-    let config = home.join("config.toml");
-    let mut text = fs::read_to_string(&config).unwrap_or_default();
-    text.push_str("\n[harnesses.\"local.gjc\"]\nmodel = \"openai-codex/gpt-6-luna\"\nargv = []\n");
-    fs::write(&config, text).unwrap();
-    json_output(&run(&home, &["config", "show"], &[]));
-    json_output(&run(&home, &["config", "check"], &[]));
-}
-
 /// The internal commands a dead home's launchers can still fire (issue #350)
 /// exit quietly and create nothing; `Paths::new` is never reached.
 #[test]
@@ -12034,4 +13184,326 @@ fn a_user_command_for_a_missing_home_still_creates_it() {
     let home = temp.path().join("missing-home");
     run(&home, &["status", "--brief"], &[]);
     assert!(home.is_dir());
+}
+
+const CLAUDE_ON_FIXTURE: &str = "litellm/claude-fable-5-2";
+
+fn launch_file_count(home: &Path) -> usize {
+    fs::read_dir(home.join("launches")).map_or(0, Iterator::count)
+}
+
+fn stored_task_count(home: &Path) -> usize {
+    brgr_store::Store::open(home.join("store"))
+        .ok()
+        .and_then(|store| store.tasks(32).ok())
+        .map_or(0, |tasks| tasks.len())
+}
+
+fn allow_claude_on_any_harness(home: &Path) {
+    json_output(&run(home, &["config", "set", "claude-route", "any"], &[]));
+}
+
+fn save_fable_alias(home: &Path) {
+    let path = home.join("config.toml");
+    let mut text = fs::read_to_string(&path).unwrap_or_default();
+    if !text.contains("[aliases.fable]") {
+        write!(
+            text,
+            "\n[aliases.fable]\nharness = \"local.fixture\"\nmodel = \"{CLAUDE_ON_FIXTURE}\"\n"
+        )
+        .unwrap();
+        fs::write(path, text).unwrap();
+    }
+}
+
+fn refused_claude_on_fixture(model: &str, alias: Option<&str>) -> String {
+    let alias = alias.map_or(String::new(), |name| format!(" (alias {name})"));
+    format!(
+        "claude-route is claude-code-only: Claude model `{model}`{alias} cannot run on local.fixture. Use `--harness local.claude-code` with a model it accepts, or allow other harnesses with `brgr config set claude-route any`. Nothing was started and no other harness was chosen."
+    )
+}
+
+#[test]
+fn a_claude_model_on_another_harness_is_refused_before_admission() {
+    let (_temp, home, workspace) = fixture_home();
+    let output = run(
+        &home,
+        &[
+            "run",
+            "BRGR_FIXTURE_OK",
+            "--harness",
+            "local.fixture",
+            "--model",
+            CLAUDE_ON_FIXTURE,
+            "--workspace",
+            workspace.to_str().unwrap(),
+        ],
+        &[("BRGR_OWNER_ID", "codex:claude-route")],
+    );
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains(&refused_claude_on_fixture(CLAUDE_ON_FIXTURE, None)),
+        "{stderr}"
+    );
+    assert_eq!(launch_file_count(&home), 0);
+    assert_eq!(stored_task_count(&home), 0);
+}
+
+#[test]
+fn the_refusal_also_applies_through_an_alias() {
+    let (_temp, home, workspace) = fixture_home();
+    allow_claude_on_any_harness(&home);
+    save_fable_alias(&home);
+    json_output(&run(
+        &home,
+        &["config", "set", "claude-route", "claude-code-only"],
+        &[],
+    ));
+    let output = run(
+        &home,
+        &[
+            "run",
+            "BRGR_FIXTURE_OK",
+            "--use",
+            "fable",
+            "--workspace",
+            workspace.to_str().unwrap(),
+        ],
+        &[("BRGR_OWNER_ID", "codex:claude-route")],
+    );
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains(&refused_claude_on_fixture(CLAUDE_ON_FIXTURE, Some("fable"))),
+        "{stderr}"
+    );
+    assert_eq!(launch_file_count(&home), 0);
+    assert_eq!(stored_task_count(&home), 0);
+}
+
+#[test]
+fn claude_route_any_admits_the_same_run() {
+    let (_temp, home, workspace) = fixture_home();
+    allow_claude_on_any_harness(&home);
+    save_fable_alias(&home);
+    let launched = json_output(&run(
+        &home,
+        &[
+            "run",
+            "BRGR_FIXTURE_OK",
+            "--use",
+            "fable",
+            "--workspace",
+            workspace.to_str().unwrap(),
+            "--foreground",
+        ],
+        &[("BRGR_OWNER_ID", "codex:claude-route")],
+    ));
+    assert!(launched["task_id"].as_str().is_some(), "{launched}");
+}
+
+#[test]
+fn a_claude_model_on_claude_code_is_admitted_under_either_setting() {
+    let temp = TempDir::new().unwrap();
+    let home = temp.path().join("brgr");
+    let workspace = temp.path().join("work");
+    let bin = temp.path().join("bin");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&bin).unwrap();
+    write_fast_script(&bin.join("claude"), CLAUDE_FIXTURE);
+    add_fixture(&home, &bin.join("claude"), &temp.path().join("scratch"));
+    let owner = [("BRGR_OWNER_ID", "codex:claude-route")];
+    for setting in [None, Some("any")] {
+        if let Some(value) = setting {
+            json_output(&run(&home, &["config", "set", "claude-route", value], &[]));
+        }
+        let launched = json_output(&run(
+            &home,
+            &[
+                "run",
+                "BRGR_FIXTURE_OK",
+                "--harness",
+                "local.claude-code",
+                "--model",
+                "sonnet",
+                "--workspace",
+                workspace.to_str().unwrap(),
+                "--foreground",
+            ],
+            &owner,
+        ));
+        let task = launched["task_id"].as_str().expect("admitted task");
+        let detail = json_output(&run(
+            &home,
+            &["status", task, "--verbose", "--observe"],
+            &owner,
+        ));
+        assert_eq!(
+            detail["task"]["route"]["harness_id"], "local.claude-code",
+            "{detail}"
+        );
+        assert_eq!(detail["task"]["route"]["requested_model"], "sonnet");
+    }
+}
+
+#[test]
+fn a_refused_route_does_not_recertify_the_harness() {
+    let (_temp, home, workspace) = drifted_fixture_home();
+    json_output(&run(&home, &["config", "set-auto-recertify", "true"], &[]));
+    let refused = run(
+        &home,
+        &[
+            "run",
+            "BRGR_FIXTURE_OK",
+            "--harness",
+            "local.fixture",
+            "--model",
+            CLAUDE_ON_FIXTURE,
+            "--workspace",
+            workspace.to_str().unwrap(),
+            "--foreground",
+        ],
+        &[("BRGR_OWNER_ID", "codex:claude-route")],
+    );
+    assert!(!refused.status.success());
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(
+        stderr.contains("claude-route is claude-code-only"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("re-certifying"), "{stderr}");
+    assert!(!stderr.contains("scratch run"), "{stderr}");
+    let health = json_output(&run(&home, &["harness", "status", "local.fixture"], &[]));
+    assert_ne!(health["health"], "healthy", "{health}");
+    assert_eq!(launch_file_count(&home), 0);
+    assert_eq!(stored_task_count(&home), 0);
+}
+
+#[test]
+fn revising_a_task_whose_route_is_no_longer_allowed_is_refused() {
+    let (_temp, home, workspace) = fixture_home();
+    let owner = [("BRGR_OWNER_ID", "codex:claude-route")];
+    allow_claude_on_any_harness(&home);
+    save_fable_alias(&home);
+    let launched = json_output(&run(
+        &home,
+        &[
+            "run",
+            "BRGR_FIXTURE_OK",
+            "--use",
+            "fable",
+            "--workspace",
+            workspace.to_str().unwrap(),
+            "--foreground",
+        ],
+        &owner,
+    ));
+    let task = launched["task_id"].as_str().unwrap();
+    // A fixture run with a Claude model that is not in the catalog finishes
+    // failed (JSONL identity). Failed and lost results are revisable;
+    // a candidate needs reject first. Ignore whichever of those applies.
+    let _ = run(
+        &home,
+        &["reject", task, "--reason", "tighten the route"],
+        &owner,
+    );
+    json_output(&run(
+        &home,
+        &["config", "set", "claude-route", "claude-code-only"],
+        &[],
+    ));
+    let revised = run(
+        &home,
+        &[
+            "revise",
+            task,
+            "BRGR_FIXTURE_OK again",
+            "--workspace",
+            workspace.to_str().unwrap(),
+        ],
+        &owner,
+    );
+    assert!(!revised.status.success());
+    let stderr = String::from_utf8_lossy(&revised.stderr);
+    assert!(
+        stderr.contains(&format!(
+            "claude-route is claude-code-only: Claude model `{CLAUDE_ON_FIXTURE}` cannot run on local.fixture. A revision keeps its route: start a new task on `local.claude-code`, or allow other harnesses with `brgr config set claude-route any`. Nothing was started and no other harness was chosen."
+        )),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn a_workflow_step_on_a_refused_route_is_refused_and_records_no_step() {
+    let (_temp, home, workspace) = fixture_home();
+    seed_git_repo(&workspace);
+    let owner = [
+        ("BRGR_OWNER_ID", "codex:claude-route"),
+        ("BRGR_SESSION_ID", "workflow-session"),
+    ];
+    let created = json_output(&run(&home, &["workflow", "create"], &owner));
+    let run_id = created["run_id"].as_str().unwrap();
+    let refused = run(
+        &home,
+        &[
+            "run",
+            "BRGR_FIXTURE_OK",
+            "--harness",
+            "local.fixture",
+            "--model",
+            CLAUDE_ON_FIXTURE,
+            "--workspace",
+            workspace.to_str().unwrap(),
+            "--workflow",
+            run_id,
+            "--step",
+            "fetch",
+        ],
+        &owner,
+    );
+    assert!(!refused.status.success());
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("claude-route is claude-code-only"),
+        "{}",
+        String::from_utf8_lossy(&refused.stderr)
+    );
+    let status = json_output(&run(&home, &["workflow", "status", run_id], &owner));
+    assert_eq!(
+        status["steps"].as_array().map(Vec::len),
+        Some(0),
+        "{status}"
+    );
+    assert_eq!(launch_file_count(&home), 0);
+    assert_eq!(stored_task_count(&home), 0);
+}
+
+#[test]
+fn tightening_claude_route_warns_about_saved_routes_and_keeps_them() {
+    let (_temp, home, _workspace) = fixture_home();
+    allow_claude_on_any_harness(&home);
+    save_fable_alias(&home);
+    let tightened = run(
+        &home,
+        &["config", "set", "claude-route", "claude-code-only"],
+        &[],
+    );
+    assert!(
+        tightened.status.success(),
+        "{}",
+        String::from_utf8_lossy(&tightened.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&tightened.stderr);
+    assert!(
+        stderr.contains(
+            "brgr: claude-route is now claude-code-only; these saved routes will be refused and were left unchanged: alias fable (local.fixture, litellm/claude-fable-5-2)"
+        ),
+        "{stderr}"
+    );
+    let listed = run(&home, &["config", "alias", "list"], &[]);
+    assert!(
+        String::from_utf8_lossy(&listed.stdout).contains("fable"),
+        "{}",
+        String::from_utf8_lossy(&listed.stdout)
+    );
 }

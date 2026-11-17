@@ -2,8 +2,10 @@ mod admission;
 #[cfg(test)]
 mod adversary;
 mod aliases;
+mod board;
 mod bridge_host;
 mod caller_pane;
+mod claude_route;
 mod cli;
 mod codex_integration;
 mod config;
@@ -37,9 +39,11 @@ mod statusline_install;
 mod supervision;
 mod task_commands;
 mod tree_status;
+mod tui;
 mod tui_host;
 mod watch;
 mod worker_identity;
+mod worker_line;
 mod workflow;
 mod workspace;
 mod worktree_prune;
@@ -58,7 +62,7 @@ use brgr_protocol::{AttemptId, DecisionVerdict, OwnerId, TaskId, TaskSpec};
 use brgr_runner::HarnessManifest;
 use brgr_store::{RunnerIdentity, Store};
 use clap::Parser;
-use cli::{ArtifactCommand, Cli, Command, ConfigCommand, PluginCommand};
+use cli::{ArtifactCommand, Cli, Command, ConfigCommand, HookEvent, PluginCommand};
 use config::Config;
 use harness_commands::{cleanup, doctor, harness, integrate};
 use omp_adapter::{OmpOptions, run_omp_adapter};
@@ -293,6 +297,7 @@ async fn main() -> Result<()> {
     let outcome = Box::pin(execute(&paths, cli.command, cli.json)).await;
     if !internal {
         failure_banner::print(&paths);
+        crate::worker_line::refresh(&paths);
         handoff_condition::print(&paths);
         pane_adapter::balance_all(&paths);
     }
@@ -316,10 +321,20 @@ async fn plugin_command(paths: &Paths, command: PluginCommand) -> Result<()> {
     }
 }
 
+async fn run_hook(paths: &Paths, event: HookEvent) -> Result<()> {
+    if hook::hook(paths, event).await.is_err() {
+        eprintln!("brgr hook could not read the inbox; run `brgr doctor`");
+        println!("{{}}");
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_lines)] // One arm per clap command, including Tui.
 async fn execute(paths: &Paths, command: Command, json_output: bool) -> Result<()> {
     match command {
         Command::Run(args) => run_task(paths, args, json_output).await,
         Command::Revise(args) => Box::pin(revise_task(paths, args, json_output)).await,
+        Command::Tui(args) => tui::run(paths, &args, json_output).await,
         Command::Artifact { command } => evidence::artifact_command(paths, command, json_output),
         Command::Wait {
             task,
@@ -363,14 +378,12 @@ async fn execute(paths: &Paths, command: Command, json_output: bool) -> Result<(
         Command::Plugin { command } => plugin_command(paths, command).await,
         Command::Cleanup { command } => cleanup(paths, command, json_output),
         Command::Supervise { launch } => supervise(paths, &launch, json_output).await,
-        Command::Hook { event } => {
-            if hook::hook(paths, event).await.is_err() {
-                eprintln!("brgr hook could not read the inbox; run `brgr doctor`");
-                println!("{{}}");
-            }
-            Ok(())
-        }
-        Command::Context { source, chain } => context_signal::run(paths, source.as_str(), &chain),
+        Command::Hook { event } => run_hook(paths, event).await,
+        Command::Context {
+            source,
+            workers,
+            chain,
+        } => context_signal::run(paths, source.as_str(), workers, &chain),
         command @ (Command::Notify { .. } | Command::NotifyWorkflow { .. }) => {
             deliver_notice(paths, command).await
         }
@@ -1021,6 +1034,20 @@ mod tests {
     }
 
     #[test]
+    fn bridge_host_refuses_tui() {
+        let root = TempDir::new().unwrap();
+        let tui = Cli::try_parse_from(["brgr", "tui"]).unwrap();
+        let error =
+            validate_bridge_host_command(&tui.command, root.path(), root.path()).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("brgr tui needs a terminal and is unavailable through the Herdr host bridge; use brgr status --brief"),
+            "{error}"
+        );
+    }
+
+    #[test]
     fn bridge_host_rejects_turning_on_issue_reporting() {
         let root = TempDir::new().unwrap();
         let reporting =
@@ -1033,6 +1060,25 @@ mod tests {
                 .contains("unavailable through the Herdr host bridge"),
             "{error}"
         );
+    }
+
+    #[test]
+    fn claude_route_cannot_be_changed_through_the_host_bridge() {
+        let root = TempDir::new().unwrap();
+        for value in ["any", "claude-code-only"] {
+            let cli =
+                Cli::try_parse_from(["brgr", "config", "set", "claude-route", value]).unwrap();
+            let error =
+                validate_bridge_host_command(&cli.command, root.path(), root.path()).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("unavailable through the Herdr host bridge"),
+                "{error}"
+            );
+        }
+        let model = Cli::try_parse_from(["brgr", "config", "set", "model", "x"]).unwrap();
+        validate_bridge_host_command(&model.command, root.path(), root.path()).unwrap();
     }
 
     #[test]

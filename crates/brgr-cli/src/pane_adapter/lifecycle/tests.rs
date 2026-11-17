@@ -110,7 +110,10 @@ case "$1 $2" in
   test ! -e "$d/pane-gone" || { printf '{"error":{"code":"pane_not_found","message":"pane is absent"}}\n' >&2; exit 1; }
   test ! -e "$d/pane-unavailable" || exit 7
   /bin/cat "$d/pane.json";;
- 'agent get') printf '{"result":{"agent":{"pane_id":"w1:p2","terminal_id":"owned-terminal","agent_status":"%s"}}}\n' "$(/bin/cat "$d/status")";;
+ 'agent get')
+  test ! -e "$d/agent-unknown" || { printf '{"error":{"code":"agent_not_found","message":"agent target not found"}}\n' >&2; exit 1; }
+  printf '{"result":{"agent":{"pane_id":"w1:p2","terminal_id":"owned-terminal","agent_status":"%s"}}}\n' "$(/bin/cat "$d/status")";;
+ 'pane read') /bin/cat "$d/screen";;
  'pane close') test ! -e "$d/fail-close" || exit 7; /usr/bin/touch "$d/closed";;
  *) exit 8;;
 esac
@@ -361,6 +364,135 @@ fn a_pane_that_vanished_after_the_decision_still_reclaims_the_worktree() {
         !Path::new(&workspace).exists(),
         "the worktree survived the pane-already-gone path"
     );
+}
+
+fn claude_native_manifest() -> serde_json::Value {
+    serde_json::json!({
+        "schema": "brgr.harness/v1",
+        "id": "local.claude-code",
+        "adapter": "process/v1",
+        "executable": "/bin/echo",
+        "probe": {"version_argv": ["--version"], "help_argv": ["--help"]},
+        "launch": {
+            "argv": [],
+            "mode": "one_shot",
+            "interactive": {
+                "herdr_kind": "claude",
+                "argv": [],
+                "native_host": true
+            }
+        },
+        "result": {
+            "source": {"kind": "stdout"},
+            "media_type": "text/plain",
+            "max_bytes": 1024,
+            "success_exit_codes": [0]
+        },
+        "capabilities": {}
+    })
+}
+
+fn decided_claude_worker(fixture: &mut Fixture, screen: &str) -> std::process::Child {
+    let workspace = Store::open(&fixture.paths.store)
+        .unwrap()
+        .task(fixture.task)
+        .unwrap()
+        .workspace;
+    fixture.report =
+        PathBuf::from(&workspace).join(format!(".brgr/tasks/{}-r1/report.md", fixture.task));
+    fs::create_dir_all(fixture.report.parent().unwrap()).unwrap();
+    fs::write(&fixture.report, "COMPLETE").unwrap();
+    let launch_path = fixture.paths.launch(fixture.task, 1);
+    let mut launch: serde_json::Value =
+        serde_json::from_slice(&fs::read(&launch_path).unwrap()).unwrap();
+    launch["manifest"] = claude_native_manifest();
+    write_json_atomic(&launch_path, &launch).unwrap();
+    fs::write(fixture.temp.path().join("agent-unknown"), "").unwrap();
+    fs::write(fixture.temp.path().join("screen"), screen).unwrap();
+    let host = std::process::Command::new("/bin/sleep")
+        .arg("300")
+        .spawn()
+        .unwrap();
+    let pid = host.id();
+    write_json_atomic(
+        &fixture
+            .paths
+            .runs
+            .join(format!("{}-r1.native-state.json", fixture.task)),
+        &crate::tui_host::NativeState {
+            pid,
+            birth: crate::supervision::ps_field(&pid.to_string(), "lstart").unwrap(),
+            phase: "running".to_owned(),
+            exit_code: None,
+            startup_error: None,
+        },
+    )
+    .unwrap();
+    update_receipt(&fixture.receipt, |receipt| {
+        receipt.report = Some(fixture.report.clone());
+        receipt.report_digest = Some(report_digest(b"COMPLETE"));
+    })
+    .unwrap();
+    let mut supervisor = brgr_core::Supervisor::open(&fixture.paths.store).unwrap();
+    assert!(collect_recovered(&fixture.paths, &fixture.unfinished(), &mut supervisor).unwrap());
+    let result = supervisor.store().latest_result(fixture.task).unwrap();
+    let owner = supervisor.store().task(fixture.task).unwrap().owner_id;
+    let decision: brgr_protocol::Decision = serde_json::from_value(serde_json::json!({
+        "schema":"brgr/v1", "decision_id":brgr_protocol::DecisionId::new(),
+        "owner_id":owner, "task_id":fixture.task, "revision":1,
+        "result_id":result.result_id, "result_digest":Store::result_digest(&result).unwrap(),
+        "session_id":"recovery", "binding_epoch":1, "verdict":"accepted", "reason":"COMPLETE verified"
+    }))
+    .unwrap();
+    supervisor
+        .store()
+        .record_decision_and_ack(&decision)
+        .unwrap();
+    host
+}
+
+#[test]
+fn a_decided_claude_worker_whose_banner_scrolled_away_has_its_pane_closed() {
+    let mut fixture = Fixture::in_worktree();
+    let workspace = Store::open(&fixture.paths.store)
+        .unwrap()
+        .task(fixture.task)
+        .unwrap()
+        .workspace;
+    let mut host = decided_claude_worker(&mut fixture, super::super::native::CLAUDE_IDLE_NO_BANNER);
+    cleanup_settled(&fixture.paths, fixture.task, 1).unwrap();
+    let _ = host.kill();
+    let _ = host.wait();
+    assert!(
+        fixture.temp.path().join("closed").is_file(),
+        "the decided Claude pane was not closed"
+    );
+    let closed: PaneReceipt = serde_json::from_slice(&fs::read(&fixture.receipt).unwrap()).unwrap();
+    assert_eq!(closed.cleanup, "closed");
+    assert_eq!(
+        fs::read_to_string(closed.archived_report.unwrap()).unwrap(),
+        "COMPLETE"
+    );
+    assert!(!fixture.report.exists());
+    assert!(
+        !Path::new(&workspace).exists(),
+        "the worktree survived after the decided Claude pane closed"
+    );
+}
+
+#[test]
+fn a_decided_claude_worker_still_in_a_turn_keeps_its_pane() {
+    let mut fixture = Fixture::in_worktree();
+    let mut host =
+        decided_claude_worker(&mut fixture, super::super::native::CLAUDE_WORKING_NO_BANNER);
+    cleanup_settled(&fixture.paths, fixture.task, 1).unwrap();
+    let _ = host.kill();
+    let _ = host.wait();
+    assert!(!fixture.temp.path().join("closed").exists());
+    let pending: PaneReceipt =
+        serde_json::from_slice(&fs::read(&fixture.receipt).unwrap()).unwrap();
+    assert_ne!(pending.cleanup, "closed");
+    assert!(fixture.report.exists());
 }
 
 /// A worktree kept for its contents is assessed once. Every hook runs the

@@ -41,6 +41,11 @@ Use the executable's canonical real path. Then run `brgr harness test
 --manifest /absolute/path/manifest.json`, followed by `brgr harness activate
 --manifest /absolute/path/manifest.json --workspace /absolute/scratch
 --prompt "small authorized test"` and `brgr harness status local.example-agent`.
+`brgr harness list` shows every registered harness. `brgr harness add
+EXECUTABLE` can omit `--workspace` (brgr creates and deletes a temporary git
+scratch) and `--prompt` (defaults to `say ok`); an explicit `--workspace` must
+already exist, is not required to be a git repository, and is not created or
+deleted by brgr.
 Activation invokes the actual model once; contract testing does not. Pass
 `--model MODEL` or `--effort LEVEL` only when the manifest documents and claims
 that capability. A successful task still needs a sealed result, owner inbox,

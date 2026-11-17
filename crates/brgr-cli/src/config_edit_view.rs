@@ -269,6 +269,19 @@ async fn edit(paths: &Paths, term: &Term) -> Result<()> {
             Choice::Harnesses => {
                 choose(term, &config, &harnesses, Screen::Harnesses)?;
             }
+            Choice::Routes => {
+                if let Choice::ClaudeRoute(route) =
+                    choose(term, &config, &harnesses, Screen::Routes)?
+                {
+                    save(
+                        paths,
+                        term,
+                        &mut config,
+                        &harnesses,
+                        Action::ClaudeRoute(route),
+                    )?;
+                }
+            }
             _ => {}
         }
     }
