@@ -27,7 +27,7 @@ brgr hands bounded work to registered coding agents and seals what they return f
 ## Rules
 
 1. Every worker opens as a Herdr pane split beside your pane, running the harness's own TUI: the first to the right of a wide pane or below a narrow one, later ones stacked under it in equal sizes while you keep your half, then in a second column beside them, and in a new tab once both are full; or in one row under you after `brgr config set worker-placement below`; or in a new tab after `brgr config set worker-placement tab`. Do not choose headless yourself; pass `--mode auto` when you cannot tell whether a Herdr pane is available. For an OpenCode session, auto uses headless when brgr cannot verify the caller pane; an explicit `--mode pane` requires a verified pane.
-2. When the work should be done by Claude, use `--harness local.claude-code`. Do not run Claude through another harness.
+2. Claude models run through `--harness local.claude-code`, unless the owner allowed other harnesses with `brgr config set claude-route any`. You do not need to check: use the harness, model or `--use` alias the user names. If brgr refuses the route, it started nothing and chose no other harness; tell the user, and do not change `claude-route` or switch harness on your own.
 3. Workers always run with full permissions (yolo). Nothing lowers it; `--permission` is ignored.
 4. Close what you open. Decide every result (`accept`, `reject`, or `result TASK --ack`) so brgr closes the worker's pane and removes its worktree once nothing in it would be lost. Use `--keep-pane` or `--keep-worktree` only when the user asks to keep one.
 5. From Codex, start every brgr command with `--as SESSION`, the session in your calling context, and never add `--source-pane`. brgr finds your pane from what the Codex panes show; if it cannot, `--mode auto` runs headless and explicit pane mode is refused before admission. Codex 0.162 and later show a command's line only after it ends, so before the first handoff of a session run one short brgr command with the same `--as` (for example `brgr --as SESSION status --brief`). From Cursor, `CURSOR_CONVERSATION_ID` is the session; `--as` is optional. OpenCode sessions use `--mode auto` when their Herdr pane cannot be verified; an explicit pane request is refused and should use `--mode headless` instead.
@@ -664,6 +664,12 @@ mod tests {
             assert!(SKILL_TEXT.contains(rule), "skill no longer mentions {rule}");
         }
         assert!(!SKILL_TEXT.contains("without a pane"));
+    }
+
+    #[test]
+    fn skill_rule_two_names_the_claude_route_setting() {
+        assert!(SKILL_TEXT.contains("brgr config set claude-route any"));
+        assert!(SKILL_TEXT.contains("local.claude-code"));
     }
 
     #[test]

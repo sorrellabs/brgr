@@ -5,6 +5,7 @@ mod aliases;
 mod board;
 mod bridge_host;
 mod caller_pane;
+mod claude_route;
 mod cli;
 mod codex_integration;
 mod config;
@@ -1051,6 +1052,25 @@ mod tests {
                 .contains("unavailable through the Herdr host bridge"),
             "{error}"
         );
+    }
+
+    #[test]
+    fn claude_route_cannot_be_changed_through_the_host_bridge() {
+        let root = TempDir::new().unwrap();
+        for value in ["any", "claude-code-only"] {
+            let cli =
+                Cli::try_parse_from(["brgr", "config", "set", "claude-route", value]).unwrap();
+            let error =
+                validate_bridge_host_command(&cli.command, root.path(), root.path()).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("unavailable through the Herdr host bridge"),
+                "{error}"
+            );
+        }
+        let model = Cli::try_parse_from(["brgr", "config", "set", "model", "x"]).unwrap();
+        validate_bridge_host_command(&model.command, root.path(), root.path()).unwrap();
     }
 
     #[test]

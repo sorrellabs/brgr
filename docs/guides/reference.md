@@ -206,8 +206,34 @@ registered harness and optional exact model and effort. Manage them with
 alias edits do not change existing tasks. Names may contain Korean text but
 cannot contain whitespace or control characters or start with `-`.
 
+By default `claude-route` is `claude-code-only`: a Claude model may run only
+through `--harness local.claude-code`. Set `brgr config set claude-route any`
+to allow other harnesses. The setting is not per-harness. Tightening with
+`brgr config set claude-route claude-code-only` always succeeds; violating
+saved aliases and harness defaults are left unchanged and later runs refuse
+them. The Herdr host bridge cannot change this setting.
+
+brgr recognizes a Claude model from the resolved model string, never the
+alias name. After ASCII-lowercasing, it splits on `/`; any provider segment
+`anthropic` is Claude. The last segment is split on non-alphanumeric
+characters; a token `claude`, `claude` followed only by digits (`claude3`),
+or `anthropic` is Claude. After cutting the model name at the first `:`, `#`
+or `@`, a remainder that is exactly `opus`, `sonnet`, `haiku` or `fable` is
+Claude (`sonnet`, `sonnet:high`). A family name counts only as the whole
+model name (`magnum-opus` is not Claude).
+
+Two cases stay invisible and are admitted as today: a proxy name that hides
+the model (a LiteLLM entry `litellm/smart` mapped to Claude upstream), and
+no model requested when the harness's own default happens to be Claude. brgr
+never reads a harness's own configuration.
+
+While `[routes]` is present (`claude = "any"`), 2.15.24 and earlier fail
+every command that loads the config (`unknown field routes`). Before
+downgrading, run `brgr config set claude-route claude-code-only`.
+
 In a terminal, `brgr config edit` opens a menu for adding, editing and removing
-aliases, choosing or clearing each harness's default model, and viewing harness
+aliases, choosing or clearing each harness's default model, choosing whether
+Claude models may run only on Claude Code or on any harness, and viewing harness
 health and tiers. Models come from the harness catalog when readable; otherwise
 enter an exact model name. Each completed change is saved immediately to the
 same config file as `brgr config set model MODEL --harness ID`. Esc or Back cancels the pending change;

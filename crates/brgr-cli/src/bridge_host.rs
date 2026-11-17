@@ -90,7 +90,13 @@ pub(crate) fn validate_bridge_host_command(
         }
         // Turning on issue filing publishes text from this machine; turning on
         // auto-recertify lets paid scratch runs start without a command; a
-        // handoff condition steers a head toward starting another harness.
+        // handoff condition steers a head toward starting another harness;
+        // claude-route loosens which harnesses may run a Claude model.
+        Command::Config {
+            command: ConfigCommand::Set { key, .. },
+        } if key == "claude-route" => bail!(
+            "this brgr command is unavailable through the Herdr host bridge; run it explicitly outside the plugin Codex pane"
+        ),
         Command::Config {
             command:
                 ConfigCommand::SetIssueReporting { .. }

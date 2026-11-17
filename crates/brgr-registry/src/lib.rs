@@ -90,6 +90,9 @@ const PROBE_DEADLINE: Duration = Duration::from_secs(15);
 /// a working harness could not be registered.
 const SCRATCH_DEADLINE: Duration = Duration::from_mins(3);
 
+/// The harness Claude models run through when `claude-route` is `claude-code-only`.
+pub const CLAUDE_CODE_HARNESS_ID: &str = "local.claude-code";
+
 #[derive(Clone, Debug)]
 pub struct Registry {
     root: PathBuf,

@@ -2,7 +2,7 @@
 
 use crate::{
     aliases::{self, Alias},
-    config::Config,
+    config::{ClaudeRoute, Config},
 };
 
 pub(crate) const TIERS: &[(&str, u8)] = &[
@@ -33,6 +33,8 @@ pub(crate) struct Harness {
 pub(crate) enum Choice {
     Aliases,
     Defaults,
+    Routes,
+    ClaudeRoute(ClaudeRoute),
     Harnesses,
     Quit,
     AddAlias,
@@ -64,6 +66,7 @@ pub(crate) enum Screen<'a> {
     Alias(&'a str),
     HarnessPicker,
     Harnesses,
+    Routes,
     Models { harness: &'a str, clear: bool },
 }
 
@@ -89,6 +92,7 @@ pub(crate) fn menu(config: &Config, harnesses: &[Harness], screen: Screen<'_>) -
             return vec![
                 item("Aliases", Choice::Aliases),
                 item("Default model per harness", Choice::Defaults),
+                item("Routes", Choice::Routes),
                 item("Harnesses", Choice::Harnesses),
                 item("Quit", Choice::Quit),
             ];
@@ -112,6 +116,13 @@ pub(crate) fn menu(config: &Config, harnesses: &[Harness], screen: Screen<'_>) -
             item("Edit", Choice::EditAlias(name.into())),
             item("Remove", Choice::RemoveAlias(name.into())),
         ],
+        Screen::Routes => {
+            let current = config.routes.claude;
+            vec![
+                route_item(ClaudeRoute::ClaudeCodeOnly, current),
+                route_item(ClaudeRoute::Any, current),
+            ]
+        }
         Screen::HarnessPicker | Screen::Harnesses => harnesses
             .iter()
             .filter(|h| visible(&h.id))
@@ -190,6 +201,26 @@ pub(crate) enum Action {
         harness: String,
         model: Option<String>,
     },
+    ClaudeRoute(ClaudeRoute),
+}
+
+fn route_label(route: ClaudeRoute) -> &'static str {
+    match route {
+        ClaudeRoute::ClaudeCodeOnly => "Claude models: Claude Code only (local.claude-code)",
+        ClaudeRoute::Any => "Claude models: any harness",
+    }
+}
+
+fn route_item(route: ClaudeRoute, current: ClaudeRoute) -> Item {
+    let label = route_label(route);
+    item(
+        if route == current {
+            format!("{label} (current)")
+        } else {
+            label.to_owned()
+        },
+        Choice::ClaudeRoute(route),
+    )
 }
 
 fn validate_route(harnesses: &[Harness], id: &str, model: Option<&str>) -> Result<(), EditError> {
@@ -262,6 +293,23 @@ pub(crate) fn apply(
                 if model.is_some() { "Saved" } else { "Cleared" },
                 model.map_or(String::new(), |m| format!(": {m}"))
             )
+        }
+        Action::ClaudeRoute(route) => {
+            next.routes.claude = route;
+            let saved = format!("Saved {}.", route_label(route));
+            if route == ClaudeRoute::ClaudeCodeOnly {
+                let found = crate::claude_route::violations(&next);
+                if found.is_empty() {
+                    saved
+                } else {
+                    format!(
+                        "{saved} These saved routes will be refused and were left unchanged: {}.",
+                        crate::claude_route::format_violations(&found, ", ")
+                    )
+                }
+            } else {
+                saved
+            }
         }
     };
     Ok((next, message))
@@ -435,6 +483,7 @@ mod tests {
             vec![
                 Choice::Aliases,
                 Choice::Defaults,
+                Choice::Routes,
                 Choice::Harnesses,
                 Choice::Quit
             ]
@@ -491,5 +540,58 @@ mod tests {
         assert_eq!(ids, tiers);
         assert_eq!(tiers.len(), TIERS.len());
         assert!(TIERS.iter().all(|(_, tier)| (1..=3).contains(tier)));
+    }
+
+    #[test]
+    fn the_routes_screen_shows_and_changes_claude_route() {
+        let config = Config::default();
+        let items = menu(&config, &[], Screen::Routes);
+        assert_eq!(
+            items
+                .iter()
+                .map(|item| item.label.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "Claude models: Claude Code only (local.claude-code) (current)",
+                "Claude models: any harness",
+                "Back"
+            ]
+        );
+        assert_eq!(
+            items[0].choice,
+            Choice::ClaudeRoute(ClaudeRoute::ClaudeCodeOnly)
+        );
+        assert_eq!(items[1].choice, Choice::ClaudeRoute(ClaudeRoute::Any));
+        let (any, message) = apply(&config, &[], Action::ClaudeRoute(ClaudeRoute::Any)).unwrap();
+        assert_eq!(any.routes.claude, ClaudeRoute::Any);
+        assert_eq!(message, "Saved Claude models: any harness.");
+        let marked = menu(&any, &[], Screen::Routes);
+        assert!(marked[1].label.ends_with("(current)"));
+        assert!(!marked[0].label.contains("(current)"));
+
+        let mut violating = any.clone();
+        violating.aliases.insert(
+            "fable".into(),
+            Alias {
+                harness: "local.opencode".into(),
+                model: Some("litellm/claude-fable-5-2".into()),
+                effort: None,
+            },
+        );
+        let (tightened, message) = apply(
+            &violating,
+            &[],
+            Action::ClaudeRoute(ClaudeRoute::ClaudeCodeOnly),
+        )
+        .unwrap();
+        assert_eq!(tightened.routes.claude, ClaudeRoute::ClaudeCodeOnly);
+        assert_eq!(
+            tightened.aliases["fable"].model.as_deref(),
+            Some("litellm/claude-fable-5-2")
+        );
+        assert!(
+            message.contains("alias fable (local.opencode, litellm/claude-fable-5-2)"),
+            "{message}"
+        );
     }
 }

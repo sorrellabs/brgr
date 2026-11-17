@@ -12770,3 +12770,325 @@ fn a_user_command_for_a_missing_home_still_creates_it() {
     run(&home, &["status", "--brief"], &[]);
     assert!(home.is_dir());
 }
+
+const CLAUDE_ON_FIXTURE: &str = "litellm/claude-fable-5-2";
+
+fn launch_file_count(home: &Path) -> usize {
+    fs::read_dir(home.join("launches")).map_or(0, Iterator::count)
+}
+
+fn stored_task_count(home: &Path) -> usize {
+    brgr_store::Store::open(home.join("store"))
+        .ok()
+        .and_then(|store| store.tasks(32).ok())
+        .map_or(0, |tasks| tasks.len())
+}
+
+fn allow_claude_on_any_harness(home: &Path) {
+    json_output(&run(home, &["config", "set", "claude-route", "any"], &[]));
+}
+
+fn save_fable_alias(home: &Path) {
+    let path = home.join("config.toml");
+    let mut text = fs::read_to_string(&path).unwrap_or_default();
+    if !text.contains("[aliases.fable]") {
+        write!(
+            text,
+            "\n[aliases.fable]\nharness = \"local.fixture\"\nmodel = \"{CLAUDE_ON_FIXTURE}\"\n"
+        )
+        .unwrap();
+        fs::write(path, text).unwrap();
+    }
+}
+
+fn refused_claude_on_fixture(model: &str, alias: Option<&str>) -> String {
+    let alias = alias.map_or(String::new(), |name| format!(" (alias {name})"));
+    format!(
+        "claude-route is claude-code-only: Claude model `{model}`{alias} cannot run on local.fixture. Use `--harness local.claude-code` with a model it accepts, or allow other harnesses with `brgr config set claude-route any`. Nothing was started and no other harness was chosen."
+    )
+}
+
+#[test]
+fn a_claude_model_on_another_harness_is_refused_before_admission() {
+    let (_temp, home, workspace) = fixture_home();
+    let output = run(
+        &home,
+        &[
+            "run",
+            "BRGR_FIXTURE_OK",
+            "--harness",
+            "local.fixture",
+            "--model",
+            CLAUDE_ON_FIXTURE,
+            "--workspace",
+            workspace.to_str().unwrap(),
+        ],
+        &[("BRGR_OWNER_ID", "codex:claude-route")],
+    );
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains(&refused_claude_on_fixture(CLAUDE_ON_FIXTURE, None)),
+        "{stderr}"
+    );
+    assert_eq!(launch_file_count(&home), 0);
+    assert_eq!(stored_task_count(&home), 0);
+}
+
+#[test]
+fn the_refusal_also_applies_through_an_alias() {
+    let (_temp, home, workspace) = fixture_home();
+    allow_claude_on_any_harness(&home);
+    save_fable_alias(&home);
+    json_output(&run(
+        &home,
+        &["config", "set", "claude-route", "claude-code-only"],
+        &[],
+    ));
+    let output = run(
+        &home,
+        &[
+            "run",
+            "BRGR_FIXTURE_OK",
+            "--use",
+            "fable",
+            "--workspace",
+            workspace.to_str().unwrap(),
+        ],
+        &[("BRGR_OWNER_ID", "codex:claude-route")],
+    );
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains(&refused_claude_on_fixture(CLAUDE_ON_FIXTURE, Some("fable"))),
+        "{stderr}"
+    );
+    assert_eq!(launch_file_count(&home), 0);
+    assert_eq!(stored_task_count(&home), 0);
+}
+
+#[test]
+fn claude_route_any_admits_the_same_run() {
+    let (_temp, home, workspace) = fixture_home();
+    allow_claude_on_any_harness(&home);
+    save_fable_alias(&home);
+    let launched = json_output(&run(
+        &home,
+        &[
+            "run",
+            "BRGR_FIXTURE_OK",
+            "--use",
+            "fable",
+            "--workspace",
+            workspace.to_str().unwrap(),
+            "--foreground",
+        ],
+        &[("BRGR_OWNER_ID", "codex:claude-route")],
+    ));
+    assert!(launched["task_id"].as_str().is_some(), "{launched}");
+}
+
+#[test]
+fn a_claude_model_on_claude_code_is_admitted_under_either_setting() {
+    let temp = TempDir::new().unwrap();
+    let home = temp.path().join("brgr");
+    let workspace = temp.path().join("work");
+    let bin = temp.path().join("bin");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&bin).unwrap();
+    write_fast_script(&bin.join("claude"), CLAUDE_FIXTURE);
+    add_fixture(&home, &bin.join("claude"), &temp.path().join("scratch"));
+    let owner = [("BRGR_OWNER_ID", "codex:claude-route")];
+    for setting in [None, Some("any")] {
+        if let Some(value) = setting {
+            json_output(&run(&home, &["config", "set", "claude-route", value], &[]));
+        }
+        let launched = json_output(&run(
+            &home,
+            &[
+                "run",
+                "BRGR_FIXTURE_OK",
+                "--harness",
+                "local.claude-code",
+                "--model",
+                "sonnet",
+                "--workspace",
+                workspace.to_str().unwrap(),
+                "--foreground",
+            ],
+            &owner,
+        ));
+        let task = launched["task_id"].as_str().expect("admitted task");
+        let detail = json_output(&run(
+            &home,
+            &["status", task, "--verbose", "--observe"],
+            &owner,
+        ));
+        assert_eq!(
+            detail["task"]["route"]["harness_id"], "local.claude-code",
+            "{detail}"
+        );
+        assert_eq!(detail["task"]["route"]["requested_model"], "sonnet");
+    }
+}
+
+#[test]
+fn a_refused_route_does_not_recertify_the_harness() {
+    let (_temp, home, workspace) = drifted_fixture_home();
+    json_output(&run(&home, &["config", "set-auto-recertify", "true"], &[]));
+    let refused = run(
+        &home,
+        &[
+            "run",
+            "BRGR_FIXTURE_OK",
+            "--harness",
+            "local.fixture",
+            "--model",
+            CLAUDE_ON_FIXTURE,
+            "--workspace",
+            workspace.to_str().unwrap(),
+            "--foreground",
+        ],
+        &[("BRGR_OWNER_ID", "codex:claude-route")],
+    );
+    assert!(!refused.status.success());
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(
+        stderr.contains("claude-route is claude-code-only"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("re-certifying"), "{stderr}");
+    assert!(!stderr.contains("scratch run"), "{stderr}");
+    let health = json_output(&run(&home, &["harness", "status", "local.fixture"], &[]));
+    assert_ne!(health["health"], "healthy", "{health}");
+    assert_eq!(launch_file_count(&home), 0);
+    assert_eq!(stored_task_count(&home), 0);
+}
+
+#[test]
+fn revising_a_task_whose_route_is_no_longer_allowed_is_refused() {
+    let (_temp, home, workspace) = fixture_home();
+    let owner = [("BRGR_OWNER_ID", "codex:claude-route")];
+    allow_claude_on_any_harness(&home);
+    save_fable_alias(&home);
+    let launched = json_output(&run(
+        &home,
+        &[
+            "run",
+            "BRGR_FIXTURE_OK",
+            "--use",
+            "fable",
+            "--workspace",
+            workspace.to_str().unwrap(),
+            "--foreground",
+        ],
+        &owner,
+    ));
+    let task = launched["task_id"].as_str().unwrap();
+    // A fixture run with a Claude model that is not in the catalog finishes
+    // failed (JSONL identity). Failed and lost results are revisable;
+    // a candidate needs reject first. Ignore whichever of those applies.
+    let _ = run(
+        &home,
+        &["reject", task, "--reason", "tighten the route"],
+        &owner,
+    );
+    json_output(&run(
+        &home,
+        &["config", "set", "claude-route", "claude-code-only"],
+        &[],
+    ));
+    let revised = run(
+        &home,
+        &[
+            "revise",
+            task,
+            "BRGR_FIXTURE_OK again",
+            "--workspace",
+            workspace.to_str().unwrap(),
+        ],
+        &owner,
+    );
+    assert!(!revised.status.success());
+    let stderr = String::from_utf8_lossy(&revised.stderr);
+    assert!(
+        stderr.contains(&format!(
+            "claude-route is claude-code-only: Claude model `{CLAUDE_ON_FIXTURE}` cannot run on local.fixture. A revision keeps its route: start a new task on `local.claude-code`, or allow other harnesses with `brgr config set claude-route any`. Nothing was started and no other harness was chosen."
+        )),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn a_workflow_step_on_a_refused_route_is_refused_and_records_no_step() {
+    let (_temp, home, workspace) = fixture_home();
+    seed_git_repo(&workspace);
+    let owner = [
+        ("BRGR_OWNER_ID", "codex:claude-route"),
+        ("BRGR_SESSION_ID", "workflow-session"),
+    ];
+    let created = json_output(&run(&home, &["workflow", "create"], &owner));
+    let run_id = created["run_id"].as_str().unwrap();
+    let refused = run(
+        &home,
+        &[
+            "run",
+            "BRGR_FIXTURE_OK",
+            "--harness",
+            "local.fixture",
+            "--model",
+            CLAUDE_ON_FIXTURE,
+            "--workspace",
+            workspace.to_str().unwrap(),
+            "--workflow",
+            run_id,
+            "--step",
+            "fetch",
+        ],
+        &owner,
+    );
+    assert!(!refused.status.success());
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("claude-route is claude-code-only"),
+        "{}",
+        String::from_utf8_lossy(&refused.stderr)
+    );
+    let status = json_output(&run(&home, &["workflow", "status", run_id], &owner));
+    assert_eq!(
+        status["steps"].as_array().map(Vec::len),
+        Some(0),
+        "{status}"
+    );
+    assert_eq!(launch_file_count(&home), 0);
+    assert_eq!(stored_task_count(&home), 0);
+}
+
+#[test]
+fn tightening_claude_route_warns_about_saved_routes_and_keeps_them() {
+    let (_temp, home, _workspace) = fixture_home();
+    allow_claude_on_any_harness(&home);
+    save_fable_alias(&home);
+    let tightened = run(
+        &home,
+        &["config", "set", "claude-route", "claude-code-only"],
+        &[],
+    );
+    assert!(
+        tightened.status.success(),
+        "{}",
+        String::from_utf8_lossy(&tightened.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&tightened.stderr);
+    assert!(
+        stderr.contains(
+            "brgr: claude-route is now claude-code-only; these saved routes will be refused and were left unchanged: alias fable (local.fixture, litellm/claude-fable-5-2)"
+        ),
+        "{stderr}"
+    );
+    let listed = run(&home, &["config", "alias", "list"], &[]);
+    assert!(
+        String::from_utf8_lossy(&listed.stdout).contains("fable"),
+        "{}",
+        String::from_utf8_lossy(&listed.stdout)
+    );
+}
