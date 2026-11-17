@@ -117,6 +117,9 @@ pub(super) fn classify(screen: &str, workspace: &Path) -> Screen {
             keys: vec!["esc"],
         };
     }
+    if let Some(resolution) = opencode_web_search(&lower) {
+        return resolution;
+    }
     let options = menu_options(screen);
     let selected = options.iter().position(|option| option.selected);
     if let (Some(selected), Some((rule, target))) = (selected, accepting_option(&lower, &options)) {
@@ -149,6 +152,9 @@ pub(super) fn classify(screen: &str, workspace: &Path) -> Screen {
             keys,
         };
     }
+    if let Some(resolution) = lsp_plugin_offer(&lower, selected, &options) {
+        return resolution;
+    }
     if selected.is_none() {
         return if has_continue_notice(screen) {
             Screen::Resolve {
@@ -160,6 +166,39 @@ pub(super) fn classify(screen: &str, workspace: &Path) -> Screen {
         };
     }
     Screen::Unknown(head(screen))
+}
+
+/// `OpenCode`'s web-search prompt: Esc dismisses. Allow would send queries to
+/// third-party providers; Disable may change `OpenCode`'s global settings.
+fn opencode_web_search(lower: &str) -> Option<Screen> {
+    lower
+        .contains("allow opencode to search the web")
+        .then_some(Screen::Resolve {
+            rule: "opencode-web-search-dismiss",
+            keys: vec!["esc"],
+        })
+}
+
+/// Claude Code's LSP plugin recommendation: decline without installing.
+/// Installing a plugin runs code and changes user-level settings.
+fn lsp_plugin_offer(
+    lower: &str,
+    selected: Option<usize>,
+    options: &[MenuOption],
+) -> Option<Screen> {
+    let selected = selected?;
+    if !lower.contains("would you like to install this lsp plugin?") {
+        return None;
+    }
+    let skip = options
+        .iter()
+        .position(|option| option.text.to_lowercase().starts_with("no, not now"))?;
+    let mut keys = keys_between(selected, skip);
+    keys.push("enter");
+    Some(Screen::Resolve {
+        rule: "lsp-plugin-offer-skip",
+        keys,
+    })
 }
 
 /// A harness offering to update itself, not an agent asking about updating
@@ -851,6 +890,115 @@ mod tests {
         ));
     }
 
+    /// Captured from an `OpenCode` worker pane on 2026-11-17 (issue #416).
+    const OPENCODE_WEB_SEARCH: &str = "\
+  ┃  Web Search
+  ┃
+  ┃  Allow OpenCode to search the web for up-to-date information?
+  ┃
+  ┃  1. Allow search via Exa, Firecrawl, Parallel, Tavily, TinyFish
+  ┃  2. Choose another provider
+  ┃  3. Disable web search
+  ┃
+  ┃  ↑↓ select  enter submit  esc dismiss
+";
+
+    #[test]
+    fn opencodes_web_search_prompt_is_dismissed_with_esc() {
+        assert_eq!(
+            classify(OPENCODE_WEB_SEARCH, work()),
+            Screen::Resolve {
+                rule: "opencode-web-search-dismiss",
+                keys: vec!["esc"],
+            }
+        );
+    }
+
+    #[test]
+    fn opencodes_web_search_prompt_never_presses_allow_from_any_row() {
+        let screens = [
+            OPENCODE_WEB_SEARCH.to_owned(),
+            OPENCODE_WEB_SEARCH.replace("┃  1. Allow", "┃❯ 1. Allow"),
+            OPENCODE_WEB_SEARCH.replace("┃  2. Choose", "┃❯ 2. Choose"),
+            OPENCODE_WEB_SEARCH.replace("┃  3. Disable", "┃❯ 3. Disable"),
+        ];
+        for screen in screens {
+            let Screen::Resolve { rule, keys } = classify(&screen, work()) else {
+                panic!("expected a dismiss, got {:?}", classify(&screen, work()));
+            };
+            assert_eq!(rule, "opencode-web-search-dismiss", "{screen}");
+            assert_eq!(keys, vec!["esc"], "{screen}");
+        }
+    }
+
+    /// Captured from Claude Code 2.1.325 on 2026-11-17 (issue #416).
+    const CLAUDE_LSP_PLUGIN: &str = "\
+ LSP plugin recommendation
+
+   LSP provides code intelligence like go-to-definition and error checking
+
+   Plugin: rust-analyzer-lsp
+   Marketplace: claude-plugins-official
+   Triggered by: .rs files
+   Description: Rust language server for code intelligence and analysis
+
+   Plugins can run code on your computer, with access to your files and shell.
+   Would you like to install this LSP plugin?
+   ❯ 1. Yes, install
+     2. No, not now
+     3. Never for this plugin
+     4. Disable all LSP recommendations
+";
+
+    #[test]
+    fn claudes_lsp_plugin_recommendation_is_declined_with_not_now() {
+        assert_eq!(
+            classify(CLAUDE_LSP_PLUGIN, work()),
+            Screen::Resolve {
+                rule: "lsp-plugin-offer-skip",
+                keys: vec!["down", "enter"],
+            }
+        );
+    }
+
+    #[test]
+    fn claudes_lsp_plugin_recommendation_never_presses_yes_install_from_any_row() {
+        let screens = [
+            (CLAUDE_LSP_PLUGIN.to_owned(), vec!["down", "enter"]),
+            (
+                CLAUDE_LSP_PLUGIN
+                    .replace("❯ 1. Yes, install", "  1. Yes, install")
+                    .replace("  2. No, not now", "❯ 2. No, not now"),
+                vec!["enter"],
+            ),
+            (
+                CLAUDE_LSP_PLUGIN
+                    .replace("❯ 1. Yes, install", "  1. Yes, install")
+                    .replace("  3. Never for this plugin", "❯ 3. Never for this plugin"),
+                vec!["up", "enter"],
+            ),
+            (
+                CLAUDE_LSP_PLUGIN
+                    .replace("❯ 1. Yes, install", "  1. Yes, install")
+                    .replace(
+                        "  4. Disable all LSP recommendations",
+                        "❯ 4. Disable all LSP recommendations",
+                    ),
+                vec!["up", "up", "enter"],
+            ),
+        ];
+        for (screen, expected) in screens {
+            assert_eq!(
+                classify(&screen, work()),
+                Screen::Resolve {
+                    rule: "lsp-plugin-offer-skip",
+                    keys: expected,
+                },
+                "{screen}"
+            );
+        }
+    }
+
     /// Captured from Codex CLI 0.166.0 on its first run after
     /// `brgr integrate codex install`. Text sent to this screen is lost.
     const CODEX_HOOKS_REVIEW: &str =
@@ -1296,6 +1444,30 @@ esac
         );
         assert!(!temp.path().join("keys").exists());
         assert!(!log_path(&paths, &run).exists());
+    }
+
+    #[test]
+    fn opencodes_web_search_prompt_is_not_answered_while_working() {
+        let (temp, herdr) = fake_herdr(OPENCODE_WEB_SEARCH);
+        let (paths, run) = run_args(&temp);
+        let mut watch = ScreenWatch::with_limit("opencode", Duration::from_hours(1));
+        assert_eq!(
+            resolve(&herdr, "w1:p2", &run, &paths, Some("working"), &mut watch).unwrap(),
+            Screen::Clear
+        );
+        assert!(!temp.path().join("keys").exists());
+    }
+
+    #[test]
+    fn claudes_lsp_plugin_recommendation_is_not_answered_while_working() {
+        let (temp, herdr) = fake_herdr(CLAUDE_LSP_PLUGIN);
+        let (paths, run) = run_args(&temp);
+        let mut watch = ScreenWatch::with_limit("claude", Duration::from_hours(1));
+        assert_eq!(
+            resolve(&herdr, "w1:p2", &run, &paths, Some("working"), &mut watch).unwrap(),
+            Screen::Clear
+        );
+        assert!(!temp.path().join("keys").exists());
     }
 
     #[test]
