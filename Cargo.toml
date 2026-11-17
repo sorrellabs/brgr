@@ -2,6 +2,7 @@
 members = [
   "crates/brgr-cli",
   "crates/brgr-core",
+  "crates/brgr-platform",
   "crates/brgr-protocol",
   "crates/brgr-registry",
   "crates/brgr-runner",
@@ -20,6 +21,7 @@ homepage = "https://github.com/sorrellabs/brgr"
 [workspace.dependencies]
 # Internal crates. crates.io needs a version beside each path.
 brgr-core = { path = "crates/brgr-core", version = "2.16.0" }
+brgr-platform = { path = "crates/brgr-platform", version = "2.16.0" }
 brgr-protocol = { path = "crates/brgr-protocol", version = "2.16.0" }
 brgr-registry = { path = "crates/brgr-registry", version = "2.16.0" }
 brgr-runner = { path = "crates/brgr-runner", version = "2.16.0" }
@@ -39,6 +41,16 @@ thiserror = "2.0.20"
 tokio = { version = "1.53.1", features = ["io-util", "macros", "process", "rt-multi-thread", "signal", "time"] }
 toml = "1.1"
 uuid = { version = "1.26.1", features = ["serde", "v4"] }
+windows-sys = { version = "0.59", features = [
+  "Win32_Foundation",
+  "Win32_Security",
+  "Win32_System_Threading",
+  "Win32_System_JobObjects",
+  "Win32_System_Diagnostics_ToolHelp",
+  "Win32_System_Power",
+  "Win32_System_Console",
+  "Win32_Storage_FileSystem",
+] }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

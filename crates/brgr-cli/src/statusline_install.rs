@@ -12,7 +12,6 @@
 use std::{
     fs,
     io::Write as _,
-    os::unix::fs::PermissionsExt as _,
     path::{Path, PathBuf},
 };
 
@@ -347,14 +346,12 @@ fn read_receipt(brgr_home: &Path, harness: Harness) -> Result<Option<Receipt>> {
     Ok(Some(serde_json::from_slice(&fs::read(path)?)?))
 }
 
-fn write_atomic(path: &Path, bytes: &[u8], mode: u32) -> Result<()> {
+fn write_atomic(path: &Path, bytes: &[u8], mode: Option<u32>) -> Result<()> {
     let parent = path.parent().context("path has no parent")?;
     fs::create_dir_all(parent)?;
     let mut temporary = NamedTempFile::new_in(parent)?;
     temporary.write_all(bytes)?;
-    temporary
-        .as_file_mut()
-        .set_permissions(fs::Permissions::from_mode(mode))?;
+    brgr_platform::fs::apply_mode_bits(temporary.as_file(), mode)?;
     temporary.as_file_mut().sync_all()?;
     temporary.persist(path)?;
     Ok(())
@@ -463,8 +460,8 @@ pub(crate) fn install(
         bail!("the edit did not produce the intended statusLine");
     }
     let backup = unique_backup_path(brgr_home, crate::context_signal::now());
-    write_atomic(&backup, text.as_bytes(), 0o600)?;
-    let mode = fs::metadata(&target).map_or(0o600, |meta| meta.permissions().mode() & 0o777);
+    write_atomic(&backup, text.as_bytes(), Some(0o600))?;
+    let mode = brgr_platform::fs::preserved_mode(&target, 0o600);
     write_atomic(&target, edited.as_bytes(), mode)?;
     let receipt = Receipt {
         settings: target.clone(),
@@ -476,7 +473,7 @@ pub(crate) fn install(
     write_atomic(
         &brgr_home.join(harness.receipt()),
         &serde_json::to_vec_pretty(&receipt)?,
-        0o600,
+        Some(0o600),
     )?;
     sync_statusline_dir(brgr_home, workers)?;
     Ok(json!({
@@ -531,8 +528,7 @@ pub(crate) fn uninstall(brgr_home: &Path, harness: Harness) -> Result<Value> {
             None => without_status_line(&text)?,
         };
         serde_json::from_str::<Value>(&edited).context("the restore would break settings.json")?;
-        let mode =
-            fs::metadata(&receipt.settings).map_or(0o600, |meta| meta.permissions().mode() & 0o777);
+        let mode = brgr_platform::fs::preserved_mode(&receipt.settings, 0o600);
         write_atomic(&receipt.settings, edited.as_bytes(), mode)?;
         true
     } else {
@@ -559,7 +555,7 @@ fn sync_statusline_dir(brgr_home: &Path, workers: bool) -> Result<()> {
     let dir = brgr_home.join("statusline");
     if workers {
         fs::create_dir_all(&dir)?;
-        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))?;
+        brgr_platform::fs::set_private_dir(&dir)?;
         crate::worker_line::refresh_home(brgr_home);
         return Ok(());
     }

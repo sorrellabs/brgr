@@ -97,7 +97,6 @@ use prompt::{render_task_prompt, worker_prompt};
 
 use std::{
     ffi::OsStr,
-    os::unix::process::CommandExt,
     path::Path,
     process::{ExitStatus, Stdio},
     sync::atomic::{AtomicBool, Ordering},
@@ -244,7 +243,7 @@ impl ProcessRunner {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
-        command.as_std_mut().process_group(0);
+        brgr_platform::process::spawn_in_new_group(command.as_std_mut());
         for name in &manifest.launch.env_allow {
             if let Some(value) = std::env::var_os(name) {
                 command.env(name, value);
@@ -285,11 +284,9 @@ impl ProcessRunner {
         {
             result?
         } else {
-            let _ = std::process::Command::new("/bin/kill")
-                .arg("-KILL")
-                .arg("--")
-                .arg(format!("-{process_group_id}"))
-                .output();
+            if let Ok(tree) = brgr_platform::process::ProcessTree::adopt(process_group_id) {
+                let _ = tree.kill_now();
+            }
             stdout_task.abort();
             stderr_task.abort();
             return Err(RunnerError::CaptureDeadlineElapsed);
@@ -367,7 +364,7 @@ impl ProcessRunner {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
-        command.as_std_mut().process_group(0);
+        brgr_platform::process::spawn_in_new_group(command.as_std_mut());
         for name in ["HOME", "LANG"] {
             if let Some(value) = std::env::var_os(name) {
                 command.env(name, value);
@@ -518,12 +515,7 @@ async fn wait_for_probe_exit(
 }
 
 fn kill_probe_group(pid: u32) -> bool {
-    std::process::Command::new("/bin/kill")
-        .arg("-KILL")
-        .arg("--")
-        .arg(format!("-{pid}"))
-        .output()
-        .is_ok_and(|output| output.status.success())
+    brgr_platform::process::ProcessTree::adopt(pid).is_ok_and(|tree| tree.kill_now())
 }
 
 async fn stop_probe_group(
@@ -568,12 +560,8 @@ async fn wait_for_exit(
 
 async fn stop_process_group(child: &mut tokio::process::Child) -> Result<ExitStatus, RunnerError> {
     let pid = child.id().ok_or(RunnerError::MissingProcessId)?;
-    let term = std::process::Command::new("/bin/kill")
-        .arg("-TERM")
-        .arg("--")
-        .arg(format!("-{pid}"))
-        .output()?;
-    if !term.status.success() {
+    let tree = brgr_platform::process::ProcessTree::adopt(pid)?;
+    if !tree.terminate() {
         if let Some(status) = child.try_wait()? {
             return Ok(status);
         }
@@ -584,30 +572,13 @@ async fn stop_process_group(child: &mut tokio::process::Child) -> Result<ExitSta
     while grace_started.elapsed() < Duration::from_millis(500) {
         if let Some(status) = child.try_wait()? {
             sleep(Duration::from_millis(500).saturating_sub(grace_started.elapsed())).await;
-            kill_process_group(pid, "KILL");
+            tree.kill();
             return Ok(status);
         }
         sleep(Duration::from_millis(25)).await;
     }
-    kill_process_group(pid, "KILL");
+    tree.kill();
     Ok(child.wait().await?)
-}
-
-fn kill_process_group(pid: u32, signal: &str) {
-    if !std::process::Command::new("/bin/kill")
-        .arg("-0")
-        .arg("--")
-        .arg(format!("-{pid}"))
-        .output()
-        .is_ok_and(|output| output.status.success())
-    {
-        return;
-    }
-    let _ = std::process::Command::new("/bin/kill")
-        .arg(format!("-{signal}"))
-        .arg("--")
-        .arg(format!("-{pid}"))
-        .status();
 }
 
 #[cfg(test)]
@@ -616,6 +587,7 @@ mod tests {
 
     use crate::capture::read_jsonl_semantic;
     use crate::collect::{collect_result, extract_jsonl_assistant_final, observe_jsonl_model};
+    use brgr_platform::process::GroupSpawn;
     use brgr_protocol::TaskSpec;
     use brgr_protocol::{ArtifactContract, AttemptBudget, OwnerId, Route, SCHEMA_V1, TaskId};
     use serde_json::json;
@@ -1627,7 +1599,7 @@ mod tests {
             .arg("sh")
             .arg(&child_pid_path)
             .kill_on_drop(true);
-        command.as_std_mut().process_group(0);
+        command.in_new_group();
         let mut leader = command.spawn().unwrap();
         assert!(leader.id().is_some());
         let started = Instant::now();

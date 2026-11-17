@@ -1,5 +1,8 @@
 use std::time::{Duration, Instant};
 
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt as _;
+
 use super::fixtures::{result, sealed_result, task};
 
 /// Every source file the write-path guards read. Checked against the modules

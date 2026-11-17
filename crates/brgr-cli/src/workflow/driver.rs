@@ -4,12 +4,8 @@ use std::{
     env,
     ffi::{OsStr, OsString},
     fmt::Write as _,
-    fs::{self, File, OpenOptions},
+    fs::{self, File},
     io::{Read, Write as IoWrite},
-    os::unix::{
-        fs::{OpenOptionsExt, PermissionsExt},
-        process::CommandExt,
-    },
     path::{Path, PathBuf},
     process::{Command as ProcessCommand, ExitStatus, Stdio},
     sync::{Arc, Mutex},
@@ -66,12 +62,11 @@ struct BoundedLog {
 
 impl BoundedLog {
     fn open(path: &Path) -> Result<Self> {
-        let file = OpenOptions::new()
+        let file = brgr_platform::fs::private_create_options()
             .create(true)
             .append(true)
-            .mode(0o600)
             .open(path)?;
-        file.set_permissions(fs::Permissions::from_mode(0o600))?;
+        brgr_platform::fs::set_private_file_mode(&file)?;
         let written = file.metadata()?.len();
         Ok(Self { file, written })
     }
@@ -230,8 +225,8 @@ fn spawn_driver(paths: &Paths, run_id: &WorkflowRunId, script: &Path) -> Result<
         .arg(script)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .process_group(0);
+        .stderr(Stdio::null());
+    brgr_platform::process::spawn_in_new_group(&mut command);
     apply_driver_env(&mut command, paths, run_id)?;
     command
         .spawn()
@@ -362,38 +357,20 @@ fn live_driver_pid(paths: &Paths, run_id: &WorkflowRunId) -> Option<u32> {
 }
 
 fn pid_is_alive(pid: u32) -> bool {
-    ProcessCommand::new("/bin/kill")
-        .args(["-0", &pid.to_string()])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .is_ok_and(|status| status.success())
+    brgr_platform::process::pid_alive(pid)
 }
 
 fn command_line_contains(pid: u32, needle: &str) -> bool {
-    let output = ProcessCommand::new("ps")
-        .args(["-p", &pid.to_string(), "-www", "-o", "command="])
-        .output();
-    output
-        .ok()
-        .filter(|output| output.status.success())
-        .is_some_and(|output| String::from_utf8_lossy(&output.stdout).contains(needle))
+    brgr_platform::process::command_line(pid).is_some_and(|line| line.contains(needle))
 }
 
 fn stop_driver_group(pid: u32) {
-    signal_group(pid, "-TERM");
+    let Ok(tree) = brgr_platform::process::ProcessTree::adopt(pid) else {
+        return;
+    };
+    let _ = tree.terminate();
     thread::sleep(Duration::from_millis(50));
-    signal_group(pid, "-KILL");
-}
-
-fn signal_group(pid: u32, signal: &str) {
-    let _ = ProcessCommand::new("/bin/kill")
-        .args([signal, "--", &format!("-{pid}")])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
+    let _ = tree.kill_now();
 }
 
 fn require_script(path: &Path) -> Result<PathBuf> {
@@ -553,7 +530,7 @@ mod tests {
         let path = dir.path().join("nested").join("run.workflow.pid");
         write_private(&path, b"1\n").unwrap();
         assert_eq!(fs::read(&path).unwrap(), b"1\n");
-        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        let mode = brgr_platform::fs::mode_bits(&fs::metadata(&path).unwrap()).unwrap() & 0o777;
         assert_eq!(mode, 0o600);
     }
 }

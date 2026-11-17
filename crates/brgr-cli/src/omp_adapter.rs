@@ -4,7 +4,6 @@ use std::{
     env,
     fs::{self},
     io::{self, Read, Write},
-    os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
     process::Command as ProcessCommand,
     thread,
@@ -290,14 +289,9 @@ pub(crate) fn read_bounded_regular_report(path: &Path, max_bytes: u64) -> Result
     if checked.len() > max_bytes {
         bail!("OMP report exceeds the task artifact limit");
     }
-    let mut file = fs::File::open(path)?;
-    let opened = file.metadata()?;
-    if !opened.is_file()
-        || (checked.dev(), checked.ino(), checked.len())
-            != (opened.dev(), opened.ino(), opened.len())
-    {
+    let Some(mut file) = brgr_platform::fs::open_matching(path, &checked)? else {
         bail!("OMP report changed before its descriptor was read");
-    }
+    };
     let mut bytes = Vec::new();
     Read::by_ref(&mut file)
         .take(max_bytes.saturating_add(1))

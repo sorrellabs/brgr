@@ -15,7 +15,6 @@ use std::{
     ffi::OsString,
     fs,
     io::{self, Read as _, Write as _},
-    os::unix::fs::OpenOptionsExt as _,
     path::{Path, PathBuf},
     process::Command,
     thread,
@@ -1208,10 +1207,7 @@ pub(crate) fn recorded_label(paths: &Paths, task: TaskId, revision: u32) -> Opti
 }
 
 fn read_report(report: &Path, max_bytes: u64) -> Result<Vec<u8>> {
-    let file = fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-        .open(report)?;
+    let file = brgr_platform::fs::open_no_follow(report)?;
     let metadata = file.metadata()?;
     if !metadata.is_file() || metadata.len() > max_bytes {
         bail!("the agent's report is not a regular file within the artifact limit");

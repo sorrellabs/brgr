@@ -10,7 +10,6 @@
 use std::{
     fs,
     io::{Read as _, Write as _},
-    os::unix::process::CommandExt as _,
     path::{Component, Path},
     process::{Child, Command, Stdio},
     sync::mpsc,
@@ -246,7 +245,7 @@ impl Git<'_> {
             Some(index) => command.env("GIT_INDEX_FILE", index),
             None => command.env_remove("GIT_INDEX_FILE"),
         };
-        let mut child = command
+        command
             .arg("-C")
             .arg(self.workspace)
             .args(["-c", "core.fsmonitor=false"])
@@ -258,10 +257,9 @@ impl Git<'_> {
                 Stdio::null()
             })
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .process_group(0)
-            .spawn()
-            .map_err(|error| error.to_string())?;
+            .stderr(Stdio::null());
+        brgr_platform::process::spawn_in_new_group(&mut command);
+        let mut child = command.spawn().map_err(|error| error.to_string())?;
         let writer = input.map(|bytes| {
             let mut stdin = child.stdin.take();
             thread::spawn(move || {
@@ -337,9 +335,9 @@ fn collect(
 }
 
 fn stop(child: &mut Child) {
-    let _ = Command::new("/bin/kill")
-        .args(["-KILL", "--", &format!("-{}", child.id())])
-        .status();
+    if let Ok(tree) = brgr_platform::process::ProcessTree::adopt(child.id()) {
+        let _ = tree.kill_now();
+    }
     let _ = child.kill();
     let _ = child.wait();
 }

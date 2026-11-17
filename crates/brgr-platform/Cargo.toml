@@ -1,0 +1,24 @@
+[package]
+name = "brgr-platform"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Platform-specific process, filesystem, and terminal primitives for brgr. Internal to the brgr CLI."
+repository.workspace = true
+homepage.workspace = true
+
+[dependencies]
+tokio.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true }
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints.clippy]
+all = "warn"
+pedantic = "warn"
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true

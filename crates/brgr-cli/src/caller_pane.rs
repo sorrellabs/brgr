@@ -409,25 +409,12 @@ fn runs_inside(pane: &str) -> bool {
     false
 }
 
-/// Every process's parent and executable, from one `ps` call.
+/// Every process's parent and executable, from one snapshot.
 fn process_table() -> Option<HashMap<u32, (u32, String)>> {
-    let output = Command::new("/bin/ps")
-        .args(["-A", "-o", "pid=,ppid=,comm="])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let text = String::from_utf8_lossy(&output.stdout);
     Some(
-        text.lines()
-            .filter_map(|line| {
-                let mut fields = line.split_whitespace();
-                let pid = fields.next()?.parse().ok()?;
-                let parent = fields.next()?.parse().ok()?;
-                let command = fields.collect::<Vec<_>>().join(" ");
-                Some((pid, (parent, command)))
-            })
+        brgr_platform::process::process_table()?
+            .into_iter()
+            .map(|entry| (entry.pid, (entry.ppid, entry.command)))
             .collect(),
     )
 }
@@ -453,7 +440,7 @@ fn pane_in_environment(pid: u32) -> Option<String> {
             std::str::from_utf8(value).ok().map(str::to_owned)
         })
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(all(unix, not(target_os = "linux")))]
     {
         let ps = |with_environment: bool| {
             let mut command = Command::new("/bin/ps");
@@ -468,6 +455,12 @@ fn pane_in_environment(pid: u32) -> Option<String> {
         };
         pane_from_ps(&ps(false)?, &ps(true)?)
     }
+    #[cfg(windows)]
+    {
+        // A process's environment is not readable cross-process on Windows.
+        let _ = pid;
+        None
+    }
 }
 
 /// The `HERDR_PANE_ID` in the environment part of a `ps -E` output, or `None`
@@ -477,7 +470,7 @@ fn pane_in_environment(pid: u32) -> Option<String> {
 /// saw different processes (or `ps` printed nothing) and nothing is trusted.
 /// Only the environment part is searched: an entry matches at its start or
 /// after a space, and a `HERDR_PANE_ID` inside the arguments is ignored.
-#[cfg_attr(target_os = "linux", allow(dead_code))]
+#[cfg_attr(not(all(unix, not(target_os = "linux"))), allow(dead_code))]
 fn pane_from_ps(arguments: &str, with_environment: &str) -> Option<String> {
     let arguments = arguments.strip_suffix('\n').unwrap_or(arguments);
     let with_environment = with_environment

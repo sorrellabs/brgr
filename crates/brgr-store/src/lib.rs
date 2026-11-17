@@ -21,9 +21,6 @@ mod workflow;
 
 use std::{fmt::Write as _, fs, io::Read, path::Path};
 
-#[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
-
 use artifact::ArtifactStore;
 pub use board::{BoardStore, BoardTaskRow, SessionCounts};
 use brgr_protocol::{
@@ -676,8 +673,7 @@ fn format_sha256(digest: &[u8]) -> String {
 
 fn private_directory(path: &Path) -> Result<(), StoreError> {
     fs::create_dir_all(path)?;
-    #[cfg(unix)]
-    fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+    brgr_platform::fs::set_private_dir(path)?;
     Ok(())
 }
 
@@ -691,8 +687,7 @@ fn prefix_upper_bound(prefix: &str) -> String {
 }
 
 fn private_file(path: &Path) -> Result<(), StoreError> {
-    #[cfg(unix)]
-    fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+    brgr_platform::fs::set_private_file(path)?;
     Ok(())
 }
 

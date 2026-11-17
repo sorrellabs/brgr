@@ -7,7 +7,6 @@ use std::{
     collections::HashSet,
     fs::{self, OpenOptions},
     io::Write as _,
-    os::unix::fs::PermissionsExt as _,
     path::Path,
     time::Duration,
 };
@@ -183,9 +182,7 @@ fn write_cache(dir: &Path, cache: &Cache) -> std::io::Result<()> {
     let mut temporary = NamedTempFile::new_in(dir)?;
     serde_json::to_writer_pretty(&mut temporary, cache).map_err(std::io::Error::other)?;
     temporary.write_all(b"\n")?;
-    temporary
-        .as_file_mut()
-        .set_permissions(fs::Permissions::from_mode(0o600))?;
+    brgr_platform::fs::set_private_file_mode(temporary.as_file())?;
     temporary.persist(&path).map_err(|error| error.error)?;
     Ok(())
 }
@@ -249,7 +246,7 @@ mod tests {
     fn enable(paths: &Paths) {
         let dir = statusline_dir(&paths.home);
         fs::create_dir_all(&dir).unwrap();
-        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+        brgr_platform::fs::set_private_dir(&dir).unwrap();
     }
 
     fn write_file(paths: &Paths, session: &str, at: u64, counts: &Counts) {

@@ -148,9 +148,7 @@ pub(crate) fn stop_external(
         ));
         if crate::tui_host::alive(&native) {
             let state: crate::tui_host::NativeState = serde_json::from_slice(&fs::read(&native)?)?;
-            let _ = Command::new("/bin/kill")
-                .args(["-TERM", &state.pid.to_string()])
-                .status()?;
+            let _ = brgr_platform::process::terminate_pid(state.pid);
         }
     } else {
         close_leftover_pane(paths, attempt.task.task_id, attempt.task.revision, false);

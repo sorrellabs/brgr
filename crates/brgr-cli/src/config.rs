@@ -1,8 +1,7 @@
 use std::{
     collections::BTreeMap,
-    fs::{self, File, OpenOptions},
+    fs::{self, File},
     io::{Read as _, Write as _},
-    os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _},
     path::{Path, PathBuf},
 };
 
@@ -205,8 +204,7 @@ pub fn validate_codex_executable(path: &Path) -> Result<()> {
     if !path.is_absolute() {
         bail!("Codex executable must be an absolute path");
     }
-    let metadata = fs::metadata(path).context("configured Codex executable is unavailable")?;
-    if !metadata.is_file() || metadata.permissions().mode() & 0o111 == 0 {
+    if !brgr_platform::fs::is_executable(path) {
         bail!("configured Codex executable is not an executable file");
     }
     Ok(())
@@ -354,9 +352,7 @@ impl Config {
         let mut temporary = NamedTempFile::new_in(parent)?;
         temporary.write_all(toml::to_string_pretty(self)?.as_bytes())?;
         temporary.as_file_mut().sync_all()?;
-        temporary
-            .as_file_mut()
-            .set_permissions(fs::Permissions::from_mode(0o600))?;
+        brgr_platform::fs::set_private_file_mode(temporary.as_file())?;
         temporary.persist(path)?;
         Ok(())
     }
@@ -370,12 +366,11 @@ impl Config {
     ) -> Result<Self> {
         fs::create_dir_all(control_home)?;
         let lock_path = control_home.join("config.lock");
-        let lock = OpenOptions::new()
+        let lock = brgr_platform::fs::private_create_options()
             .create(true)
             .truncate(false)
             .read(true)
             .write(true)
-            .mode(0o600)
             .open(lock_path)?;
         lock.lock().context("locking brgr config")?;
 
@@ -519,7 +514,7 @@ pub(crate) fn initialize(paths: &crate::Paths, json_output: bool) -> Result<()> 
         .open(&instructions)
     {
         Ok(mut file) => {
-            file.set_permissions(fs::Permissions::from_mode(0o600))?;
+            brgr_platform::fs::set_private_file_mode(&file)?;
             file.write_all("# brgr 사용자 지침\n\n<!-- 이 파일에 오케스트레이션에 전달할 지침을 작성하세요. -->\n".as_bytes())?;
             file.sync_all()?;
             instructions_created = true;
