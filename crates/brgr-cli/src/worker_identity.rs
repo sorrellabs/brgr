@@ -4,10 +4,9 @@
 //! A Codex worker does not: its tool commands run in Codex's shared daemon, which
 //! keeps the environment of whoever started it, so the variables are absent or
 //! name another worker. Its working directory is still its own, so a task
-//! directory inside a brgr worktree wins over the environment. A pane worker's
-//! Codex launch passes the run's home as session config
-//! (`shell_environment_policy.set.BRGR_HOME`), and a command that inherits it
-//! uses it; the worktree's own path names the home when the daemon lost it.
+//! directory inside a brgr worktree wins over the environment, and the
+//! worktree's own path names the home: passing it as session config
+//! (`shell_environment_policy.set.BRGR_HOME`) hung Codex 0.169's tool host.
 
 use std::{
     env, fs,

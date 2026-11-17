@@ -98,7 +98,7 @@ that was already running does not know brgr yet.
 The Herdr plugin's **Open brgr status** action is the same board, plus workspace actions:
 
 ```bash
-herdr plugin install sorrellabs/brgr --ref v2.15.24
+herdr plugin install sorrellabs/brgr --ref v2.16.0
 ```
 
 ## Use it
