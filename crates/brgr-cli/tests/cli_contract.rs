@@ -2599,48 +2599,33 @@ fn a_pane_run_works_with_spaces_in_the_home_and_workspace_paths() {
     );
 }
 
-/// Codex runs a worker's tool commands in a shared daemon that keeps the
-/// environment of whoever started it, so the pane launch carries the run's home
-/// as session config instead (issue #362).
+/// Codex 0.169's tool host hangs on a `-c shell_environment_policy.set.*`
+/// override (issue #435), so a Codex pane worker's argv carries none; its
+/// commands find the home from the worktree path instead (issue #362).
 #[test]
-fn a_codex_pane_worker_gets_the_control_home_as_session_config() {
+fn a_codex_pane_worker_has_no_session_config_override() {
     let fixture = pane_fixture();
     let ran = fixture.run_on("local.codex", &[]);
     assert_eq!(ran["outcome"], "candidate", "{ran}");
     let args = fixture.state("start-args");
-    let home = fixture.home.canonicalize().unwrap();
-    let expected = format!(
-        "-c\nshell_environment_policy.set.BRGR_HOME={}",
-        serde_json::to_string(home.to_str().unwrap()).unwrap()
-    );
-    assert!(args.contains(&expected), "{args}");
-    assert_eq!(
-        args.matches("shell_environment_policy.set.").count(),
-        1,
-        "{args}"
-    );
+    assert!(!args.contains("shell_environment_policy"), "{args}");
 }
 
-/// The same override survives a home path with a space and a double quote:
-/// the value is JSON-quoted, so the pane's command line still parses.
+/// A home path with a space and a double quote changes nothing: no session
+/// config is built for the launch, so no quoting is ever needed.
 #[test]
-fn a_codex_pane_worker_gets_a_home_with_spaces_and_quotes() {
+fn a_codex_pane_worker_with_a_quoted_home_has_no_session_config() {
     let fixture = pane_fixture_named("Application Support/br\"gr", "work space");
     let ran = fixture.run_on("local.codex", &[]);
     assert_eq!(ran["outcome"], "candidate", "{ran}");
     let args = fixture.state("start-args");
-    let home = fixture.home.canonicalize().unwrap();
-    let expected = format!(
-        "shell_environment_policy.set.BRGR_HOME={}",
-        serde_json::to_string(home.to_str().unwrap()).unwrap()
-    );
-    assert!(args.contains(&expected), "{args}");
+    assert!(!args.contains("shell_environment_policy"), "{args}");
 }
 
 /// A `revise` rebuilds the launch, so the second revision's Codex pane launch
-/// carries the same home override.
+/// still carries no session config.
 #[test]
-fn a_revised_codex_pane_worker_still_gets_the_home_override() {
+fn a_revised_codex_pane_worker_has_no_session_config_override() {
     let fixture = pane_fixture();
     let ran = fixture.run_on("local.codex", &[]);
     assert_eq!(ran["outcome"], "candidate", "{ran}");
@@ -2670,14 +2655,10 @@ fn a_revised_codex_pane_worker_still_gets_the_home_override() {
     assert_eq!(revised["outcome"], "candidate", "{revised}");
     assert_eq!(revised["revision"], 2);
     let args = fixture.state("start-args");
-    assert!(
-        args.contains("shell_environment_policy.set.BRGR_HOME="),
-        "{args}"
-    );
+    assert!(!args.contains("shell_environment_policy"), "{args}");
 }
 
-/// Only Codex needs its home as session config: another harness's pane launch
-/// is unchanged.
+/// No pane launch carries session config: another harness's is unchanged.
 #[test]
 fn a_non_codex_pane_worker_has_no_home_config_override() {
     let fixture = pane_fixture();
