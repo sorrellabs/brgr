@@ -108,6 +108,16 @@ fn event_message(value: &Value, depth: usize) -> Option<String> {
                     }
                 }
             }
+            // Qwen Code's stream ends in a `result` event whose `error.message`
+            // names the model failure.
+            if map.get("type").and_then(Value::as_str) == Some("result")
+                && map.get("is_error").and_then(Value::as_bool) == Some(true)
+                && let Some(Value::String(message)) =
+                    map.get("error").and_then(|error| error.get("message"))
+                && !message.trim().is_empty()
+            {
+                return Some(message.clone());
+            }
             map.values()
                 .find_map(|child| event_message(child, depth + 1))
         }
@@ -143,6 +153,7 @@ mod tests {
             stderr: stderr.as_bytes().to_vec(),
             result: Vec::new(),
             observed_model: None,
+            session_id: None,
             timed_out: false,
             cancelled: false,
             output_truncated: false,

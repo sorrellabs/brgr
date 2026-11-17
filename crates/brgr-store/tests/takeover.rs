@@ -101,6 +101,7 @@ fn open_candidate_with_question(
         route_observation: None,
         unresolved_effects: vec![],
         slept_seconds: None,
+        harness_session_id: None,
     };
     store.commit_terminal_result(owner_id, &envelope).unwrap();
     (task, envelope, message)
@@ -134,6 +135,7 @@ fn candidate(store: &mut Store, owner_id: &OwnerId) -> (TaskSpec, ResultEnvelope
         route_observation: None,
         unresolved_effects: vec![],
         slept_seconds: None,
+        harness_session_id: None,
     };
     store.commit_terminal_result(owner_id, &envelope).unwrap();
     (task, envelope)
@@ -2254,6 +2256,7 @@ fn failed_result(store: &mut Store, owner_id: &OwnerId) -> (TaskSpec, ResultEnve
         route_observation: None,
         unresolved_effects: vec![],
         slept_seconds: None,
+        harness_session_id: None,
     };
     store.commit_terminal_result(owner_id, &envelope).unwrap();
     (task, envelope)

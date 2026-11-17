@@ -1,7 +1,7 @@
 use super::*;
 use crate::execution::{
     delegated_lost_reason, finish_execution, is_retryable_spawn_failure, last_stderr_line,
-    transition,
+    resumable_session, transition,
 };
 use brgr_protocol::{ArtifactContract, AttemptBudget, OwnerId, Route, SCHEMA_V1};
 use brgr_protocol::{AttemptId, AttemptState, ObservationSource, ResultId, TaskId};
@@ -21,7 +21,8 @@ fn a_lost_delegated_run_names_the_adapter_error() {
         stderr: b"brgr pane mode \xc2\xb7 claude agent in pane w1:p2\nError: Herdr could not start the claude agent\n\n".to_vec(),
         result: Vec::new(),
         observed_model: None,
-        timed_out: false,
+        session_id: None,
+            timed_out: false,
         cancelled: false,
         output_truncated: false,
         elapsed: Duration::from_secs(1),
@@ -38,6 +39,7 @@ fn a_lost_delegated_run_names_the_adapter_error() {
     // At the deadline the last stderr line is progress noise, not the cause.
     let timed_out = brgr_runner::ExecutionOutput {
         stderr: b"brgr pane mode \xc2\xb7 prompted\n".to_vec(),
+        session_id: None,
         timed_out: true,
         ..output
     };
@@ -119,6 +121,7 @@ fn delegated_fixture_manifest() -> HarnessManifest {
                 "@${input.prompt_file}".to_owned(),
             ],
             model_argv: vec![],
+            resume_argv: vec![],
             effort_argv: vec![],
             env_allow: vec![],
             mode: ExecutionMode::DelegatedExternal,
@@ -129,6 +132,7 @@ fn delegated_fixture_manifest() -> HarnessManifest {
             source: ResultSource::JsonlAssistantFinal,
             media_type: "text/plain".to_owned(),
             max_bytes: 1_024,
+            budget_exit_codes: vec![],
             success_exit_codes: vec![0],
         },
         capabilities: BTreeMap::new(),
@@ -229,6 +233,7 @@ fn delegated_pane_finish(
         launch: LaunchSpec {
             argv: vec![],
             model_argv: vec![],
+            resume_argv: vec![],
             effort_argv: vec![],
             env_allow: vec![],
             mode: ExecutionMode::DelegatedExternal,
@@ -239,6 +244,7 @@ fn delegated_pane_finish(
             source: ResultSource::Stdout,
             media_type: "text/plain".to_owned(),
             max_bytes: 1_024,
+            budget_exit_codes: vec![],
             success_exit_codes: vec![0],
         },
         capabilities: BTreeMap::new(),
@@ -263,6 +269,7 @@ fn only_an_agent_that_gave_no_report_fails_where_other_pane_ends_stay_lost() {
         stderr: b"Error: the agent finished without writing its report\n".to_vec(),
         result: vec![],
         observed_model: None,
+        session_id: None,
         timed_out: false,
         cancelled: false,
         output_truncated: false,
@@ -280,6 +287,7 @@ fn only_an_agent_that_gave_no_report_fails_where_other_pane_ends_stay_lost() {
             ..output.clone()
         },
         ExecutionOutput {
+            session_id: None,
             timed_out: true,
             ..output.clone()
         },
@@ -302,6 +310,7 @@ fn a_run_records_the_model_its_own_session_log_names() {
         stderr: vec![],
         result: b"report".to_vec(),
         observed_model: None,
+        session_id: None,
         timed_out: false,
         cancelled: false,
         output_truncated: false,
@@ -383,6 +392,7 @@ fn delegated_external_failure_is_lost_with_unresolved_effects() {
         launch: LaunchSpec {
             argv: vec![],
             model_argv: vec![],
+            resume_argv: vec![],
             effort_argv: vec![],
             env_allow: vec![],
             mode: ExecutionMode::DelegatedExternal,
@@ -393,6 +403,7 @@ fn delegated_external_failure_is_lost_with_unresolved_effects() {
             source: ResultSource::Stdout,
             media_type: "text/plain".to_owned(),
             max_bytes: 1_024,
+            budget_exit_codes: vec![],
             success_exit_codes: vec![0],
         },
         capabilities: BTreeMap::new(),
@@ -403,6 +414,7 @@ fn delegated_external_failure_is_lost_with_unresolved_effects() {
         stderr: vec![],
         result: vec![],
         observed_model: None,
+        session_id: None,
         timed_out: false,
         cancelled: false,
         output_truncated: false,
@@ -469,6 +481,7 @@ fn result_for(attempt: &Attempt, outcome: TerminalOutcome) -> ResultEnvelope {
         route_observation: None,
         unresolved_effects: vec![],
         slept_seconds: None,
+        harness_session_id: None,
     }
 }
 
@@ -559,6 +572,7 @@ fn restart_replay_of_same_result_is_idempotent_without_new_rows() {
             route_observation: None,
             unresolved_effects: vec![],
             slept_seconds: None,
+            harness_session_id: None,
         };
         assert_eq!(
             store
@@ -993,6 +1007,7 @@ fn one_shot_manifest() -> HarnessManifest {
         launch: LaunchSpec {
             argv: vec![],
             model_argv: vec![],
+            resume_argv: vec![],
             effort_argv: vec![],
             env_allow: vec![],
             mode: ExecutionMode::OneShot,
@@ -1003,6 +1018,7 @@ fn one_shot_manifest() -> HarnessManifest {
             source: ResultSource::Stdout,
             media_type: "text/plain".to_owned(),
             max_bytes: 1_024,
+            budget_exit_codes: vec![],
             success_exit_codes: vec![0],
         },
         capabilities: BTreeMap::new(),
@@ -1029,6 +1045,7 @@ fn successful_output(result: &[u8]) -> ExecutionOutput {
         stderr: vec![],
         result: result.to_vec(),
         observed_model: None,
+        session_id: None,
         timed_out: false,
         cancelled: false,
         output_truncated: false,
@@ -1185,6 +1202,7 @@ fn provider_output(stderr: &str, timed_out: bool) -> ExecutionOutput {
         stderr: stderr.as_bytes().to_vec(),
         result: Vec::new(),
         observed_model: None,
+        session_id: None,
         timed_out,
         cancelled: false,
         output_truncated: false,
@@ -1211,6 +1229,7 @@ fn delegated_provider_timeout_retains_active_diagnostic() {
 fn recovered_or_malformed_provider_marker_does_not_taint_timeout() {
     let generic = brgr_runner::ExecutionOutput {
         stderr: b"brgr pane mode \xc2\xb7 prompted\n".to_vec(),
+        session_id: None,
         timed_out: true,
         ..provider_output("", true)
     };
@@ -1271,5 +1290,81 @@ fn provider_error_remains_lost_with_unresolved_effects_and_no_retry() {
     assert!(
         error.contains("last screen: Timed out waiting for response headers"),
         "{error}"
+    );
+}
+
+/// A follow-up revision resumes the harness session the previous revision's
+/// result recorded — only when the harness's recipe can take it.
+#[test]
+fn a_revision_follow_up_resumes_the_recorded_harness_session() {
+    let root = tempfile::tempdir().unwrap();
+    let mut store = Store::open(root.path()).unwrap();
+    let task = task_spec(TaskId::new(), 1);
+    store.record_task(&task, "resume-fixture").unwrap();
+    let attempt_id = AttemptId::new();
+    store
+        .claim_attempt(task.task_id, task.revision, attempt_id)
+        .unwrap();
+    let artifact = store
+        .seal_artifact_reader(Cursor::new(b"first report".to_vec()), "text/plain", 1_024)
+        .unwrap();
+    let mut result = ResultEnvelope {
+        schema: SCHEMA_V1.to_owned(),
+        task_id: task.task_id,
+        revision: task.revision,
+        attempt_id,
+        result_id: ResultId::new(),
+        outcome: TerminalOutcome::Candidate,
+        artifacts: vec![artifact],
+        error: None,
+        legacy_embedded_route_observation: None,
+        route_observation: None,
+        unresolved_effects: vec![],
+        slept_seconds: None,
+        harness_session_id: Some("qwen-session-7".to_owned()),
+    };
+    store
+        .commit_terminal_result(&task.owner_id, &result)
+        .unwrap();
+
+    let mut manifest = one_shot_manifest();
+    manifest.launch.resume_argv = vec!["--resume".to_owned(), "${input.session}".to_owned()];
+    let follow_up = task_spec(task.task_id, 2);
+    assert_eq!(
+        resumable_session(&store, &follow_up, &manifest).unwrap(),
+        Some("qwen-session-7".to_owned())
+    );
+    // A first revision has nothing to resume.
+    assert!(
+        resumable_session(&store, &task, &manifest)
+            .unwrap()
+            .is_none()
+    );
+    // A harness without a resume argv never sees one.
+    manifest.launch.resume_argv = vec![];
+    assert!(
+        resumable_session(&store, &follow_up, &manifest)
+            .unwrap()
+            .is_none()
+    );
+    // A prior result that named no session resumes nothing.
+    result.harness_session_id = None;
+    result.result_id = ResultId::new();
+    let mut bare = task_spec(TaskId::new(), 1);
+    bare.create_request_id = "resume-bare-create".to_owned();
+    store.record_task(&bare, "resume-bare").unwrap();
+    let bare_attempt = AttemptId::new();
+    store
+        .claim_attempt(bare.task_id, bare.revision, bare_attempt)
+        .unwrap();
+    result.task_id = bare.task_id;
+    result.attempt_id = bare_attempt;
+    store
+        .commit_terminal_result(&bare.owner_id, &result)
+        .unwrap();
+    assert!(
+        resumable_session(&store, &task_spec(bare.task_id, 2), &manifest)
+            .unwrap()
+            .is_none()
     );
 }

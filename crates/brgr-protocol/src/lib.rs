@@ -489,6 +489,11 @@ pub struct ResultEnvelope {
     /// the reporting threshold. Omitted to preserve older result digests.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub slept_seconds: Option<u64>,
+    /// The harness-reported session a follow-up run may resume, when the
+    /// harness's stream named one. Omitted so unchanged harnesses keep their
+    /// result digest.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub harness_session_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -887,6 +892,7 @@ mod tests {
             route_observation: None,
             unresolved_effects: vec![],
             slept_seconds: None,
+            harness_session_id: None,
         };
         let bytes = serde_json::to_vec(&old).unwrap();
         assert!(!String::from_utf8_lossy(&bytes).contains("route_observation"));

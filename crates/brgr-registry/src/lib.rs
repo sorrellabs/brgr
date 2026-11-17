@@ -445,6 +445,7 @@ impl Registry {
                 instructions: None,
                 model,
                 effort,
+                resume_session: None,
                 permission: None,
                 deadline: SCRATCH_DEADLINE,
                 cancel_path: None,
@@ -1564,6 +1565,7 @@ mod tests {
             stderr: stderr.to_vec(),
             result: vec![],
             observed_model: None,
+            session_id: None,
             timed_out: false,
             cancelled: false,
             output_truncated: false,
@@ -1873,6 +1875,7 @@ mod tests {
                     "${input.prompt_file}".to_owned(),
                 ],
                 model_argv: vec!["--model".to_owned(), "${route.model}".to_owned()],
+                resume_argv: vec![],
                 effort_argv: vec![],
                 env_allow: vec!["HOME".to_owned(), "PATH".to_owned()],
                 mode: ExecutionMode::OneShot,
@@ -1883,6 +1886,7 @@ mod tests {
                 source: ResultSource::Stdout,
                 media_type: "text/plain".to_owned(),
                 max_bytes: 1_024,
+                budget_exit_codes: vec![],
                 success_exit_codes: vec![0],
             },
             capabilities: BTreeMap::from([
@@ -2660,6 +2664,7 @@ mod tests {
                 instructions: None,
                 model: None,
                 effort: None,
+                resume_session: None,
                 permission: None,
                 // A hang guard: the fixture ends at once, however slowly it starts.
                 deadline: Duration::from_mins(1),
@@ -2693,6 +2698,7 @@ mod tests {
             launch: LaunchSpec {
                 argv: vec!["-p".to_owned(), "${input.prompt}".to_owned()],
                 model_argv: vec![],
+                resume_argv: vec![],
                 effort_argv: vec![],
                 env_allow: vec!["HOME".to_owned(), "PATH".to_owned()],
                 mode: ExecutionMode::OneShot,
@@ -2703,6 +2709,7 @@ mod tests {
                 source: ResultSource::Stdout,
                 media_type: "text/plain".to_owned(),
                 max_bytes: 1_024,
+                budget_exit_codes: vec![],
                 success_exit_codes: vec![0],
             },
             capabilities: BTreeMap::from([
@@ -2730,6 +2737,7 @@ mod tests {
                 instructions: None,
                 model: None,
                 effort: None,
+                resume_session: None,
                 permission: None,
                 // A hang guard: the fixture ends at once, however slowly it starts.
                 deadline: Duration::from_mins(1),
@@ -3135,6 +3143,7 @@ mod tests {
                 instructions: None,
                 model: None,
                 effort: None,
+                resume_session: None,
                 permission: None,
                 deadline: Duration::from_mins(1),
                 cancel_path: None,
@@ -3144,5 +3153,276 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(result.result, b"ok");
+    }
+
+    /// The Qwen Code recipe comes from its own pinned help: the positional
+    /// prompt, `-o stream-json`, `--approval-mode yolo` at the full level,
+    /// `--resume` for follow-ups, and the CLI's own budget exits.
+    #[test]
+    fn the_qwen_recipe_drafts_from_its_pinned_help() {
+        let manifest = generate_manifest(
+            "qwen",
+            PathBuf::from("/bin/echo"),
+            &help_fixture("qwen-0.27.4.txt"),
+        )
+        .unwrap();
+        manifest.validate().unwrap();
+        assert_eq!(manifest.id, "local.qwen");
+        assert_eq!(
+            manifest.launch.argv,
+            ["-o", "stream-json", "${input.prompt}"]
+        );
+        assert_eq!(manifest.launch.model_argv, ["--model", "${route.model}"]);
+        assert_eq!(
+            manifest.launch.resume_argv,
+            ["--resume", "${input.session}"]
+        );
+        assert_eq!(
+            manifest.permission_arguments(None).unwrap(),
+            ["--approval-mode", "yolo"]
+        );
+        assert_eq!(manifest.result.source, ResultSource::StreamJsonResult);
+        assert_eq!(manifest.result.budget_exit_codes, [53, 55]);
+        assert_eq!(
+            manifest.launch.interactive.as_ref().unwrap().herdr_kind,
+            "qwen"
+        );
+        assert!(
+            manifest
+                .launch
+                .interactive
+                .as_ref()
+                .unwrap()
+                .argv
+                .is_empty()
+        );
+        // BASE_ENV plus the credential names of the auth types the pinned
+        // CLI supports — nothing else.
+        let allow: Vec<&str> = manifest
+            .launch
+            .env_allow
+            .iter()
+            .map(String::as_str)
+            .collect();
+        for name in [
+            "HOME",
+            "PATH",
+            "LANG",
+            "TMPDIR",
+            "USER",
+            "QWEN_API_KEY",
+            "DASHSCOPE_API_KEY",
+            "OPENAI_API_KEY",
+            "ANTHROPIC_API_KEY",
+            "GEMINI_API_KEY",
+            "GOOGLE_API_KEY",
+            "GOOGLE_APPLICATION_CREDENTIALS",
+        ] {
+            assert!(allow.contains(&name), "{name} missing from env_allow");
+        }
+        for name in ["OPENAI_MODEL", "GEMINI_MODEL", "QWEN_CODE_SESSION_ID"] {
+            assert!(!allow.contains(&name), "{name} is not a credential name");
+        }
+    }
+
+    /// A stand-in `qwen` that checks the headless argv contract and answers
+    /// from a marker in its prompt. Emits the exact 0.27.4 `stream-json`
+    /// envelope: a `result` event carrying `session_id`, `is_error`,
+    /// `subtype` and `result`/`error.message`.
+    fn qwen_executable(path: &Path) {
+        write_fast_script(
+            path,
+            concat!(
+                "#!/bin/sh\n",
+                "set -eu\n",
+                "output_format=''\n",
+                "approval=''\n",
+                "model=''\n",
+                "resume=''\n",
+                "prompt=''\n",
+                "while [ \"$#\" -gt 0 ]; do\n",
+                "  case \"$1\" in\n",
+                "    -o|--output-format) output_format=\"$2\"; shift 2 ;;\n",
+                "    --approval-mode) approval=\"$2\"; shift 2 ;;\n",
+                "    -m|--model) model=\"$2\"; shift 2 ;;\n",
+                "    -r|--resume) resume=\"$2\"; shift 2 ;;\n",
+                "    --version) printf '0.27.4\\n'; exit 0 ;;\n",
+                "    -*) printf 'unexpected flag %s\\n' \"$1\" >&2; exit 64 ;;\n",
+                "    *) prompt=\"$1\"; shift ;;\n",
+                "  esac\n",
+                "done\n",
+                "[ \"$output_format\" = stream-json ] || exit 65\n",
+                "[ \"$approval\" = yolo ] || exit 66\n",
+                "case \"$prompt\" in\n",
+                "  *BUDGET_WALL*) printf 'FatalBudgetExceededError: wall-time budget exceeded\\n' >&2; exit 55 ;;\n",
+                "  *BUDGET_TURNS*) printf 'FatalTurnLimitedError: session turn limit reached\\n' >&2; exit 53 ;;\n",
+                "  *TRUNCATED*) printf '%s\\n' '{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"fixture-session\"}'; exit 0 ;;\n",
+                "  *MODEL_ERROR*)\n",
+                "    printf '%s\\n' \\\n",
+                "      '{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"fixture-error-session\"}' \\\n",
+                "      '{\"type\":\"result\",\"subtype\":\"error_during_execution\",\"is_error\":true,\"session_id\":\"fixture-error-session\",\"error\":{\"message\":\"model is overloaded\"}}'\n",
+                "    exit 1 ;;\n",
+                "  *)\n",
+                "    printf '%s\\n' \\\n",
+                "      '{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"fixture-session\"}' \\\n",
+                "      \"{\\\"type\\\":\\\"assistant\\\",\\\"message\\\":{\\\"role\\\":\\\"assistant\\\",\\\"model\\\":\\\"$model\\\"}}\" \\\n",
+                "      \"{\\\"type\\\":\\\"result\\\",\\\"subtype\\\":\\\"success\\\",\\\"is_error\\\":false,\\\"session_id\\\":\\\"fixture-session\\\",\\\"result\\\":\\\"qwen fixture result resumed=${resume:-none}\\\"}\"\n",
+                "    exit 0 ;;\n",
+                "esac\n",
+            ),
+        );
+    }
+
+    fn qwen_manifest(executable: &Path) -> HarnessManifest {
+        generate_manifest(
+            "qwen",
+            executable.canonicalize().unwrap(),
+            &help_fixture("qwen-0.27.4.txt"),
+        )
+        .unwrap()
+    }
+
+    async fn run_qwen(
+        manifest: &HarnessManifest,
+        workspace: &Path,
+        prompt: &str,
+        model: Option<&str>,
+        resume_session: Option<&str>,
+    ) -> Result<brgr_runner::ExecutionOutput, RunnerError> {
+        ProcessRunner::run(
+            manifest,
+            brgr_runner::RunRequest {
+                workspace,
+                prompt,
+                criteria: None,
+                instructions: None,
+                model,
+                effort: None,
+                resume_session,
+                permission: None,
+                deadline: Duration::from_mins(1),
+                cancel_path: None,
+                pid_path: None,
+            },
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn a_qwen_run_seals_the_pinned_stream_json_result() {
+        let root = tempfile::tempdir().unwrap();
+        let executable = root.path().join("qwen");
+        qwen_executable(&executable);
+        let manifest = qwen_manifest(&executable);
+        let output = run_qwen(
+            &manifest,
+            root.path(),
+            "fixture task",
+            Some("qwen3-coder"),
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(output.succeeded(&manifest));
+        assert_eq!(output.result, b"qwen fixture result resumed=none");
+        assert_eq!(output.session_id.as_deref(), Some("fixture-session"));
+        assert_eq!(output.observed_model.as_deref(), Some("qwen3-coder"));
+    }
+
+    #[tokio::test]
+    async fn a_qwen_model_error_fails_naming_the_event_error() {
+        let root = tempfile::tempdir().unwrap();
+        let executable = root.path().join("qwen");
+        qwen_executable(&executable);
+        let manifest = qwen_manifest(&executable);
+        let output = run_qwen(&manifest, root.path(), "MODEL_ERROR", None, None)
+            .await
+            .unwrap();
+        assert!(!output.succeeded(&manifest));
+        assert!(output.result.is_empty());
+        assert_eq!(
+            output.failure_cause().map(|cause| cause.text),
+            Some("model is overloaded".to_owned())
+        );
+    }
+
+    /// The CLI's own run budgets — wall time and tool calls exit 55, the
+    /// session-turn cap exits 53 — are failed runs, never lost ones.
+    #[tokio::test]
+    async fn a_qwen_budget_stop_exits_with_the_budget_code() {
+        let root = tempfile::tempdir().unwrap();
+        let executable = root.path().join("qwen");
+        qwen_executable(&executable);
+        let manifest = qwen_manifest(&executable);
+        for (marker, code) in [("BUDGET_WALL", 55), ("BUDGET_TURNS", 53)] {
+            let output = run_qwen(&manifest, root.path(), marker, None, None)
+                .await
+                .unwrap();
+            assert_eq!(output.exit_code, Some(code), "{marker}");
+            assert!(!output.succeeded(&manifest), "{marker}");
+            assert!(
+                manifest
+                    .result
+                    .budget_exit_codes
+                    .contains(&output.exit_code.unwrap()),
+                "{marker}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_qwen_stream_without_a_result_event_is_a_typed_failure() {
+        let root = tempfile::tempdir().unwrap();
+        let executable = root.path().join("qwen");
+        qwen_executable(&executable);
+        let manifest = qwen_manifest(&executable);
+        let outcome = run_qwen(&manifest, root.path(), "TRUNCATED", None, None).await;
+        assert!(matches!(outcome, Err(RunnerError::MissingResultEvent)));
+    }
+
+    /// A follow-up run resumes the session id its terminal result named.
+    #[tokio::test]
+    async fn a_qwen_follow_up_resumes_the_recorded_session() {
+        let root = tempfile::tempdir().unwrap();
+        let executable = root.path().join("qwen");
+        qwen_executable(&executable);
+        let manifest = qwen_manifest(&executable);
+        let output = run_qwen(&manifest, root.path(), "follow up", None, Some("session-9"))
+            .await
+            .unwrap();
+        assert!(output.succeeded(&manifest));
+        assert_eq!(output.result, b"qwen fixture result resumed=session-9");
+    }
+
+    /// Envelopes from other releases — `response`, `messages`, a success
+    /// event without text — are refused, never guessed at.
+    #[test]
+    fn foreign_stream_json_envelopes_are_refused() {
+        for stream in [
+            r#"{"response":{"result":"text"}}
+"#,
+            r#"{"type":"result","subtype":"success","is_error":false,"messages":[{"role":"assistant","content":"text"}],"session_id":"s"}
+"#,
+            r#"{"type":"result","subtype":"success","is_error":false,"result":42,"session_id":"s"}
+"#,
+            r#"{"type":"result","subtype":"success","session_id":"s"}
+"#,
+            r#"{"type":"result","subtype":"success","is_error":false,"result":"  ","session_id":"s"}
+"#,
+        ] {
+            assert!(
+                matches!(
+                    brgr_runner::extract_stream_json_result(stream.as_bytes()),
+                    Err(RunnerError::UnexpectedResultShape
+                        | RunnerError::MissingAssistantText
+                        | RunnerError::MissingResultEvent)
+                ),
+                "{stream:?} was accepted"
+            );
+        }
+        assert!(matches!(
+            brgr_runner::extract_stream_json_result(b""),
+            Err(RunnerError::MissingResultEvent)
+        ));
     }
 }

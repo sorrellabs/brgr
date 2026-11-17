@@ -38,6 +38,7 @@
         "argv": { "$ref": "#/$defs/argv" },
         "model_argv": { "$ref": "#/$defs/argv" },
         "effort_argv": { "$ref": "#/$defs/argv" },
+        "resume_argv": { "$ref": "#/$defs/argv" },
         "env_allow": {
           "type": "array", "uniqueItems": true, "maxItems": 32,
           "items": { "type": "string", "pattern": "^[A-Z_][A-Z0-9_]*$" }
@@ -72,12 +73,14 @@
           "oneOf": [
             { "type": "object", "additionalProperties": false, "required": ["kind"], "properties": { "kind": { "const": "stdout" } } },
             { "type": "object", "additionalProperties": false, "required": ["kind"], "properties": { "kind": { "const": "jsonl_assistant_final" } } },
+            { "type": "object", "additionalProperties": false, "required": ["kind"], "properties": { "kind": { "const": "stream_json_result" } } },
             { "type": "object", "additionalProperties": false, "required": ["kind", "path"], "properties": { "kind": { "const": "file" }, "path": { "type": "string", "minLength": 1 } } }
           ]
         },
         "media_type": { "type": "string", "minLength": 1 },
         "max_bytes": { "type": "integer", "minimum": 1, "maximum": 20971520 },
-        "success_exit_codes": { "type": "array", "minItems": 1, "items": { "type": "integer" } }
+        "success_exit_codes": { "type": "array", "minItems": 1, "items": { "type": "integer" } },
+        "budget_exit_codes": { "type": "array", "maxItems": 8, "items": { "type": "integer" } }
       }
     },
     "capabilities": {

@@ -236,6 +236,7 @@ fn result() -> ResultEnvelope {
         route_observation: None,
         unresolved_effects: vec![],
         slept_seconds: None,
+        harness_session_id: None,
     }
 }
 

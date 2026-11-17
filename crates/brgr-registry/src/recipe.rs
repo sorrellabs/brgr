@@ -41,6 +41,12 @@ pub(crate) struct Recipe {
     pub(crate) argv: &'static [&'static str],
     pub(crate) model_argv: &'static [&'static str],
     pub(crate) effort_argv: &'static [&'static str],
+    /// Arguments a follow-up run adds to resume the session a result named;
+    /// empty for a harness with no resume flag.
+    pub(crate) resume_argv: &'static [&'static str],
+    /// Exit codes that mean the harness stopped on its own run or session
+    /// budget rather than a brgr deadline.
+    pub(crate) budget_exit_codes: &'static [i32],
     /// When set, effort is offered only if the help text documents this flag.
     pub(crate) effort_requires: Option<&'static str>,
     /// When set, model is offered only if the help text documents this flag.
@@ -82,6 +88,7 @@ pub(crate) enum Catalog {
 pub(crate) enum Source {
     Stdout,
     JsonlAssistantFinal,
+    StreamJsonResult,
 }
 
 #[derive(Clone, Copy)]
@@ -122,6 +129,8 @@ pub(crate) const GENERIC: Recipe = Recipe {
     argv: &["--prompt-file", "${input.prompt_file}"],
     model_argv: &[],
     effort_argv: &[],
+    resume_argv: &[],
+    budget_exit_codes: &[],
     effort_requires: None,
     model_requires: None,
     own_process: None,
@@ -667,6 +676,74 @@ pub(crate) const RECIPES: &[Recipe] = &[
         ..GENERIC
     },
     Recipe {
+        names: &["qwen"],
+        packages: &["@qwen-code"],
+        id: "local.qwen",
+        required_flags: &[
+            "-o, --output-format",
+            "-m, --model",
+            "--approval-mode",
+            "-r, --resume",
+        ],
+        // The positional prompt; `-p/--prompt` is deprecated in favour of it.
+        argv: &["-o", "stream-json", "${input.prompt}"],
+        // No model list; the CLI refuses an unknown name before a request.
+        catalog: Some((&[], Catalog::CliValidated)),
+        model_argv: MODEL,
+        // A result event's `session_id` resumes with `--resume <id>`.
+        resume_argv: &["--resume", "${input.session}"],
+        // `--max-wall-time`/`--max-tool-calls` raise FatalBudgetExceededError
+        // (exit 55), `--max-session-turns` FatalTurnLimitedError (exit 53):
+        // the CLI's own run budgets, not a brgr deadline.
+        budget_exit_codes: &[53, 55],
+        // BASE_ENV plus the credential variables each `--auth-type` reads in
+        // 0.27.4 (openai/anthropic/dashscope/gemini/vertex-ai); nothing else.
+        env_allow: &[
+            "HOME",
+            "PATH",
+            "LANG",
+            "TMPDIR",
+            "USER",
+            "QWEN_API_KEY",
+            "QWEN_BASE_URL",
+            "DASHSCOPE_API_KEY",
+            "DASHSCOPE_PROXY_BASE_URL",
+            "OPENAI_API_KEY",
+            "OPENAI_BASE_URL",
+            "OPENAI_API_BASE",
+            "ANTHROPIC_API_KEY",
+            "ANTHROPIC_BASE_URL",
+            "ANTHROPIC_AUTH_TOKEN",
+            "GEMINI_API_KEY",
+            "GOOGLE_API_KEY",
+            "GOOGLE_CLOUD_PROJECT",
+            "GOOGLE_CLOUD_LOCATION",
+            "GOOGLE_APPLICATION_CREDENTIALS",
+            "GOOGLE_GENAI_USE_VERTEXAI",
+            "GOOGLE_GENAI_USE_GCA",
+            "GOOGLE_GEMINI_BASE_URL",
+            "GOOGLE_VERTEX_BASE_URL",
+        ],
+        source: Source::StreamJsonResult,
+        media_type: "text/markdown",
+        capabilities: &[
+            PROCESS_CAPS[0],
+            PROCESS_CAPS[1],
+            ("model_select", Cap::Supported("--model")),
+            ("effort_select", Cap::Unsupported("not_documented")),
+        ],
+        full: Some(&["--approval-mode", "yolo"]),
+        edits: None,
+        read_only: None,
+        interactive: Some(Interactive {
+            kind: "qwen",
+            argv: &[],
+            effort_print_only: false,
+            model_print_only_with: None,
+        }),
+        ..GENERIC
+    },
+    Recipe {
         names: &["pi"],
         id: "local.pi",
         required_flags: &[
@@ -856,6 +933,7 @@ pub(crate) fn draft(
             } else {
                 vec![]
             },
+            resume_argv: strings(recipe.resume_argv),
             effort_argv: if effort {
                 strings(recipe.effort_argv)
             } else {
@@ -885,9 +963,11 @@ pub(crate) fn draft(
             source: match recipe.source {
                 Source::Stdout => ResultSource::Stdout,
                 Source::JsonlAssistantFinal => ResultSource::JsonlAssistantFinal,
+                Source::StreamJsonResult => ResultSource::StreamJsonResult,
             },
             media_type: recipe.media_type.to_owned(),
             max_bytes: 1_048_576,
+            budget_exit_codes: recipe.budget_exit_codes.to_vec(),
             success_exit_codes: vec![0],
         },
         capabilities: recipe

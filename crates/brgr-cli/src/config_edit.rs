@@ -14,6 +14,7 @@ pub(crate) const TIERS: &[(&str, u8)] = &[
     ("local.omp", 2),
     ("local.omp-herdr", 2),
     ("local.opencode", 2),
+    ("local.qwen", 2),
     ("local.cline", 2),
     ("local.copilot", 3),
     ("local.gemini", 3),

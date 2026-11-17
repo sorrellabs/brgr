@@ -81,6 +81,7 @@ pub(crate) async fn run_single_attempt(
         &mut producer_seq,
     )?;
 
+    let resume_session = resumable_session(store, spec, manifest)?;
     let execution = await_with_cancellation(
         ProcessRunner::run_with_delegation(
             manifest,
@@ -94,6 +95,7 @@ pub(crate) async fn run_single_attempt(
                 instructions: Some(&spec.instructions),
                 model: spec.route.requested_model.as_deref(),
                 effort: spec.route.requested_effort.as_deref(),
+                resume_session: resume_session.as_deref(),
                 permission: spec.permission,
                 deadline: Duration::from_secs(spec.budget.deadline_seconds),
                 cancel_path: control.cancel_path,
@@ -313,6 +315,22 @@ fn decode_pane_diagnostic(json: &str) -> Option<PaneDiagnostic> {
     })
 }
 
+/// A revision follows up on the run it replaces: a harness whose recipe
+/// declares `resume_argv` resumes the session the previous revision
+/// recorded, instead of starting a cold session it cannot continue.
+pub(crate) fn resumable_session(
+    store: &Store,
+    spec: &TaskSpec,
+    manifest: &HarnessManifest,
+) -> Result<Option<String>, StoreError> {
+    if spec.revision <= 1 || manifest.launch.resume_argv.is_empty() {
+        return Ok(None);
+    }
+    Ok(store
+        .revision_result(spec.task_id, spec.revision - 1)?
+        .and_then(|result| result.harness_session_id))
+}
+
 pub(crate) fn finish_execution(
     store: &Store,
     spec: &TaskSpec,
@@ -440,6 +458,7 @@ fn finish_execution_result(
                 None,
             );
             result.slept_seconds = output.slept_seconds;
+            result.harness_session_id.clone_from(&output.session_id);
             result.unresolved_effects.extend(unresolved_effects);
             if let Some(observation) = route_observation(manifest, observed_model) {
                 result.route_observation = Some(observation);
@@ -451,7 +470,7 @@ fn finish_execution_result(
             spec,
             attempt_id,
             TerminalOutcome::Failed,
-            execution_failure_reason(&output),
+            execution_failure_reason(manifest, &output),
             Some(&output),
         )),
         Err(error) => Ok(result_for(
@@ -515,11 +534,25 @@ fn route_observation(
     })
 }
 
-pub(crate) fn execution_failure_reason(output: &ExecutionOutput) -> String {
+pub(crate) fn execution_failure_reason(
+    manifest: &HarnessManifest,
+    output: &ExecutionOutput,
+) -> String {
+    let budget_stop = output
+        .exit_code
+        .is_some_and(|code| manifest.result.budget_exit_codes.contains(&code));
     let reason = if output.timed_out {
         "attempt deadline elapsed".to_owned()
     } else if output.output_truncated {
         "process output exceeded the configured limit".to_owned()
+    } else if budget_stop {
+        // The harness's own run or session budget ended it (Qwen Code exits
+        // 55, or 53 at its session-turn cap). That is a failed run with a
+        // named cause, never a lost one.
+        format!(
+            "harness stopped on its own run budget (exit {})",
+            output.exit_code.expect("a budget stop has a code")
+        )
     } else if output.result.is_empty() {
         "process produced no result artifact".to_owned()
     } else {
@@ -587,6 +620,7 @@ pub(crate) fn terminal_with_requested_logs(
     let mut result = result_for(spec, attempt_id, outcome, artifacts, Some(error));
     result.unresolved_effects = unresolved_effects;
     result.slept_seconds = output.and_then(|value| value.slept_seconds);
+    result.harness_session_id = output.and_then(|value| value.session_id.clone());
     result
 }
 
@@ -699,6 +733,7 @@ pub(crate) fn result_for(
         route_observation: Some(RouteObservation::unavailable()),
         unresolved_effects: vec![],
         slept_seconds: None,
+        harness_session_id: None,
     }
 }
 
@@ -714,6 +749,42 @@ pub(crate) fn sha256(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod failure_reason_tests {
     use super::*;
+    use brgr_runner::{
+        ExecutionMode, LaunchSpec, MANIFEST_SCHEMA_V1, PROCESS_ADAPTER_V1, PermissionArgv,
+        ProbeSpec, ResultSource, ResultSpec,
+    };
+
+    fn manifest(budget_exit_codes: &[i32]) -> HarnessManifest {
+        HarnessManifest {
+            schema: MANIFEST_SCHEMA_V1.to_owned(),
+            id: "local.fixture".to_owned(),
+            adapter: PROCESS_ADAPTER_V1.to_owned(),
+            executable: std::path::PathBuf::from("/bin/echo"),
+            probe: ProbeSpec {
+                version_argv: vec!["--version".to_owned()],
+                help_argv: vec!["--help".to_owned()],
+                model_catalog: None,
+            },
+            launch: LaunchSpec {
+                argv: vec![],
+                model_argv: vec![],
+                effort_argv: vec![],
+                resume_argv: vec![],
+                env_allow: vec![],
+                mode: ExecutionMode::OneShot,
+                permission_argv: PermissionArgv::default(),
+                interactive: None,
+            },
+            result: ResultSpec {
+                source: ResultSource::Stdout,
+                media_type: "text/plain".to_owned(),
+                max_bytes: 1_048_576,
+                success_exit_codes: vec![0],
+                budget_exit_codes: budget_exit_codes.to_vec(),
+            },
+            capabilities: std::collections::BTreeMap::default(),
+        }
+    }
 
     fn failed(stderr: &str) -> ExecutionOutput {
         ExecutionOutput {
@@ -722,6 +793,7 @@ mod failure_reason_tests {
             stderr: stderr.as_bytes().to_vec(),
             result: Vec::new(),
             observed_model: None,
+            session_id: None,
             timed_out: false,
             cancelled: false,
             output_truncated: false,
@@ -738,15 +810,43 @@ mod failure_reason_tests {
             Error when talking to Gemini API TerminalQuotaError: You have exhausted your daily quota\n\
                 at classifyGoogleError (file:///x.js:1:1)\n\
             }";
-        let reason = execution_failure_reason(&failed(gemini));
+        let reason = execution_failure_reason(&manifest(&[]), &failed(gemini));
         assert!(reason.starts_with("process produced no result artifact; last stderr: "));
         assert!(reason.contains("exhausted your daily quota"), "{reason}");
         assert!(
-            execution_failure_reason(&failed("Error: Insufficient credits for Command Code."))
-                .ends_with("last stderr: Error: Insufficient credits for Command Code.")
+            execution_failure_reason(
+                &manifest(&[]),
+                &failed("Error: Insufficient credits for Command Code.")
+            )
+            .ends_with("last stderr: Error: Insufficient credits for Command Code.")
         );
         assert_eq!(
-            execution_failure_reason(&failed("")),
+            execution_failure_reason(&manifest(&[]), &failed("")),
+            "process produced no result artifact"
+        );
+    }
+
+    /// A Qwen Code run that ends on its own `--max-wall-time` /
+    /// `--max-tool-calls` (55) or `--max-session-turns` (53) budget is a failed
+    /// run that names the budget, not a lost run.
+    #[test]
+    fn a_harness_budget_exit_names_the_budget() {
+        for code in [53, 55] {
+            let mut output = failed("FatalBudgetExceededError: wall-time budget exceeded");
+            output.exit_code = Some(code);
+            let reason = execution_failure_reason(&manifest(&[53, 55]), &output);
+            assert!(
+                reason.starts_with(&format!(
+                    "harness stopped on its own run budget (exit {code}); last stderr: "
+                )),
+                "{reason}"
+            );
+        }
+        // An exit the manifest does not declare keeps the generic reason.
+        let mut output = failed("");
+        output.exit_code = Some(55);
+        assert_eq!(
+            execution_failure_reason(&manifest(&[]), &output),
             "process produced no result artifact"
         );
     }
@@ -758,7 +858,7 @@ mod failure_reason_tests {
 "#
         .to_vec();
         assert_eq!(
-            execution_failure_reason(&output),
+            execution_failure_reason(&manifest(&[]), &output),
             "process produced no result artifact; last error event: Connect error resource_exhausted: Error"
         );
     }

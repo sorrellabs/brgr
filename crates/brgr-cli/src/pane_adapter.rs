@@ -239,6 +239,7 @@ pub(crate) fn pane_process_manifest(
         launch: LaunchSpec {
             argv,
             model_argv: vec![],
+            resume_argv: vec![],
             effort_argv: vec![],
             env_allow: activated
                 .launch
@@ -284,6 +285,7 @@ pub(crate) fn pane_process_manifest(
             source: ResultSource::Stdout,
             media_type: activated.result.media_type.clone(),
             max_bytes: launch.spec.artifact_contract.max_bytes,
+            budget_exit_codes: vec![],
             success_exit_codes: vec![0],
         },
         capabilities: activated.capabilities.clone(),
@@ -1605,6 +1607,7 @@ mod interactive_model_tests {
                     "-p".to_owned(),
                 ],
                 model_argv: model_argv.iter().map(|value| (*value).to_owned()).collect(),
+                resume_argv: vec![],
                 effort_argv: vec![],
                 env_allow: ["HOME", "PATH", "LANG", "TMPDIR"]
                     .into_iter()
@@ -1628,6 +1631,7 @@ mod interactive_model_tests {
                 source: ResultSource::Stdout,
                 media_type: "text/plain".to_owned(),
                 max_bytes: 1_048_576,
+                budget_exit_codes: vec![],
                 success_exit_codes: vec![0],
             },
             capabilities: BTreeMap::new(),

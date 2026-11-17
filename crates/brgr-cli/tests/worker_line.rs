@@ -142,6 +142,7 @@ fn seed_failed(home: &Path, owner: &str, request: &str, session: &str) {
         route_observation: None,
         unresolved_effects: vec![],
         slept_seconds: None,
+        harness_session_id: None,
     };
     store
         .commit_terminal_result(&task.owner_id, &envelope)

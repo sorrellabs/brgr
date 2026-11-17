@@ -367,6 +367,7 @@ fn result_ack_clears_older_failures_and_unblocks_prune() {
         route_observation: None,
         unresolved_effects: vec![],
         slept_seconds: None,
+        harness_session_id: None,
     };
     store
         .commit_terminal_result(&next.owner_id, &candidate)
