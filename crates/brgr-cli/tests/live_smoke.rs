@@ -293,6 +293,7 @@ fn the_workflow_files_one_issue_per_harness_and_failure_kind() {
 /// list, not nothing, so a wrong filter here commented on a nonexistent
 /// issue instead of opening one.
 #[test]
+#[allow(clippy::too_many_lines)] // Runs the workflow's filing step against fake `gh` listings.
 fn an_open_issues_number_is_only_used_when_there_is_one() {
     let block = {
         let text = workflow();
