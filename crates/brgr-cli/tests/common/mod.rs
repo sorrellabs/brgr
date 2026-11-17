@@ -256,38 +256,28 @@ pub fn calls(dir: &Path) -> String {
     fs::read_to_string(dir.join("calls.log")).unwrap_or_default()
 }
 
-/// A worker's own identity. `cargo test` inside a worker inherits it, and a
-/// fixture command must not: a stale parent attempt or a session that
-/// disagrees with `CODEX_THREAD_ID` fails the command before it runs.
-pub const INHERITED_WORKER_ENV: &[&str] = &[
-    "BRGR_HOME",
-    "BRGR_BIN",
-    "BRGR_OWNER_ID",
-    "BRGR_SESSION_ID",
-    "BRGR_PARENT_TASK_ID",
-    "BRGR_PARENT_ATTEMPT_ID",
-    "BRGR_WORKER_HERDR_CONTEXT",
-    "CODEX_THREAD_ID",
-    "CLAUDE_CODE_SESSION_ID",
-    "CURSOR_CONVERSATION_ID",
-];
+/// Copied from the caller after [`Command::env_clear`]. Tests that need an
+/// owner, host, or other fixture identity set it explicitly afterwards.
+const ISOLATED_ENV_ALLOWLIST: &[&str] = &["PATH", "HOME", "TMPDIR"];
 
-/// The brgr binary under test, with the worker identity removed. Debug builds
-/// trust a faked `HERDR_PANE_ID` only with `BRGR_TEST_TRUST_HERDR_PANE`.
+/// The brgr binary under test, with a cleared environment plus the allowlist.
+/// Debug builds trust a faked `HERDR_PANE_ID` only with `BRGR_TEST_TRUST_HERDR_PANE`.
 pub fn brgr_command() -> Command {
     let mut command = Command::new(brgr_binary());
-    command.env("BRGR_TEST_TRUST_HERDR_PANE", "1");
     isolate_test_command(&mut command);
+    command.env("BRGR_TEST_TRUST_HERDR_PANE", "1");
     command
 }
 
-/// Removes inherited worker/Herdr identity and supplies the isolated test PATH
-/// for any intermediary process that may execute brgr.
+/// Starts `command` from a cleared environment, then restores the allowlist
+/// and the isolated test PATH. Use this for any process that may execute brgr.
 pub fn isolate_test_command(command: &mut Command) {
-    for name in INHERITED_WORKER_ENV {
-        command.env_remove(name);
+    command.env_clear();
+    for name in ISOLATED_ENV_ALLOWLIST {
+        if let Some(value) = env::var_os(name) {
+            command.env(name, value);
+        }
     }
-    clear_inherited_herdr_env(command);
     // Harness children inherit PATH (but the runner removes HERDR_BIN_PATH),
     // so put a failing Herdr stub first while preserving every existing tool.
     command.env("PATH", test_path());
@@ -457,6 +447,48 @@ pub fn add_fixture(home: &Path, fixture: &Path, scratch: &Path) {
         &[],
     ));
     assert!(receipt["scratch_result_digest"].as_str().is_some());
+}
+
+#[test]
+fn isolated_test_command_starts_from_cleared_env_plus_allowlist() {
+    let mut command = Command::new("/usr/bin/env");
+    command
+        .env("OPENCODE_SESSION_ID", "leaked-opencode")
+        .env("CLAUDE_CODE_SESSION_ID", "leaked-claude")
+        .env("CURSOR_CONVERSATION_ID", "leaked-cursor")
+        .env("BRGR_UNRELATED_LEAK", "should-not-pass");
+    isolate_test_command(&mut command);
+    let output = command.output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let text = String::from_utf8_lossy(&output.stdout);
+    let names: Vec<&str> = text
+        .lines()
+        .filter_map(|line| line.split_once('=').map(|(name, _)| name))
+        .collect();
+    for forbidden in [
+        "OPENCODE_SESSION_ID",
+        "CLAUDE_CODE_SESSION_ID",
+        "CURSOR_CONVERSATION_ID",
+        "BRGR_UNRELATED_LEAK",
+        "CODEX_THREAD_ID",
+        "BRGR_SESSION_ID",
+        "BRGR_OWNER_ID",
+        "BRGR_HOME",
+    ] {
+        assert!(
+            !names.contains(&forbidden),
+            "{forbidden} leaked into isolated command env:\n{text}"
+        );
+    }
+    assert!(names.contains(&"PATH"), "PATH missing:\n{text}");
+    assert!(names.contains(&"HOME"), "HOME missing:\n{text}");
+    if env::var_os("TMPDIR").is_some() {
+        assert!(names.contains(&"TMPDIR"), "TMPDIR missing:\n{text}");
+    }
 }
 
 #[test]

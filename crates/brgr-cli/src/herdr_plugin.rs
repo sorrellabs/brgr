@@ -3,7 +3,6 @@
 use std::{
     env,
     ffi::OsString,
-    fmt::Write as _,
     fs,
     io::{self, IsTerminal as _, Write as _},
     os::unix::fs::PermissionsExt as _,
@@ -13,13 +12,9 @@ use std::{
 };
 
 use anyhow::{Context as _, Result, bail};
-use brgr_store::BoardStore;
 use serde::Deserialize;
 use tempfile::Builder;
-use tokio::{
-    process::Command,
-    time::{sleep, timeout},
-};
+use tokio::{process::Command, time::timeout};
 
 use crate::{
     Paths, codex_integration,
@@ -169,87 +164,17 @@ pub async fn open(no_focus: bool, codex: bool) -> Result<()> {
     Ok(())
 }
 
-fn board_snapshot(paths: &Paths) -> Result<String> {
-    let store = BoardStore::open_existing(&paths.store)?;
-    let mut output = String::from("brgr · managed tasks\n\n");
-    output.push_str("Codex owns final accept/reject. Use the Herdr 'Open Codex for brgr' action to run or review work.\n\n");
-    output.push_str("TASK      PROJECT               HARNESS            REV  STATE       RESULT      DECISION\n");
-    let tasks = store.rows(20)?;
-    if tasks.is_empty() {
-        output.push_str("No managed tasks yet.\n");
-    }
-    for task in tasks {
-        let project = Path::new(&task.workspace)
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("-");
-        let task_id = task.task_id.to_string();
-        let outcome = task.result_outcome.map_or_else(
-            || "-".to_owned(),
-            |value| format!("{value:?}").to_lowercase(),
-        );
-        let verdict = task.decision_verdict.map_or_else(
-            || "-".to_owned(),
-            |value| format!("{value:?}").to_lowercase(),
-        );
-        writeln!(
-            output,
-            "{:<9} {:<21} {:<18} {:<4} {:<11} {:<11} {}",
-            &task_id[..8],
-            truncate(project, 20),
-            truncate(&task.harness_id, 17),
-            task.revision,
-            format!("{:?}", task.attempt_state).to_lowercase(),
-            outcome,
-            verdict,
-        )?;
-    }
-    output.push_str(
-        "\nRead-only · latest 20 tasks · refreshes every 2 seconds · close the pane to exit\n",
-    );
-    Ok(output)
-}
-
-fn truncate(value: &str, max_chars: usize) -> String {
-    value
-        .chars()
-        .map(|character| {
-            if character.is_control() {
-                '\u{fffd}'
-            } else {
-                character
-            }
-        })
-        .take(max_chars)
-        .collect()
-}
-
 pub async fn board(paths: &Paths, once: bool) -> Result<()> {
     require_host()?;
-    loop {
-        match board_snapshot(paths) {
-            Ok(snapshot) => {
-                if once {
-                    print!("{snapshot}");
-                    return Ok(());
-                }
-                print!("\x1b[2J\x1b[H{snapshot}");
-                io::stdout().flush()?;
-            }
-            Err(error) => {
-                let rendered = format!(
-                    "brgr · managed tasks\n\nboard refresh failed: {error}\nNo tasks were mutated or reconciled.\n"
-                );
-                if once {
-                    eprint!("{rendered}");
-                    return Err(error);
-                }
-                print!("\x1b[2J\x1b[H{rendered}");
-                io::stdout().flush()?;
-            }
-        }
-        sleep(Duration::from_secs(2)).await;
-    }
+    crate::tui::run_board(
+        paths,
+        crate::tui::BoardOptions {
+            scope: crate::board::Scope::All,
+            host: crate::board::Host::HerdrPlugin,
+            once,
+        },
+    )
+    .await
 }
 
 pub async fn codex(paths: &Paths) -> Result<()> {
@@ -476,10 +401,5 @@ mod tests {
             codex_env_config("PATH", value).unwrap(),
             r#"shell_environment_policy.set.PATH="/tmp/a b/\"quote\"""#
         );
-    }
-
-    #[test]
-    fn board_cells_replace_terminal_control_characters() {
-        assert_eq!(super::truncate("repo\n\u{1b}[31m", 20), "repo��[31m");
     }
 }

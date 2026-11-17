@@ -12,10 +12,11 @@
 
 use std::{
     fs,
-    io::{Read as _, Seek as _, SeekFrom, Write as _},
+    io::{Read, Seek as _, SeekFrom, Write},
     os::unix::fs::PermissionsExt as _,
     path::PathBuf,
     process::{Command, Stdio},
+    thread,
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -62,7 +63,7 @@ pub(crate) fn now() -> u64 {
 }
 
 /// A session id names a file, so it is held to what real ones look like.
-fn valid_session(session: &str) -> bool {
+pub(crate) fn valid_session(session: &str) -> bool {
     !session.is_empty()
         && session.len() <= 128
         && session
@@ -245,10 +246,43 @@ fn expand_home(word: &str) -> String {
     }
 }
 
+fn worker_segment(paths: &Paths, workers: bool, signal: Option<&Signal>) -> Option<String> {
+    if !workers {
+        return None;
+    }
+    let signal = signal?;
+    crate::worker_line::read(paths, &signal.session, now())
+        .and_then(|counts| crate::worker_line::segment(&counts))
+}
+
+fn print_plain(usage: &str, segment: Option<&str>) {
+    match (usage.is_empty(), segment) {
+        (true, None) => {}
+        (false, None) => println!("{usage}"),
+        (true, Some(segment)) => println!("{segment}"),
+        (false, Some(segment)) => println!("{usage} · {segment}"),
+    }
+}
+
+fn copy_stdout(child_stdout: &mut impl Read, sink: &mut impl Write) -> std::io::Result<Option<u8>> {
+    let mut buf = [0_u8; 8192];
+    let mut last = None;
+    loop {
+        let n = child_stdout.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        sink.write_all(&buf[..n])?;
+        last = Some(buf[n - 1]);
+    }
+    sink.flush()?;
+    Ok(last)
+}
+
 /// `brgr __context`: runs as a status line command. It records what it was
 /// given, then runs `chain` with the same input so the user's own status line
 /// still draws. Recording never fails the status line.
-pub(crate) fn run(paths: &Paths, source: &str, chain: &[String]) -> Result<()> {
+pub(crate) fn run(paths: &Paths, source: &str, workers: bool, chain: &[String]) -> Result<()> {
     let mut input = Vec::new();
     std::io::stdin().take(INPUT_LIMIT).read_to_end(&mut input)?;
     let signal = serde_json::from_slice::<Value>(&input)
@@ -257,23 +291,50 @@ pub(crate) fn run(paths: &Paths, source: &str, chain: &[String]) -> Result<()> {
     if let Some(signal) = &signal {
         let _ = record(paths, signal);
     }
+    let segment = worker_segment(paths, workers, signal.as_ref());
     let chain: Vec<String> = chain.iter().map(|word| expand_home(word)).collect();
     let Some((program, arguments)) = chain.split_first() else {
-        if let Some(signal) = &signal {
-            println!("{}", summary(signal));
-        }
+        print_plain(
+            &signal.as_ref().map_or(String::new(), summary),
+            segment.as_deref(),
+        );
         return Ok(());
     };
+    if segment.is_none() {
+        let mut child = Command::new(program)
+            .args(arguments)
+            .stdin(Stdio::piped())
+            .spawn()
+            .with_context(|| format!("could not run the chained status line `{program}`"))?;
+        if let Some(mut stdin) = child.stdin.take() {
+            // A chained command that ignores its input closes the pipe early.
+            let _ = stdin.write_all(&input);
+        }
+        child.wait()?;
+        return Ok(());
+    }
     let mut child = Command::new(program)
         .args(arguments)
         .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
         .spawn()
         .with_context(|| format!("could not run the chained status line `{program}`"))?;
+    let mut child_stdout = child.stdout.take().expect("piped stdout");
+    let copied =
+        thread::spawn(move || copy_stdout(&mut child_stdout, &mut std::io::stdout().lock()));
     if let Some(mut stdin) = child.stdin.take() {
-        // A chained command that ignores its input closes the pipe early.
         let _ = stdin.write_all(&input);
     }
+    let last = copied
+        .join()
+        .unwrap_or_else(|_| Err(std::io::Error::other("status line copy thread panicked")))?;
     child.wait()?;
+    if last.is_some_and(|byte| byte != b'\n') {
+        println!();
+    }
+    if let Some(segment) = segment {
+        println!("{segment}");
+    }
     Ok(())
 }
 

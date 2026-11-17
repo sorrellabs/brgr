@@ -29,21 +29,23 @@ brgr config set-codex-executable "$(command -v codex)"
 yet reported the pane's Codex session ID, brgr verifies the exact Codex pane
 and reports the bound session before delivering a completion notification.
 
-Herdr exposes three workspace actions: **Open brgr status** opens a live,
-read-only board of the latest 20 tasks; **Open Codex for brgr** starts a new
-Codex pane in the selected worktree or workspace; **Check brgr** reports
-integration and harness health. Opening the Codex pane installs or updates only
-brgr-owned Codex hooks and its skill, then launches Codex with the plugin's
-built binary on `PATH`. A private bridge tied to that pane executes brgr CLI
-commands in the Herdr host, where supervisor process inspection is available;
-Codex keeps its ordinary command sandbox and receives access only to an
-ephemeral bridge directory. The host accepts managed task, result, decision,
-health, and cleanup commands, pins them to the selected workspace and brgr
-control home, and rejects harness mutation or integration commands. Plugin
-installation itself does not run a paid model or activate a harness. Register
-an approved executable with a small authorized scratch run outside the plugin
-Codex pane before using it for a task. The board shows task status, route, and
-decision state without revealing prompts or artifact contents.
+Herdr exposes three workspace actions: **Open brgr status** opens `brgr tui` in
+a pane, a live, read-only board of the latest 20 tasks for every owner;
+**Open Codex for brgr** starts a new Codex pane in the selected worktree or
+workspace; **Check brgr** reports integration and harness health. Opening the
+Codex pane installs or updates only brgr-owned Codex hooks and its skill, then
+launches Codex with the plugin's built binary on `PATH`. A private bridge tied
+to that pane executes brgr CLI commands in the Herdr host, where supervisor
+process inspection is available; Codex keeps its ordinary command sandbox and
+receives access only to an ephemeral bridge directory. The host accepts managed
+task, result, decision, health, and cleanup commands, pins them to the selected
+workspace and brgr control home, and rejects harness mutation or integration
+commands. Plugin installation itself does not run a paid model or activate a
+harness. Register an approved executable with a small authorized scratch run
+outside the plugin Codex pane before using it for a task. The board shows task
+id, project, harness, alias, model, revision, attempt state, result, and
+decision without revealing prompts, artifacts, or decision reasons. The owner
+session decides each sealed result; the board never does.
 
 See [the v2 plugin contract](v2-herdr-plugin.md) for ownership, context,
 recovery, and verification boundaries.
@@ -72,7 +74,7 @@ headless. The separate `local.omp-herdr` route retains its legacy
 |---|---|---|
 | 1 | Claude Code, Codex CLI, Cursor CLI, Devin CLI | Each release runs a real round through it first, and a failure stops the release |
 | 2 | Command Code, OMP, OpenCode, Cline | The recipe and screen rules are kept up, and it runs for real when its recipe changes. Bugs get fixed but do not stop a release |
-| 3 | GitHub Copilot CLI, Gemini CLI, Pi | The recipe and contract tests only, with fixes on report |
+| 3 | GitHub Copilot CLI, Gemini CLI, Pi, GJC | The recipe and contract tests only, with fixes on report |
 
 Devin CLI is a worker only: it cannot be an owner.
 
@@ -139,7 +141,7 @@ observation, and none expose a verified effort observation.
 ### Pane mode
 
 Generated recipes declare native TUI launches for Claude Code, Codex, Gemini
-CLI, GitHub Copilot CLI, Pi, Cursor, Devin, Cline, OMP, OpenCode, and
+CLI, GitHub Copilot CLI, Pi, Cursor, Devin, Cline, OMP, OpenCode, GJC, and
 Command Code. Codex runs every installed hook for a worker as well; brgr's
 own hook recognises a task worktree by the session's working directory and
 does nothing there, while the user's other hooks still run. Codex has no
@@ -185,8 +187,14 @@ for config, instructions, debate, and the current verification limits.
 ### Recursive workers
 
 Default TUI tasks own their native pane; an additional supervisor pane is not
-created. Set `brgr config set worker-placement tab` for new tabs or `adjacent`
-for a split beside the exact caller. Settings live at `$BRGR_HOME/config.toml`
+created. Set `brgr config set worker-placement tab` for new tabs, `adjacent`
+for a split beside the exact caller: later workers stack under the first, then
+fill a second column beside them when the area is wide enough, then a new tab
+once both columns are full, or `below` for one row under the caller, left to
+right, then a new tab when the row is full. While `worker-placement` is
+`below`, brgr 2.15.24 and older cannot read `config.toml` and commands that
+load it fail with "brgr config is invalid". Set it back to `adjacent` or `tab`
+before running an older release. Settings live at `$BRGR_HOME/config.toml`
 and do not move existing panes. Legacy auto-worker settings remain readable.
 
 Named routes live under `[aliases]` in `config.toml`; each entry stores a
@@ -198,12 +206,38 @@ registered harness and optional exact model and effort. Manage them with
 alias edits do not change existing tasks. Names may contain Korean text but
 cannot contain whitespace or control characters or start with `-`.
 
+By default `claude-route` is `claude-code-only`: a Claude model may run only
+through `--harness local.claude-code`. Set `brgr config set claude-route any`
+to allow other harnesses. The setting is not per-harness. Tightening with
+`brgr config set claude-route claude-code-only` always succeeds; violating
+saved aliases and harness defaults are left unchanged and later runs refuse
+them. The Herdr host bridge cannot change this setting.
+
+brgr recognizes a Claude model from the resolved model string, never the
+alias name. After ASCII-lowercasing, it splits on `/`; any provider segment
+`anthropic` is Claude. The last segment is split on non-alphanumeric
+characters; a token `claude`, `claude` followed only by digits (`claude3`),
+or `anthropic` is Claude. After cutting the model name at the first `:`, `#`
+or `@`, a remainder that is exactly `opus`, `sonnet`, `haiku` or `fable` is
+Claude (`sonnet`, `sonnet:high`). A family name counts only as the whole
+model name (`magnum-opus` is not Claude).
+
+Two cases stay invisible and are admitted as today: a proxy name that hides
+the model (a LiteLLM entry `litellm/smart` mapped to Claude upstream), and
+no model requested when the harness's own default happens to be Claude. brgr
+never reads a harness's own configuration.
+
+While `[routes]` is present (`claude = "any"`), 2.15.24 and earlier fail
+every command that loads the config (`unknown field routes`). Before
+downgrading, run `brgr config set claude-route claude-code-only`.
+
 In a terminal, `brgr config edit` opens a menu for adding, editing and removing
-aliases, choosing or clearing each harness's default model, and viewing harness
+aliases, choosing or clearing each harness's default model, choosing whether
+Claude models may run only on Claude Code or on any harness, and viewing harness
 health and tiers. Models come from the harness catalog when readable; otherwise
 enter an exact model name. Each completed change is saved immediately to the
 same config file as `brgr config set model MODEL --harness ID`. Esc or Back cancels the pending change;
-Ctrl+C exits. The editor skips the fixture and removed GJC harnesses. It requires
+Ctrl+C exits. The editor skips the fixture harness. It requires
 a terminal and refuses `--json`; agents and scripts should use
 commands such as `brgr config alias list` and
 `brgr config set model MODEL --harness ID` instead.
@@ -297,6 +331,15 @@ result exists, whether a decision exists). `brgr status --brief --json` is a
 compact array with keys `task_id`, `state`, `harness`, `elapsed_seconds`,
 `objective_head`.
 
+`brgr tui` is the task board in any terminal, not only the Herdr plugin pane.
+With an owner session it lists that session's tasks; without one it lists every
+owner and says so. `--mine` requires a session (or `--as SESSION`) and does not
+guess. `--all` lists every owner. `--once` prints one snapshot and exits.
+Piped or non-terminal stdout is the same snapshot, with no escape codes.
+`--json` is refused; use `brgr --json status` or `brgr status --brief`. The
+Herdr host bridge refuses it (`brgr status --brief` instead). The board never
+decides.
+
 `--deadline-seconds` counts awake time for a pane or headless run, on macOS and on
 Linux, so machine sleep extends the wall-clock duration before the run times out.
 When wall-clock time exceeds awake time by more than 60 seconds, the sealed result
@@ -314,7 +357,7 @@ brgr integrate claude install   # same skill for Claude Code
 ```
 
 Ask Codex, for example, “이 변경을 검토하면서 실패 사례도 확인해줘.”
-Codex owns the task criteria and the accept/reject decision; brgr owns the
+The owner session owns the task criteria and the accept/reject decision; brgr owns the
 bounded execution, sealed bytes, and durable inbox. The CLI remains an escape
 hatch for inspection and explicit operations:
 
@@ -452,9 +495,18 @@ that exact manifest supports model selection. Do not infer support for flags
 absent from the installed executable's help.
 See [agent-authored manifests](custom-harness-registration.md) for a
 documented CLI whose prompt shape needs a custom declarative recipe.
-For an already approved executable, `brgr harness add EXECUTABLE --workspace
-SCRATCH --prompt "small authorized probe"` is the combined probe, contract-test,
-scratch, activation, and health-check escape hatch. `--presentation-only`
+`brgr harness list` (and `brgr harness list --json`) shows each registered
+harness id, executable, version, and health; it reuses the harness array
+`brgr doctor` already computes.
+For an already approved executable, `brgr harness add EXECUTABLE` is the
+combined probe, contract-test, scratch, activation, and health-check escape
+hatch. `--prompt` defaults to `say ok`. When `--workspace` is omitted, brgr
+creates a temporary git repository with one commit, runs the scratch there,
+and deletes that directory afterwards. When `--workspace DIR` is given, the
+directory must already exist and sit outside the brgr control home; it does
+not have to be a git repository, and brgr does not create, commit in, or
+delete it (the harness itself may write files during the scratch run).
+`--presentation-only`
 registers the optional Herdr adapter without claiming a managed scratch run.
 Process activations created before this scratch requirement remain on disk but
 cannot start a new task; re-add each approved executable with an authorized
@@ -546,6 +598,16 @@ wrapping it would change its meaning. `uninstall` restores the previous member
 byte for byte, and leaves a status line you changed since. A leading `~/` in a
 chained command is expanded by brgr, since Cursor only promises it for the
 command path. Codex needs no change to its config beyond the hooks it already has.
+
+To also show this Claude Code session's own workers, install with
+`brgr integrate claude install --context --workers` (`--workers` needs
+`--context`). The status line then adds a worker segment after the usage text
+(for example `⚙3 ✓1 ✗0`), or on the next line when a chained status line already
+draws, and `?N` only when a worker is asking. The counts are this bound session's. Cursor's installer never
+turns this on. If you later install an older brgr that does not accept
+`--workers`, run `brgr integrate claude uninstall` first, or `install --context`
+without `--workers`: the written command includes that flag, and an older
+`__context` would reject it, so the status line would stop drawing.
 
 The note, or the handoff with `--auto`, happens once per crossing, and again after
 30 minutes if the head is still over, or after it has dropped 15 points below the

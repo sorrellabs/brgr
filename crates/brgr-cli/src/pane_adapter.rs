@@ -53,7 +53,7 @@ use native::{
     start_native,
 };
 pub(crate) use screens::LAST_SCREEN as LAST_SCREEN_MARK;
-use screens::{Screen, ScreenWatch};
+use screens::{AnswerMemory, ProviderState, Screen, ScreenWatch};
 
 /// How often the agent's state is read.
 const POLL: Duration = Duration::from_secs(1);
@@ -86,6 +86,67 @@ impl Stillness {
             self.polls = 0;
         }
         self.polls
+    }
+}
+
+/// What the pane is asking the owner to look at, if anything. A provider
+/// incident is not an approval: `Unknown` speaks about answering a screen,
+/// `Provider` says the harness lost its model API or network.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Attention {
+    None,
+    Unknown,
+    Provider(ProviderState),
+}
+
+/// Tells the owner about a provider/network incident once per state, marking
+/// the stderr diagnostic for the supervisor. Never presses a key.
+fn note_provider(
+    notices: &mut Notices<'_>,
+    run: &PaneRunArgs,
+    pane: &str,
+    state: ProviderState,
+    quote: &str,
+    attention: &mut Attention,
+) {
+    let next = Attention::Provider(state);
+    if *attention == next {
+        return;
+    }
+    // Withdraw the previous transient note so a changed screen does not leave
+    // the owner with two contradictory messages.
+    notices.withdraw();
+    let minutes = screens::PROVIDER_RECOVERY_LIMIT.as_secs() / 60;
+    let mut body = format!(
+        "The {} worker in Herdr pane {pane} has a provider/network problem; the harness {}. \
+         Quoted harness diagnostic (untrusted): \"{quote}\". This is not an approval; brgr will \
+         press nothing. Check provider/network/VPN connectivity. Recovery is bounded to \
+         {minutes} minutes from first detection and by the existing attempt deadline, \
+         whichever comes first.",
+        run.kind,
+        if state == ProviderState::Retrying {
+            "is retrying"
+        } else {
+            "has stopped retrying"
+        }
+    );
+    if state == ProviderState::Stopped {
+        body.push_str(
+            " The harness is no longer retrying. After restoring service, inspect the pane and \
+             explicitly resume it if appropriate; brgr will not send a retry/continue command.",
+        );
+    }
+    notices.tell(&run.kind, pane, &body);
+    eprintln!("{}", screens::provider_marker(true, Some(state), quote));
+    *attention = next;
+}
+
+/// The active diagnostic is gone and ordinary work or readiness is back.
+fn recover_provider(notices: &mut Notices<'_>, attention: &mut Attention) {
+    if matches!(attention, Attention::Provider(_)) {
+        notices.withdraw();
+        eprintln!("{}", screens::provider_marker(false, None, ""));
+        *attention = Attention::None;
     }
 }
 
@@ -197,6 +258,8 @@ pub(crate) fn pane_process_manifest(
                         "HERDR_SESSION",
                         "HERDR_SOCKET_PATH",
                         "HERDR_BIN_PATH",
+                        // Opt-in per-resolve screen trace; see `screens::trace`.
+                        "BRGR_SCREEN_TRACE",
                     ]
                     .map(str::to_owned),
                 )
@@ -204,6 +267,7 @@ pub(crate) fn pane_process_manifest(
                 .chain(cfg!(debug_assertions).then(|| "BRGR_TEST_REPORT_GRACE_MS".to_owned()))
                 .chain(cfg!(debug_assertions).then(|| "BRGR_TEST_CALLER_WAIT_MS".to_owned()))
                 .chain(cfg!(debug_assertions).then(|| "BRGR_TEST_SCREEN_DEADLINE_MS".to_owned()))
+                .chain(cfg!(debug_assertions).then(|| "BRGR_TEST_PROVIDER_LIMIT_MS".to_owned()))
                 .collect::<std::collections::BTreeSet<_>>()
                 .into_iter()
                 .collect(),
@@ -398,6 +462,10 @@ fn run_pane_adapter(paths: &Paths, run: &PaneRunArgs) -> Result<()> {
         outstanding: Vec::new(),
     };
     let outcome = drive(&herdr, &name, &pane, run, &report, &mut notices);
+    // A transient note is withdrawn when the run ends, whether it finished or
+    // failed. The terminal failure notice is separate and is never acknowledged
+    // here.
+    notices.withdraw();
     let finished = outcome.and_then(|()| {
         let bytes = read_report(&report, spec.artifact_contract.max_bytes)?;
         let digest = report_digest(&bytes);
@@ -425,6 +493,7 @@ fn start_agent(
     pane: &str,
     run: &PaneRunArgs,
     notices: &mut Notices<'_>,
+    answers: &mut AnswerMemory,
 ) -> Result<()> {
     let mut start: Vec<String> = [
         "agent",
@@ -469,7 +538,7 @@ fn start_agent(
     }
     // Herdr can call an agent ready while it shows a menu: Codex opened on an
     // update offer and was reported idle. `settle` answers what a rule covers.
-    settle(herdr, name, pane, run, notices)
+    settle(herdr, name, pane, run, notices, answers)
 }
 
 /// Waits until the agent is ready, pressing what the screen rules say and
@@ -481,15 +550,38 @@ fn settle(
     pane: &str,
     run: &PaneRunArgs,
     notices: &mut Notices<'_>,
+    answers: &mut AnswerMemory,
 ) -> Result<()> {
     let mut watch = ScreenWatch::new(&run.kind);
-    let mut announced = false;
+    let mut attention = Attention::None;
     loop {
         let status = herdr.status(name)?;
-        match screens::resolve(herdr, pane, run, notices.paths, Some(&status))? {
-            Screen::Resolve { rule, .. } => watch.pressed(rule)?,
+        match screens::resolve(
+            herdr,
+            pane,
+            run,
+            notices.paths,
+            Some(&status),
+            answers,
+            "settle",
+        )? {
+            Screen::Provider { state, quote } => {
+                note_provider(notices, run, pane, state, &quote, &mut attention);
+                watch.observe_at(
+                    &Screen::Provider {
+                        state,
+                        quote: quote.clone(),
+                    },
+                    Instant::now(),
+                )?;
+            }
+            Screen::Resolve { rule, .. } => {
+                recover_provider(notices, &mut attention);
+                watch.pressed(rule)?;
+            }
             Screen::Unknown(text) => {
-                if !announced {
+                recover_provider(notices, &mut attention);
+                if attention != Attention::Unknown {
                     notices.tell(
                         &run.kind,
                         pane,
@@ -498,7 +590,7 @@ fn settle(
                             run.kind
                         ),
                     );
-                    announced = true;
+                    attention = Attention::Unknown;
                 }
                 watch.observe(&Screen::Unknown(text))?;
             }
@@ -507,9 +599,15 @@ fn settle(
                     notices.withdraw();
                     return Ok(());
                 }
-                "working" => watch.reset(),
+                "working" => {
+                    recover_provider(notices, &mut attention);
+                    watch.reset();
+                }
                 _ => watch.observe_blocked(herdr.screen(pane).as_deref())?,
             },
+            Screen::Answered { .. } => {
+                recover_provider(notices, &mut attention);
+            }
         }
         thread::sleep(POLL);
     }
@@ -518,7 +616,9 @@ fn settle(
 /// One poll of an agent Herdr does not classify. Herdr never says whether it
 /// waits on a dialog, so a screen that stands still for `STILL_POLLS` is read
 /// like a blocked one: a rule's dialog is answered, any other is reported and
-/// starts the unknown-screen deadline. A moving screen clears both.
+/// starts the unknown-screen deadline. A moving screen clears both. A
+/// recognized provider diagnostic is seen before stillness, so a changing
+/// retry countdown cannot evade it.
 #[allow(clippy::too_many_arguments)]
 fn poll_unclassified(
     herdr: &Herdr,
@@ -528,36 +628,71 @@ fn poll_unclassified(
     status: &str,
     still: &mut Stillness,
     watch: &mut ScreenWatch,
-    blocked: &mut bool,
+    answers: &mut AnswerMemory,
+    attention: &mut Attention,
 ) -> Result<()> {
-    if still.see(herdr.screen(pane)) < STILL_POLLS {
-        if *blocked {
+    let screen = herdr.screen(pane);
+    if let Some(text) = screen.as_deref()
+        && let Screen::Provider { state, quote } =
+            screens::classify_for(&run.kind, text, &run.workspace)
+    {
+        note_provider(notices, run, pane, state, &quote, attention);
+        watch.observe_at(
+            &Screen::Provider {
+                state,
+                quote: quote.clone(),
+            },
+            Instant::now(),
+        )?;
+        return Ok(());
+    }
+    if still.see(screen) < STILL_POLLS {
+        if *attention != Attention::None {
             notices.withdraw();
-            *blocked = false;
+            *attention = Attention::None;
             set_phase(notices.paths, run, "working");
         }
         watch.restart_clock();
         return Ok(());
     }
-    match screens::resolve(herdr, pane, run, notices.paths, Some(status))? {
+    match screens::resolve(
+        herdr,
+        pane,
+        run,
+        notices.paths,
+        Some(status),
+        answers,
+        "drive-unclassified",
+    )? {
         Screen::Resolve { rule, .. } => {
-            if *blocked {
+            if *attention != Attention::None {
                 notices.withdraw();
-                *blocked = false;
+                *attention = Attention::None;
                 set_phase(notices.paths, run, "working");
             }
             watch.pressed(rule)?;
             *still = Stillness::default();
         }
+        Screen::Provider { state, quote } => {
+            note_provider(notices, run, pane, state, &quote, attention);
+            watch.observe_at(
+                &Screen::Provider {
+                    state,
+                    quote: quote.clone(),
+                },
+                Instant::now(),
+            )?;
+        }
         Screen::Unknown(text) => {
-            if !*blocked {
+            if *attention != Attention::Unknown {
+                notices.withdraw();
                 notices.blocked(&run.kind, pane, "while working");
-                *blocked = true;
+                *attention = Attention::Unknown;
                 set_phase(notices.paths, run, "awaiting_input");
             }
             watch.observe(&Screen::Unknown(text))?;
         }
-        Screen::Clear => watch.restart_clock(),
+        Screen::Clear | Screen::Answered { .. } => watch.restart_clock(),
     }
     Ok(())
 }
@@ -573,18 +708,27 @@ fn start_worker(
     pane: &str,
     run: &PaneRunArgs,
     notices: &mut Notices<'_>,
+    answers: &mut AnswerMemory,
 ) -> Result<()> {
     screens::settle_shell(herdr, pane, run, notices.paths);
     if run.native_executable.is_some() {
-        start_native(herdr, pane, run, notices)?;
+        start_native(herdr, pane, run, notices, answers)?;
     } else {
-        start_agent(herdr, name, pane, run, notices)?;
+        start_agent(herdr, name, pane, run, notices, answers)?;
     }
     let label = recorded_label(notices.paths, run.task, run.revision);
-    herdr.keep_pane_name(pane, label.as_deref());
+    let harness = Store::open(&notices.paths.store)
+        .ok()
+        .and_then(|store| store.task(run.task).ok())
+        .map_or_else(|| run.kind.clone(), |spec| spec.route.harness_id);
+    let agent = label
+        .is_some()
+        .then(|| name::agent_name(&harness, &run.task.to_string()));
+    herdr.keep_pane_name(pane, label.as_deref(), agent.as_deref());
     Ok(())
 }
 
+#[allow(clippy::too_many_lines)]
 fn drive(
     herdr: &Herdr,
     name: &str,
@@ -593,16 +737,28 @@ fn drive(
     report: &Path,
     notices: &mut Notices<'_>,
 ) -> Result<()> {
-    start_worker(herdr, name, pane, run, notices)?;
+    // One answer memory for this pane and run, shared by startup, the first
+    // prompt and every poll: a stage handoff must not press the same dialog
+    // twice.
+    let mut answers = AnswerMemory::new();
+    start_worker(herdr, name, pane, run, notices, &mut answers)?;
 
     let prompt = fs::read_to_string(&run.prompt_file)?;
     let instruction = result_instruction(notices.paths, run, &prompt, report)?;
-    send_first_prompt(herdr, name, pane, run, &instruction, notices.paths)?;
+    send_first_prompt(
+        herdr,
+        name,
+        pane,
+        run,
+        &instruction,
+        notices.paths,
+        &mut answers,
+    )?;
     spawn_session_server(notices.paths, run.task)?;
     set_phase(notices.paths, run, "working");
     eprintln!("brgr pane mode · prompted the agent");
 
-    let mut blocked = false;
+    let mut attention = Attention::None;
     let mut watch = ScreenWatch::new(&run.kind);
     let mut idle = IdleReport::new(instruction.clone());
     let mut still = Stillness::default();
@@ -621,6 +777,7 @@ fn drive(
             if report_digest(&bytes) != expected {
                 bail!("completed native report changed");
             }
+            notices.withdraw();
             return Ok(());
         }
         let status = if run.native_executable.is_some() {
@@ -628,56 +785,116 @@ fn drive(
         } else {
             herdr.status(name)?
         };
+        // Passive provider recognition comes before message delivery, the
+        // report reminder, the working reset and any key press. A harness
+        // retrying a provider request is neither ready nor waiting for an
+        // approval, and nothing may be typed into it.
+        let looked = screens::look(herdr, pane, run);
+        if let Some(Screen::Provider { state, quote }) = &looked {
+            note_provider(notices, run, pane, *state, quote, &mut attention);
+            watch.observe_at(
+                &Screen::Provider {
+                    state: *state,
+                    quote: quote.clone(),
+                },
+                Instant::now(),
+            )?;
+            if status == "working" {
+                idle.worked();
+            }
+            thread::sleep(POLL);
+            continue;
+        }
+        match &looked {
+            Some(Screen::Unknown(_)) => {
+                // A different dialog exits provider handling and gets the
+                // unchanged unknown-screen clock below.
+                recover_provider(notices, &mut attention);
+            }
+            Some(_) if watch.provider_active() => {
+                recover_provider(notices, &mut attention);
+                watch.recovered();
+            }
+            _ => {}
+        }
         if run.native_executable.is_some() || matches!(status.as_str(), "idle" | "done") {
             deliver_worker_messages(herdr, name, pane, run, notices.paths)?;
         }
         let unclassified = !matches!(status.as_str(), "blocked" | "working" | "idle" | "done");
         // Whatever stopped the agent was dealt with in the pane. An
         // unclassified agent's dialog is cleared when its screen moves, below.
-        if blocked && status != "blocked" && !unclassified {
+        if matches!(attention, Attention::Unknown) && status != "blocked" && !unclassified {
             notices.withdraw();
-            blocked = false;
+            attention = Attention::None;
             set_phase(notices.paths, run, "working");
         }
         match status.as_str() {
             // Only `blocked` is acted on while the agent works. Herdr never
-            // classifies some harnesses (Fixture, Command Code), which report
+            // classifies some harnesses (GJC, Command Code), which report
             // `unknown` for their whole life, and their own output can look
             // like a menu.
-            "blocked" => match screens::resolve(herdr, pane, run, notices.paths, Some(&status))? {
-                Screen::Resolve { rule, .. } => {
-                    notices.withdraw();
-                    blocked = false;
-                    set_phase(notices.paths, run, "working");
-                    watch.pressed(rule)?;
-                    thread::sleep(POLL);
-                    continue;
-                }
-                Screen::Unknown(text) => {
-                    if !blocked {
-                        notices.blocked(&run.kind, pane, "while working");
-                        blocked = true;
-                        set_phase(notices.paths, run, "awaiting_input");
+            "blocked" => {
+                match screens::resolve(
+                    herdr,
+                    pane,
+                    run,
+                    notices.paths,
+                    Some(&status),
+                    &mut answers,
+                    "drive-blocked",
+                )? {
+                    Screen::Resolve { rule, .. } => {
+                        notices.withdraw();
+                        attention = Attention::None;
+                        set_phase(notices.paths, run, "working");
+                        watch.pressed(rule)?;
+                        thread::sleep(POLL);
+                        continue;
                     }
-                    watch.observe(&Screen::Unknown(text))?;
-                }
-                Screen::Clear => {
-                    if !blocked {
-                        notices.blocked(&run.kind, pane, "while working");
-                        blocked = true;
-                        set_phase(notices.paths, run, "awaiting_input");
+                    Screen::Provider { state, quote } => {
+                        note_provider(notices, run, pane, state, &quote, &mut attention);
+                        watch.observe_at(
+                            &Screen::Provider {
+                                state,
+                                quote: quote.clone(),
+                            },
+                            Instant::now(),
+                        )?;
                     }
-                    watch.observe_blocked(herdr.screen(pane).as_deref())?;
+                    Screen::Unknown(text) => {
+                        if attention != Attention::Unknown {
+                            notices.withdraw();
+                            notices.blocked(&run.kind, pane, "while working");
+                            attention = Attention::Unknown;
+                            set_phase(notices.paths, run, "awaiting_input");
+                        }
+                        watch.observe(&Screen::Unknown(text))?;
+                    }
+                    Screen::Clear => {
+                        if attention != Attention::Unknown {
+                            notices.blocked(&run.kind, pane, "while working");
+                            attention = Attention::Unknown;
+                            set_phase(notices.paths, run, "awaiting_input");
+                        }
+                        watch.observe_blocked(herdr.screen(pane).as_deref())?;
+                    }
+                    Screen::Answered { .. } => {}
                 }
-            },
+            }
             // The report is the completion signal. The runner removed any old
             // one before starting, and Herdr may never have shown this agent
             // working: Cursor went straight from unknown to idle once it had
             // finished between two polls.
-            "idle" | "done" if run.native_executable.is_none() && report.is_file() => return Ok(()),
+            "idle" | "done" if run.native_executable.is_none() && report.is_file() => {
+                notices.withdraw();
+                return Ok(());
+            }
             "working" => {
                 idle.worked();
                 watch.reset();
+                // drive does not resolve while working, so it invalidates the
+                // answered dialog here.
+                answers.forget();
             }
             "idle" | "done" => {
                 idle.settle(herdr, name, pane, run, report, notices)?;
@@ -695,7 +912,8 @@ fn drive(
                     &status,
                     &mut still,
                     &mut watch,
-                    &mut blocked,
+                    &mut answers,
+                    &mut attention,
                 )?;
             }
         }
@@ -745,7 +963,7 @@ impl IdleReport {
         }
     }
 
-    /// Herdr never classifies some harnesses (Command Code), so their
+    /// Herdr never classifies some harnesses (GJC, Command Code), so their
     /// status is `unknown` and idleness cannot be read. A report file that has
     /// not changed for the grace period is sealed for them; nothing is sent to
     /// the agent, since it may still be working.
@@ -1157,21 +1375,42 @@ impl Herdr {
         let placement = crate::config::Config::load(&paths.config)?
             .herdr
             .worker_placement;
-        let target = if placement == crate::config::WorkerPlacement::Tab {
-            layout::Placement::Tab
-        } else {
-            let workers = layout::workers(&paths.runs, caller);
-            self.call(&["pane", "layout", "--pane", caller])
-                .ok()
-                .as_ref()
-                .and_then(layout::Layout::parse)
-                .map_or_else(
-                    || layout::Placement::Split {
-                        pane: caller.to_owned(),
-                        direction: "right",
-                    },
-                    |current| layout::place(&current, caller, &workers),
-                )
+        let target = match placement {
+            crate::config::WorkerPlacement::Tab => layout::Placement::Tab,
+            crate::config::WorkerPlacement::Adjacent => {
+                let workers = layout::workers(&paths.runs, caller);
+                self.call(&["pane", "layout", "--pane", caller])
+                    .ok()
+                    .as_ref()
+                    .and_then(layout::Layout::parse)
+                    .map_or_else(
+                        || layout::Placement::Split {
+                            pane: caller.to_owned(),
+                            direction: "right",
+                        },
+                        |current| layout::place(&current, caller, &workers),
+                    )
+            }
+            crate::config::WorkerPlacement::Below => {
+                let workers = layout::workers(&paths.runs, caller);
+                self.call(&["pane", "layout", "--pane", caller])
+                    .ok()
+                    .as_ref()
+                    .and_then(layout::Layout::parse)
+                    .map_or_else(
+                        || {
+                            if workers.is_empty() {
+                                layout::Placement::Split {
+                                    pane: caller.to_owned(),
+                                    direction: "down",
+                                }
+                            } else {
+                                layout::Placement::Tab
+                            }
+                        },
+                        |current| layout::place_below(&current, caller, &workers),
+                    )
+            }
         };
         let mut args: Vec<String> = match target {
             layout::Placement::Tab => vec![
@@ -1244,10 +1483,24 @@ impl Herdr {
         }
     }
 
+    /// Herdr's agents sidebar shows the agent name, not the pane label. Display
+    /// only, same as `name_pane`: a missing command or a rejected name is one
+    /// stderr line. `name` is already Herdr-safe; the pane label is not used.
+    fn name_agent(&self, pane: &str, name: Option<&str>) {
+        if let Some(name) = name
+            && let Err(failure) = self.call(&["agent", "rename", pane, name])
+        {
+            eprintln!("brgr pane mode · could not name agent {pane}: {failure}");
+        }
+    }
+
     /// Herdr overwrites the label when the agent registers, after `agent start`
     /// has already returned. Put the template back for a short bounded window.
-    fn keep_pane_name(&self, pane: &str, label: Option<&str>) {
+    /// The agent name is set here too: the sidebar entry exists only after start.
+    /// An empty pane name template sends neither call.
+    fn keep_pane_name(&self, pane: &str, label: Option<&str>, agent: Option<&str>) {
         self.name_pane(pane, label);
+        self.name_agent(pane, agent);
         let (attempts, delay) = if cfg!(debug_assertions) {
             (3, Duration::from_millis(1))
         } else {
@@ -1256,6 +1509,7 @@ impl Herdr {
         for _ in 0..attempts {
             thread::sleep(delay);
             self.name_pane(pane, label);
+            self.name_agent(pane, agent);
         }
     }
 

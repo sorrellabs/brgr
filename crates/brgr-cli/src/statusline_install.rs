@@ -69,6 +69,9 @@ struct Receipt {
     /// The previous `statusLine` member's value, verbatim; `None` if there was none.
     original: Option<String>,
     backup: PathBuf,
+    /// Whether the written command includes `--workers`.
+    #[serde(default)]
+    workers: bool,
 }
 
 struct Member {
@@ -395,7 +398,12 @@ fn previous_status_line(
     Ok((original, chain))
 }
 
-pub(crate) fn install(brgr_home: &Path, harness: Harness, executable: &Path) -> Result<Value> {
+pub(crate) fn install(
+    brgr_home: &Path,
+    harness: Harness,
+    executable: &Path,
+    workers: bool,
+) -> Result<Value> {
     let link = harness.config_file()?;
     // A managed config is often a symlink; edit what it points to, not the link.
     let target = if link.exists() {
@@ -425,6 +433,9 @@ pub(crate) fn install(brgr_home: &Path, harness: Harness, executable: &Path) -> 
         shell_quote(&brgr_home.to_string_lossy()),
         harness.source_flag(),
     );
+    if workers {
+        command.push_str(" --workers");
+    }
     if let Some(chain) = &chain {
         command.push_str(" -- ");
         command.push_str(chain);
@@ -434,6 +445,7 @@ pub(crate) fn install(brgr_home: &Path, harness: Harness, executable: &Path) -> 
         && receipt.settings == target
         && status_line_command(&parsed) == Some(command.as_str())
     {
+        sync_statusline_dir(brgr_home, workers)?;
         return Ok(json!({"status": "already_installed", "settings": target}));
     }
     // Keep the previous object's other fields (padding and the like).
@@ -459,12 +471,14 @@ pub(crate) fn install(brgr_home: &Path, harness: Harness, executable: &Path) -> 
         command,
         original,
         backup: backup.clone(),
+        workers,
     };
     write_atomic(
         &brgr_home.join(harness.receipt()),
         &serde_json::to_vec_pretty(&receipt)?,
         0o600,
     )?;
+    sync_statusline_dir(brgr_home, workers)?;
     Ok(json!({
         "status": "installed",
         "settings": target,
@@ -488,6 +502,7 @@ pub(crate) fn status(brgr_home: &Path, harness: Harness) -> Result<Value> {
     Ok(json!({
         "status": if intact { "installed" } else { "drifted" },
         "settings": receipt.settings,
+        "workers": receipt.workers,
     }))
 }
 
@@ -525,7 +540,33 @@ pub(crate) fn uninstall(brgr_home: &Path, harness: Harness) -> Result<Value> {
         false
     };
     fs::remove_file(brgr_home.join(harness.receipt()))?;
+    sync_statusline_dir(brgr_home, false)?;
     Ok(json!({"status": "uninstalled", "status_line_restored": restored}))
+}
+
+fn any_workers_receipt(brgr_home: &Path) -> bool {
+    [Harness::Claude, Harness::Cursor]
+        .into_iter()
+        .any(|harness| {
+            read_receipt(brgr_home, harness)
+                .ok()
+                .flatten()
+                .is_some_and(|receipt| receipt.workers)
+        })
+}
+
+fn sync_statusline_dir(brgr_home: &Path, workers: bool) -> Result<()> {
+    let dir = brgr_home.join("statusline");
+    if workers {
+        fs::create_dir_all(&dir)?;
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))?;
+        crate::worker_line::refresh_home(brgr_home);
+        return Ok(());
+    }
+    if !any_workers_receipt(brgr_home) {
+        let _ = fs::remove_dir_all(&dir);
+    }
+    Ok(())
 }
 
 #[cfg(test)]

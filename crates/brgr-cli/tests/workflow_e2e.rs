@@ -2,9 +2,7 @@
 
 mod common;
 
-use common::{
-    brgr_binary as brgr, brgr_command, clear_inherited_herdr_env, test_path, write_fast_script,
-};
+use common::{brgr_binary as brgr, brgr_command, isolate_test_command, write_fast_script};
 
 use std::{
     fs,
@@ -1112,6 +1110,7 @@ fn spawn_agent_script(
     brgr_bin: &Path,
 ) -> std::process::Child {
     let mut command = Command::new("node");
+    isolate_test_command(&mut command);
     command
         .arg(script)
         .current_dir(&fixture.workspace)
@@ -1120,17 +1119,10 @@ fn spawn_agent_script(
         .env("BRGR_WORKFLOW_RUN", run_id)
         .env("BRGR_OWNER_ID", "codex:workflow-owner")
         .env("BRGR_SESSION_ID", "workflow-session")
-        .env_remove("BRGR_PARENT_TASK_ID")
-        .env_remove("BRGR_PARENT_ATTEMPT_ID")
-        .env_remove("CODEX_THREAD_ID")
-        .env_remove("CLAUDE_CODE_SESSION_ID")
-        .env_remove("CURSOR_CONVERSATION_ID")
         .env("BRGR_TEST_TRUST_HERDR_PANE", "1")
-        .env("PATH", test_path())
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    clear_inherited_herdr_env(&mut command);
     command.spawn().unwrap()
 }
 

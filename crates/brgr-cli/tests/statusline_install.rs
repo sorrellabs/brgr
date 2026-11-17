@@ -337,3 +337,230 @@ fn a_chained_tilde_path_is_expanded_by_brgr_when_the_harness_does_not() {
     .unwrap();
     assert_eq!(signal["source"], "cursor");
 }
+
+#[test]
+fn workers_without_context_is_refused() {
+    let setup = setup();
+    let original = ORIGINAL.replace("bash CHAIN", "bash x.sh");
+    fs::write(settings(&setup), &original).unwrap();
+    let output = brgr(&setup, &["install", "--workers"]);
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("context"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(fs::read_to_string(settings(&setup)).unwrap(), original);
+    assert!(!setup.home.join("statusline").exists());
+    assert!(!setup.home.join("claude-statusline.json").exists());
+}
+
+#[test]
+fn install_with_workers_writes_the_flag_and_creates_the_statusline_directory() {
+    let setup = setup();
+    fs::write(
+        settings(&setup),
+        ORIGINAL.replace("bash CHAIN", "bash x.sh"),
+    )
+    .unwrap();
+    let installed = json(&brgr(&setup, &["install", "--context", "--workers"]));
+    assert_eq!(installed["status_line"]["status"], "installed");
+    let command = status_line_command(&settings(&setup));
+    assert!(
+        command.contains(" __context --workers -- bash x.sh"),
+        "{command}"
+    );
+    assert!(setup.home.join("statusline").is_dir());
+    let receipt: Value =
+        serde_json::from_slice(&fs::read(setup.home.join("claude-statusline.json")).unwrap())
+            .unwrap();
+    assert_eq!(receipt["workers"], true);
+    assert_eq!(
+        json(&brgr(&setup, &["status"]))["status_line"]["workers"],
+        true
+    );
+}
+
+#[test]
+fn install_without_workers_does_not_create_the_statusline_directory() {
+    let setup = setup();
+    fs::write(
+        settings(&setup),
+        ORIGINAL.replace("bash CHAIN", "bash x.sh"),
+    )
+    .unwrap();
+    json(&brgr(&setup, &["install", "--context"]));
+    let command = status_line_command(&settings(&setup));
+    assert!(command.contains(" __context -- bash x.sh"), "{command}");
+    assert!(!command.contains("--workers"), "{command}");
+    assert!(!setup.home.join("statusline").exists());
+    assert_eq!(
+        json(&brgr(&setup, &["status"]))["status_line"]["workers"],
+        false
+    );
+}
+
+#[test]
+fn uninstall_removes_the_statusline_directory() {
+    let setup = setup();
+    fs::write(
+        settings(&setup),
+        ORIGINAL.replace("bash CHAIN", "bash x.sh"),
+    )
+    .unwrap();
+    json(&brgr(&setup, &["install", "--context", "--workers"]));
+    assert!(setup.home.join("statusline").is_dir());
+    json(&brgr(&setup, &["uninstall"]));
+    assert!(!setup.home.join("statusline").exists());
+}
+
+#[test]
+fn cursor_install_never_enables_workers() {
+    let setup = setup();
+    let path = setup.config.join("cli-config.json");
+    fs::write(&path, CURSOR_CONFIG).unwrap();
+    json(&cursor(&setup, &["install"]));
+    let command = status_line_command(&path);
+    assert!(!command.contains("--workers"), "{command}");
+    assert!(!setup.home.join("statusline").exists());
+    let receipt: Value =
+        serde_json::from_slice(&fs::read(setup.home.join("cursor-statusline.json")).unwrap())
+            .unwrap();
+    assert_eq!(receipt["workers"], false);
+}
+
+#[test]
+fn installing_workers_again_recreates_a_missing_statusline_directory() {
+    let setup = setup();
+    fs::write(
+        settings(&setup),
+        ORIGINAL.replace("bash CHAIN", "bash x.sh"),
+    )
+    .unwrap();
+    json(&brgr(&setup, &["install", "--context", "--workers"]));
+    fs::remove_dir_all(setup.home.join("statusline")).unwrap();
+    let again = json(&brgr(&setup, &["install", "--context", "--workers"]));
+    assert_eq!(again["status_line"]["status"], "already_installed");
+    assert!(setup.home.join("statusline").is_dir());
+}
+
+#[test]
+fn reinstalling_with_workers_upgrades_a_context_only_install() {
+    let setup = setup();
+    fs::write(
+        settings(&setup),
+        ORIGINAL.replace("bash CHAIN", "bash x.sh"),
+    )
+    .unwrap();
+    json(&brgr(&setup, &["install", "--context"]));
+    assert!(!setup.home.join("statusline").exists());
+    let upgraded = json(&brgr(&setup, &["install", "--context", "--workers"]));
+    assert_eq!(upgraded["status_line"]["status"], "installed");
+    let command = status_line_command(&settings(&setup));
+    assert!(
+        command.contains(" __context --workers -- bash x.sh"),
+        "{command}"
+    );
+    assert!(setup.home.join("statusline").is_dir());
+}
+
+#[test]
+fn install_with_workers_changes_only_the_status_line_member_and_uninstall_restores_it_exactly() {
+    let setup = setup();
+    let original = ORIGINAL.replace("bash CHAIN", "bash x.sh");
+    fs::write(settings(&setup), &original).unwrap();
+    json(&brgr(&setup, &["install", "--context", "--workers"]));
+    let edited = fs::read_to_string(settings(&setup)).unwrap();
+    let before: Value = serde_json::from_str(&original).unwrap();
+    let after: Value = serde_json::from_str(&edited).unwrap();
+    assert_eq!(before["model"], after["model"]);
+    assert_eq!(before["hooks"], after["hooks"]);
+    assert_ne!(before["statusLine"], after["statusLine"]);
+    let command = after["statusLine"]["command"].as_str().unwrap();
+    assert!(
+        command.contains(" __context --workers -- bash x.sh"),
+        "{command}"
+    );
+    json(&brgr(&setup, &["uninstall"]));
+    assert_eq!(fs::read_to_string(settings(&setup)).unwrap(), original);
+}
+
+#[test]
+fn adding_workers_to_an_existing_install_keeps_the_chained_command_and_the_original() {
+    let setup = setup();
+    fs::write(
+        settings(&setup),
+        ORIGINAL.replace("bash CHAIN", "bash x.sh"),
+    )
+    .unwrap();
+    json(&brgr(&setup, &["install", "--context"]));
+    let receipt_before: Value =
+        serde_json::from_slice(&fs::read(setup.home.join("claude-statusline.json")).unwrap())
+            .unwrap();
+    json(&brgr(&setup, &["install", "--context", "--workers"]));
+    let command = status_line_command(&settings(&setup));
+    assert!(
+        command.contains(" __context --workers -- bash x.sh"),
+        "{command}"
+    );
+    let receipt: Value =
+        serde_json::from_slice(&fs::read(setup.home.join("claude-statusline.json")).unwrap())
+            .unwrap();
+    assert_eq!(receipt["original"], receipt_before["original"]);
+    assert_eq!(receipt["workers"], true);
+}
+
+#[test]
+fn reinstalling_without_workers_removes_the_flag_and_the_cache_directory() {
+    let setup = setup();
+    fs::write(
+        settings(&setup),
+        ORIGINAL.replace("bash CHAIN", "bash x.sh"),
+    )
+    .unwrap();
+    json(&brgr(&setup, &["install", "--context", "--workers"]));
+    assert!(setup.home.join("statusline").is_dir());
+    json(&brgr(&setup, &["install", "--context"]));
+    let command = status_line_command(&settings(&setup));
+    assert!(command.contains(" __context -- bash x.sh"), "{command}");
+    assert!(!command.contains("--workers"), "{command}");
+    assert!(!setup.home.join("statusline").exists());
+}
+
+#[test]
+fn status_reports_whether_workers_are_shown() {
+    let setup = setup();
+    fs::write(
+        settings(&setup),
+        ORIGINAL.replace("bash CHAIN", "bash x.sh"),
+    )
+    .unwrap();
+    json(&brgr(&setup, &["install", "--context"]));
+    assert_eq!(
+        json(&brgr(&setup, &["status"]))["status_line"]["workers"],
+        false
+    );
+    json(&brgr(&setup, &["install", "--context", "--workers"]));
+    assert_eq!(
+        json(&brgr(&setup, &["status"]))["status_line"]["workers"],
+        true
+    );
+}
+
+#[test]
+fn a_receipt_written_before_workers_existed_still_loads() {
+    let setup = setup();
+    fs::write(
+        settings(&setup),
+        ORIGINAL.replace("bash CHAIN", "bash x.sh"),
+    )
+    .unwrap();
+    json(&brgr(&setup, &["install", "--context"]));
+    let path = setup.home.join("claude-statusline.json");
+    let mut receipt: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    receipt.as_object_mut().unwrap().remove("workers");
+    fs::write(&path, serde_json::to_vec_pretty(&receipt).unwrap()).unwrap();
+    let status = json(&brgr(&setup, &["status"]));
+    assert_eq!(status["status_line"]["status"], "installed");
+    assert_eq!(status["status_line"]["workers"], false);
+}

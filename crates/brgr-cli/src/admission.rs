@@ -71,6 +71,7 @@ pub(crate) struct StartOptions<'a> {
     pub(crate) acknowledge_previous: Option<(OwnerId, brgr_protocol::ResultId, String, u64)>,
     pub(crate) workflow: Option<WorkflowStepAdmission>,
     pub(crate) reuse_clean_unadmitted_worktree: bool,
+    pub(crate) claude_route: config::ClaudeRoute,
 }
 
 /// One `brgr run --workflow --step` admission, computed before any worktree.
@@ -154,17 +155,14 @@ pub(crate) async fn run_task(paths: &Paths, mut args: RunArgs, json_output: bool
     let _awake = crate::sleep_guard::keep_awake();
     let config = Config::load(&paths.config)?;
     let registry = Registry::open_with_control_home(&paths.registry, &paths.home)?;
-    let selected_alias = if let Some(name) = args.use_alias.take() {
-        Some(
-            crate::aliases::get(&config, &name)
-                .cloned()
-                .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "unknown alias {name}; known aliases: {}",
-                        crate::aliases::known(crate::aliases::list(&config))
-                    )
-                })?,
-        )
+    let alias_name = args.use_alias.take();
+    let selected_alias = if let Some(name) = alias_name.as_deref() {
+        Some(crate::aliases::get(&config, name).cloned().ok_or_else(|| {
+            anyhow::anyhow!(
+                "unknown alias {name}; known aliases: {}",
+                crate::aliases::known(crate::aliases::list(&config))
+            )
+        })?)
     } else {
         None
     };
@@ -191,6 +189,12 @@ pub(crate) async fn run_task(paths: &Paths, mut args: RunArgs, json_output: bool
     calling.permission = ignored_permission(args.permission.is_some());
     calling.deadline_seconds = args.deadline_seconds.or(calling.deadline_seconds);
     config::validate_argv(&calling.argv)?;
+    crate::claude_route::check(
+        config.routes.claude,
+        &harness,
+        calling.model.as_deref(),
+        &crate::claude_route::Origin::Run { alias: alias_name },
+    )?;
     let (user_instructions, instructions_digest) = read_user_instructions(paths)?;
     add_user_instructions(&mut args.role_instructions, user_instructions)?;
     let (activated, activation) = load_harness(&registry, &harness, config.recertify.auto).await?;
@@ -286,6 +290,7 @@ pub(crate) async fn run_task(paths: &Paths, mut args: RunArgs, json_output: bool
                 acknowledge_previous: None,
                 workflow,
                 reuse_clean_unadmitted_worktree: false,
+                claude_route: config.routes.claude,
             },
         )),
     )
@@ -521,10 +526,17 @@ pub(crate) async fn revise_task(paths: &Paths, args: ReviseArgs, json_output: bo
         .clone();
 
     let registry = Registry::open_with_control_home(&paths.registry, &paths.home)?;
+    let config = Config::load(&paths.config)?;
+    crate::claude_route::check(
+        config.routes.claude,
+        &replacement.route.harness_id,
+        replacement.route.requested_model.as_deref(),
+        &crate::claude_route::Origin::Revise,
+    )?;
     let (activated, activation) = load_harness(
         &registry,
         &replacement.route.harness_id,
-        Config::load(&paths.config)?.recertify.auto,
+        config.recertify.auto,
     )
     .await?;
     activated.validate_task_route(&replacement)?;
@@ -580,6 +592,7 @@ pub(crate) async fn revise_task(paths: &Paths, args: ReviseArgs, json_output: bo
             acknowledge_previous: revisable.unacknowledged,
             workflow: None,
             reuse_clean_unadmitted_worktree: true,
+            claude_route: config.routes.claude,
         },
     )
     .await?;
@@ -776,10 +789,6 @@ pub(crate) async fn load_harness(
     harness: &str,
     auto_recertify: bool,
 ) -> Result<(HarnessManifest, ActivationReceipt)> {
-    // Before the probe, whose failure would suggest re-certifying it.
-    if harness == brgr_registry::REMOVED_HARNESS_ID {
-        return Err(brgr_registry::RegistryError::RemovedGjcSupport.into());
-    }
     let probed = registry.health_probed(harness).await?;
     let probed = recertify_if_allowed(registry, harness, probed, auto_recertify).await?;
     require_healthy_harness(
@@ -928,7 +937,18 @@ fn record_admission(
 /// Pane mode puts the agent's own TUI in the split pane, so brgr's worker
 /// pane would only be a second, empty one.
 /// Refusals that need the resolved source and the activated harness.
-fn check_admissible(activated: &HarnessManifest, spec: &TaskSpec, source: &Path) -> Result<()> {
+fn check_admissible(
+    activated: &HarnessManifest,
+    spec: &TaskSpec,
+    source: &Path,
+    claude_route: config::ClaudeRoute,
+) -> Result<()> {
+    crate::claude_route::check(
+        claude_route,
+        &spec.route.harness_id,
+        spec.route.requested_model.as_deref(),
+        &crate::claude_route::Origin::Run { alias: None },
+    )?;
     if spec.evidence.capture_diff && !workspace::is_git_workspace(source)? {
         bail!("--capture-diff requires a Git workspace before task admission");
     }
@@ -1015,7 +1035,7 @@ pub(crate) async fn start_task(
     let source = options.source_workspace.canonicalize()?;
     let home = paths.home.canonicalize()?;
     validate_source_home(paths, &source, &home, options.parent, &spec.owner_id)?;
-    check_admissible(activated, &spec, &source)?;
+    check_admissible(activated, &spec, &source, options.claude_route)?;
     let source_pane = source_pane(
         activated,
         &spec,

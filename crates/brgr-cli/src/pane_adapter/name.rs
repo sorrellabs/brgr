@@ -13,6 +13,55 @@ pub(crate) struct Input<'a> {
 const OBJECTIVE_LIMIT: usize = 48;
 /// How long a whole pane name may be.
 const NAME_LIMIT: usize = 120;
+/// Herdr 0.9.5 agent names: `[a-z][a-z0-9_-]{0,31}`.
+const AGENT_NAME_LIMIT: usize = 32;
+/// Task-id characters kept so two live agents do not share a name.
+const TASK_PREFIX: usize = 8;
+
+/// A Herdr agent name from the run: `{harness-short}-{task8}`, lowercase,
+/// `[a-z][a-z0-9_-]{0,31}`. Pure: no process, no Herdr. The pane label is
+/// separate and may keep punctuation Herdr would reject here.
+pub(crate) fn agent_name(harness: &str, task: &str) -> String {
+    let harness = harness.strip_prefix("local.").unwrap_or(harness);
+    let sanitized: String = harness
+        .chars()
+        .flat_map(char::to_lowercase)
+        .filter(|character| {
+            character.is_ascii_lowercase()
+                || character.is_ascii_digit()
+                || *character == '_'
+                || *character == '-'
+        })
+        .collect();
+    let mut short = sanitized
+        .split('-')
+        .find(|piece| !piece.is_empty())
+        .unwrap_or("h")
+        .to_owned();
+    if !short.starts_with(|character: char| character.is_ascii_lowercase()) {
+        short.insert(0, 'h');
+    }
+    let task: String = task
+        .chars()
+        .flat_map(char::to_lowercase)
+        .filter(|character| character.is_ascii_lowercase() || character.is_ascii_digit())
+        .take(TASK_PREFIX)
+        .collect();
+    let suffix = if task.is_empty() {
+        String::new()
+    } else {
+        format!("-{task}")
+    };
+    let budget = AGENT_NAME_LIMIT.saturating_sub(suffix.len()).max(1);
+    let short: String = short.chars().take(budget).collect();
+    let mut name = format!("{short}{suffix}");
+    name.truncate(AGENT_NAME_LIMIT);
+    if name.is_empty() || !name.starts_with(|character: char| character.is_ascii_lowercase()) {
+        name.insert(0, 'h');
+        name.truncate(AGENT_NAME_LIMIT);
+    }
+    name
+}
 
 /// Renders a pane name from `template`. Pure: no process, no Herdr.
 pub(crate) fn render(template: &str, input: &Input<'_>) -> String {
@@ -346,5 +395,102 @@ mod tests {
     #[test]
     fn an_empty_template_renders_nothing() {
         assert_eq!(render("", &input("local.claude-code", None, None, "x")), "");
+    }
+
+    fn herdr_agent_name(name: &str) -> bool {
+        let bytes = name.as_bytes();
+        (1..=AGENT_NAME_LIMIT).contains(&bytes.len())
+            && bytes[0].is_ascii_lowercase()
+            && bytes.iter().all(|byte| {
+                byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'_' | b'-')
+            })
+    }
+
+    #[test]
+    fn an_agent_name_is_the_harness_short_and_task_prefix() {
+        assert_eq!(
+            agent_name("local.claude-code", "1cf44e8d-c0aa-43d7-9603-0079d032a5d8"),
+            "claude-1cf44e8d"
+        );
+    }
+
+    #[test]
+    fn an_agent_name_uses_only_the_herdr_charset() {
+        let name = agent_name("local.claude-code", TASK);
+        assert!(
+            name.chars().all(|character| character.is_ascii_lowercase()
+                || character.is_ascii_digit()
+                || character == '_'
+                || character == '-'),
+            "{name}"
+        );
+        assert!(herdr_agent_name(&name), "{name}");
+    }
+
+    #[test]
+    fn an_agent_name_is_at_most_32_characters() {
+        let harness = "x".repeat(80);
+        let name = agent_name(&harness, TASK);
+        assert!(name.len() <= AGENT_NAME_LIMIT, "{name}");
+        assert!(herdr_agent_name(&name), "{name}");
+        assert!(
+            name.contains(&TASK.chars().take(TASK_PREFIX).collect::<String>()),
+            "{name}"
+        );
+    }
+
+    #[test]
+    fn an_agent_name_starts_with_a_letter() {
+        for harness in ["9lives", "123Harness", "---", "!!!", "_foo", ""] {
+            let name = agent_name(harness, TASK);
+            assert!(
+                name.starts_with(|character: char| character.is_ascii_lowercase()),
+                "{harness:?} → {name}"
+            );
+            assert!(herdr_agent_name(&name), "{harness:?} → {name}");
+        }
+    }
+
+    #[test]
+    fn agent_names_differ_when_the_task_id_differs() {
+        let a = agent_name("local.claude-code", TASK);
+        let b = agent_name("local.claude-code", "9bb22c11-bbbb-485e-a612-d69de695b2b8");
+        assert_ne!(a, b, "{a} {b}");
+        assert!(a.ends_with("fe3142c6"), "{a}");
+        assert!(b.ends_with("9bb22c11"), "{b}");
+    }
+
+    #[test]
+    fn an_agent_name_matches_the_herdr_pattern_for_odd_harness_ids_and_labels() {
+        let labels = [
+            "claude-code/anthropic: Explain the build",
+            "!!!",
+            "123",
+            "",
+            "Name With Spaces",
+        ];
+        let harnesses = [
+            "local.claude-code",
+            "123Harness",
+            "CLAUDE CODE",
+            "!!!",
+            "---",
+            "local.cursor-cli",
+            "9lives",
+            "Foo.Bar/Baz",
+            "command-code",
+        ];
+        for harness in harnesses {
+            for label in labels {
+                let name = agent_name(harness, TASK);
+                assert!(herdr_agent_name(&name), "{harness} / {label:?} → {name}");
+                assert!(
+                    !name.contains('/') && !name.contains(':') && !name.contains(' '),
+                    "the pane label leaked into the agent name: {name}"
+                );
+            }
+        }
+        let long = "H".repeat(80);
+        assert!(herdr_agent_name(&agent_name(&long, TASK)), "{long}");
     }
 }

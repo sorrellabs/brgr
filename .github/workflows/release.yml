@@ -55,6 +55,7 @@ jobs:
           printf '%s' "$detail" | jq -e '.artifacts[0].text == "BRGR_FIXTURE_OK"'
           decision="$(BRGR_OWNER_ID=codex:release-smoke BRGR_SESSION_ID=release-smoke "$binary" --home "$scratch/home" --json accept "$task" --reason 'release fixture result verified')"
           printf '%s' "$decision" | jq -e '.verdict == "accepted"'
+          "$binary" --home "$scratch/home" tui --once | grep -q "${task:0:8}"
       - name: Generate SPDX SBOM
         run: |
           cargo install cargo-sbom --version 0.10.0 --locked --root "${RUNNER_TEMP}/brgr-sbom-tool"
@@ -112,6 +113,7 @@ jobs:
           printf '%s' "$detail" | jq -e '.artifacts[0].text == "BRGR_FIXTURE_OK"'
           decision="$(BRGR_OWNER_ID=codex:release-smoke BRGR_SESSION_ID=release-smoke "$binary" --home "$scratch/home" --json accept "$task" --reason 'release fixture result verified')"
           printf '%s' "$decision" | jq -e '.verdict == "accepted"'
+          "$binary" --home "$scratch/home" tui --once | grep -q "${task:0:8}"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: release-linux

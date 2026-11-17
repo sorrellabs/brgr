@@ -26,8 +26,8 @@ brgr hands bounded work to registered coding agents and seals what they return f
 
 ## Rules
 
-1. Every worker opens as a Herdr pane split beside your pane, running the harness's own TUI: the first to the right of a wide pane or below a narrow one, later ones stacked under it in equal sizes while you keep your half, and in a new tab once that column is full or after `brgr config set worker-placement tab`. Do not choose headless yourself; pass `--mode auto` when you cannot tell whether a Herdr pane is available. For an OpenCode session, auto uses headless when brgr cannot verify the caller pane; an explicit `--mode pane` requires a verified pane.
-2. When the work should be done by Claude, use `--harness local.claude-code`. Do not run Claude through another harness.
+1. Every worker opens as a Herdr pane split beside your pane, running the harness's own TUI: the first to the right of a wide pane or below a narrow one, later ones stacked under it in equal sizes while you keep your half, then in a second column beside them, and in a new tab once both are full; or in one row under you after `brgr config set worker-placement below`; or in a new tab after `brgr config set worker-placement tab`. Do not choose headless yourself; pass `--mode auto` when you cannot tell whether a Herdr pane is available. For an OpenCode session, auto uses headless when brgr cannot verify the caller pane; an explicit `--mode pane` requires a verified pane.
+2. Claude models run through `--harness local.claude-code`, unless the owner allowed other harnesses with `brgr config set claude-route any`. You do not need to check: use the harness, model or `--use` alias the user names. If brgr refuses the route, it started nothing and chose no other harness; tell the user, and do not change `claude-route` or switch harness on your own.
 3. Workers always run with full permissions (yolo). Nothing lowers it; `--permission` is ignored.
 4. Close what you open. Decide every result (`accept`, `reject`, or `result TASK --ack`) so brgr closes the worker's pane and removes its worktree once nothing in it would be lost. Use `--keep-pane` or `--keep-worktree` only when the user asks to keep one.
 5. From Codex, start every brgr command with `--as SESSION`, the session in your calling context, and never add `--source-pane`. brgr finds your pane from what the Codex panes show; if it cannot, `--mode auto` runs headless and explicit pane mode is refused before admission. Codex 0.162 and later show a command's line only after it ends, so before the first handoff of a session run one short brgr command with the same `--as` (for example `brgr --as SESSION status --brief`). From Cursor, `CURSOR_CONVERSATION_ID` is the session; `--as` is optional. OpenCode sessions use `--mode auto` when their Herdr pane cannot be verified; an explicit pane request is refused and should use `--mode headless` instead.
@@ -45,6 +45,7 @@ brgr hands bounded work to registered coding agents and seals what they return f
 
 - `brgr_completion`: a result is ready. Check it against the criterion, then decide. It is not acceptance.
 - `brgr_failure`: the run failed or was lost, and `reason` says why. Inspect with `brgr result TASK`; retry with `brgr revise TASK "<corrected objective>"`, or dismiss with `brgr result TASK --ack`. Until you do, every brgr command ends with a stderr note listing it.
+- `brgr_completions`: several results are ready, including failed and lost runs. For each task, read the sealed result, verify its criteria, and decide or acknowledge it.
 - `brgr_question`: the worker is waiting on you. Read it with `brgr message list TASK --for owner`, answer with `brgr message send TASK --to worker --kind reply --reply-to MESSAGE_ID --body "<answer>"`, then `brgr message ack TASK MESSAGE_ID --for owner`.
 - A repeated id is the same notice, not a new one.
 
@@ -69,7 +70,7 @@ Siblings talk directly only when the user asks for a **debate**: `brgr debate st
 - Workspace: a clean Git repository gets a task worktree. `--snapshot-path <file>` carries chosen uncommitted files; `--evidence-file <file>` and `--capture-logs` add artifacts.
 - Isolation: to keep test tasks out of the real store, pass `--home DIR` on every brgr command. An exported `BRGR_HOME` does not reach a Codex session, whose shared daemon keeps its own environment.
 - Status: `brgr status --brief`, `brgr status TASK --tree`, `brgr cancel TASK --tree`. A different session stops a worker with `brgr cancel TASK --force` without deciding the result.
-- Config: `brgr config init`, `brgr config show`, `brgr config set model <name> --harness <id>`, `brgr config alias set NAME --harness ID`, `brgr config set worker-placement tab`, `brgr config check`. Alias set also accepts `--model MODEL` and `--effort EFFORT`; use `brgr run <objective> --use <name>` to select a saved route. User instructions live in `$BRGR_HOME/BRGR.md`.
+- Config: `brgr config init`, `brgr config show`, `brgr config set model <name> --harness <id>`, `brgr config alias set NAME --harness ID`, `brgr config set worker-placement adjacent|below|tab`, `brgr config check`. Alias set also accepts `--model MODEL` and `--effort EFFORT`; use `brgr run <objective> --use <name>` to select a saved route. User instructions live in `$BRGR_HOME/BRGR.md`.
 - Housekeeping: `brgr errors` lists recorded failures. A worktree a decision kept (it holds work found nowhere else) stays until `brgr prune --apply`; `brgr prune` first reports what would go and why the rest stays.
 - Head: to pass your command to a new session, `brgr head handoff TASK --kind claude|codex|cursor --goal TEXT`; the new head is told every step. `brgr head claim TASK --abandoned --goal TEXT` takes a head that is gone. The other `head` subcommands are the steps these run.
 - Which to use: one worker for a bounded task; parallel attempts to compare answers; a workflow script for a fixed sequence of steps (`brgr workflow init`); `--enable-delegation` when a worker must split its own work; debate only when the user asks; handoff when this session should stop being the head.
@@ -663,6 +664,12 @@ mod tests {
             assert!(SKILL_TEXT.contains(rule), "skill no longer mentions {rule}");
         }
         assert!(!SKILL_TEXT.contains("without a pane"));
+    }
+
+    #[test]
+    fn skill_rule_two_names_the_claude_route_setting() {
+        assert!(SKILL_TEXT.contains("brgr config set claude-route any"));
+        assert!(SKILL_TEXT.contains("local.claude-code"));
     }
 
     #[test]

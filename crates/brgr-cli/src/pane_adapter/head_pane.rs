@@ -72,23 +72,27 @@ pub(crate) fn open_incoming(paths: &Paths, spec: &IncomingSpec<'_>) -> Result<In
         task: spec.task,
         outstanding: Vec::new(),
     };
+    let mut answers = screens::AnswerMemory::new();
     screens::settle_shell(&herdr, &pane, &run, paths);
-    let ready = start_agent(&herdr, &name, &pane, &run, &mut notices).and_then(|()| {
-        let waited = Instant::now();
-        while !native::native_ready(&herdr, &pane, spec.kind, false) {
-            if waited.elapsed() > READY {
-                bail!(
-                    "the incoming {} agent never became ready for a prompt",
-                    spec.kind
-                );
+    let ready =
+        start_agent(&herdr, &name, &pane, &run, &mut notices, &mut answers).and_then(|()| {
+            let waited = Instant::now();
+            while !native::native_ready(&herdr, &pane, spec.kind, false) {
+                if waited.elapsed() > READY {
+                    bail!(
+                        "the incoming {} agent never became ready for a prompt",
+                        spec.kind
+                    );
+                }
+                thread::sleep(POLL);
             }
-            thread::sleep(POLL);
-        }
-        herdr
-            .call(&["agent", "prompt", &name, spec.prompt])
-            .map_err(|failure| anyhow::anyhow!("could not prompt the incoming head: {failure}"))?;
-        Ok(())
-    });
+            herdr
+                .call(&["agent", "prompt", &name, spec.prompt])
+                .map_err(|failure| {
+                    anyhow::anyhow!("could not prompt the incoming head: {failure}")
+                })?;
+            Ok(())
+        });
     if let Err(error) = ready {
         // A pane that never took its prompt holds nothing; do not leave it.
         let _ = herdr.call(&["pane", "close", &pane]);

@@ -59,7 +59,7 @@ mod recipe;
 pub use error::RegistryError;
 
 use catalog::{executable_on_path, parse_model_catalog};
-use recipe::{GENERIC, RECIPES, generate_manifest};
+use recipe::{GENERIC, generate_manifest_from, named, recipe_for};
 
 use std::{
     collections::BTreeSet,
@@ -90,9 +90,8 @@ const PROBE_DEADLINE: Duration = Duration::from_secs(15);
 /// a working harness could not be registered.
 const SCRATCH_DEADLINE: Duration = Duration::from_mins(3);
 
-/// A harness whose support was removed. An installation may still have it
-/// registered; it stays readable but never runs.
-pub const REMOVED_HARNESS_ID: &str = "local.gjc";
+/// The harness Claude models run through when `claude-route` is `claude-code-only`.
+pub const CLAUDE_CODE_HARNESS_ID: &str = "local.claude-code";
 
 #[derive(Clone, Debug)]
 pub struct Registry {
@@ -213,10 +212,7 @@ impl Registry {
                 }
                 let stem = path.file_stem().unwrap_or_default().to_string_lossy();
                 validate_harness_id(&stem)?;
-                // It cannot run, and there is nothing for the owner to repair.
-                if stem != REMOVED_HARNESS_ID {
-                    ids.insert(stem.into_owned());
-                }
+                ids.insert(stem.into_owned());
             }
         }
         Ok(ids.into_iter().collect())
@@ -230,9 +226,6 @@ impl Registry {
     /// Returns [`RegistryError`] when probing fails, required documented flags
     /// are absent, or activation data cannot be persisted.
     pub async fn add(&self, executable: &Path) -> Result<ActivationReceipt, RegistryError> {
-        if executable.file_name().and_then(|value| value.to_str()) == Some("gjc") {
-            return Err(RegistryError::RemovedGjcSupport);
-        }
         let (manifest, probe) = self.draft_with_probe(executable).await?;
         if manifest.id != "local.omp-herdr" || manifest.adapter != OMP_ROLE_ADAPTER_V1 {
             return Err(RegistryError::ScratchRunRequired(manifest.id));
@@ -249,9 +242,6 @@ impl Registry {
     /// Returns an error if probing fails or a bounded fresh run cannot be
     /// described without guessing flags.
     pub async fn draft(&self, executable: &Path) -> Result<HarnessManifest, RegistryError> {
-        if executable.file_name().and_then(|value| value.to_str()) == Some("gjc") {
-            return Err(RegistryError::RemovedGjcSupport);
-        }
         self.draft_with_probe(executable)
             .await
             .map(|(manifest, _)| manifest)
@@ -266,8 +256,7 @@ impl Registry {
         executable: &Path,
     ) -> Result<(HarnessManifest, ProbeEvidence), RegistryError> {
         let file_name = executable.file_name().and_then(|value| value.to_str());
-        let known =
-            file_name.is_some_and(|name| RECIPES.iter().any(|recipe| recipe.names.contains(&name)));
+        let known = file_name.is_some_and(|name| named(name).is_some());
         if !known
             && executable.is_absolute()
             && let Some(name) = self.registered_name_for(executable)?
@@ -532,9 +521,6 @@ impl Registry {
         harness_id: &str,
     ) -> Result<(HarnessManifest, ActivationReceipt), RegistryError> {
         validate_harness_id(harness_id)?;
-        if harness_id == REMOVED_HARNESS_ID {
-            return Err(RegistryError::RemovedGjcSupport);
-        }
         let manifest_bytes = fs::read(self.manifest_path(harness_id))?;
         let manifest: HarnessManifest = serde_json::from_slice(&manifest_bytes)?;
         let receipt: ActivationReceipt =
@@ -657,9 +643,20 @@ impl Registry {
     /// Returns [`RegistryError`] when the manifest cannot be read.
     pub fn recertify_action_for(&self, harness_id: &str) -> Result<String, RegistryError> {
         validate_harness_id(harness_id)?;
-        let manifest: HarnessManifest =
-            serde_json::from_slice(&fs::read(self.manifest_path(harness_id))?)?;
-        Ok(recertify_action(&manifest))
+        Ok(recertify_action(&self.stored_manifest(harness_id)?))
+    }
+
+    /// The stored recipe for a harness, without checking health. Diagnostics
+    /// use it to name the executable and version probe.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RegistryError`] when the manifest cannot be read.
+    pub fn stored_manifest(&self, harness_id: &str) -> Result<HarnessManifest, RegistryError> {
+        validate_harness_id(harness_id)?;
+        Ok(serde_json::from_slice(&fs::read(
+            self.manifest_path(harness_id),
+        )?)?)
     }
 
     /// The manifest an agent authored for a harness, when that is how it was
@@ -1016,7 +1013,8 @@ async fn probe_custom_contract(manifest: &HarnessManifest) -> Result<ProbeEviden
     if manifest.adapter != PROCESS_ADAPTER_V1
         || matches!(
             manifest.id.as_str(),
-            "local.omp"
+            "local.gjc"
+                | "local.omp"
                 | "local.omp-herdr"
                 | "local.cursor-cli"
                 | "local.command-code"
@@ -1218,12 +1216,10 @@ async fn draft_manifest_as(
     }
     // The recipe says where its version and help live; a CLI whose flags
     // belong to a subcommand documents them only there.
-    let recipe = RECIPES
-        .iter()
-        .find(|recipe| recipe.names.contains(&requested_name))
-        .unwrap_or(&GENERIC);
-    let version_argv = vec![recipe.version_argv.to_owned()];
-    let help_argv: Vec<String> = recipe
+    let recipe = recipe_for(requested_name, &realpath);
+    let probe_recipe = recipe.unwrap_or(&GENERIC);
+    let version_argv = vec![probe_recipe.version_argv.to_owned()];
+    let help_argv: Vec<String> = probe_recipe
         .help_argv
         .iter()
         .map(|arg| (*arg).to_owned())
@@ -1240,7 +1236,7 @@ async fn draft_manifest_as(
         return Err(RegistryError::ProbeFailed);
     }
     let help_text = String::from_utf8_lossy(help_output(&help));
-    let manifest = generate_manifest(requested_name, realpath, &help_text)?;
+    let manifest = generate_manifest_from(recipe, requested_name, realpath, &help_text)?;
     manifest.validate()?;
     let executable_digest = digest_file(&manifest.executable)?;
     Ok((
@@ -1406,7 +1402,7 @@ fn write_json_atomic(path: &Path, bytes: &[u8]) -> Result<(), RegistryError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::recipe::{supported, unsupported};
+    use crate::recipe::{generate_manifest, supported, unsupported};
     use brgr_runner::PermissionLevel;
     use brgr_runner::{
         LaunchSpec, MANIFEST_SCHEMA_V1, ModelCatalogSpec, ProbeSpec, ResultSource, ResultSpec,
@@ -2012,7 +2008,10 @@ mod tests {
     #[test]
     fn unknown_harness_is_not_guessed() {
         let error = generate_manifest("mystery", PathBuf::from("/bin/echo"), "--help").unwrap_err();
-        assert!(matches!(error, RegistryError::RequiredFlagsMissing));
+        assert!(matches!(
+            error,
+            RegistryError::UnknownHarnessName { ref name, .. } if name == "mystery"
+        ));
         let error = generate_manifest("omp", PathBuf::from("/bin/echo"), "--prompt-file <path>")
             .unwrap_err();
         assert!(matches!(error, RegistryError::RequiredFlagsMissing));
@@ -2546,7 +2545,7 @@ mod tests {
         // Before anything is registered the file name alone names no recipe.
         assert!(matches!(
             registry.draft(&script).await,
-            Err(RegistryError::RequiredFlagsMissing)
+            Err(RegistryError::UnknownHarnessName { .. })
         ));
         let registered = registry.draft(&link).await.unwrap();
         assert_eq!(registered.id, "local.command-code");
@@ -2559,6 +2558,58 @@ mod tests {
         let redrafted = registry.draft(&script).await.unwrap();
         assert_eq!(redrafted.id, "local.command-code");
         assert_eq!(redrafted.launch.argv, registered.launch.argv);
+    }
+
+    const COMMAND_CODE_FIXTURE_BODY: &str = "#!/bin/sh\ncase \"$1\" in\n  --version) echo '1.89.1';;\n  *) echo '--print [query] --permission-mode <mode> --no-session --no-skills --skip-onboarding --no-auto-update --max-turns <number> --model <model>';;\nesac\n";
+
+    /// Command Code installs `cmd` on PATH and `dist/index.mjs` in its package.
+    /// Neither file name is a recipe name, so the `node_modules/command-code`
+    /// path decides the recipe, with no prior registration.
+    #[tokio::test]
+    async fn command_code_package_drafts_from_cmd_and_index_mjs_paths() {
+        let root = tempfile::tempdir().unwrap();
+        let dist = root.path().join("node_modules/command-code/dist");
+        fs::create_dir_all(&dist).unwrap();
+        let script = dist.join("index.mjs");
+        write_fast_script(&script, COMMAND_CODE_FIXTURE_BODY);
+        let bin = root.path().join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        let cmd = bin.join("cmd");
+        symlink(&script, &cmd).unwrap();
+        let registry = Registry::open(root.path().join("registry")).unwrap();
+
+        let through_cmd = registry.draft(&cmd).await.unwrap();
+        assert_eq!(through_cmd.id, "local.command-code");
+        let through_script = registry.draft(&script).await.unwrap();
+        assert_eq!(through_script.id, "local.command-code");
+        assert_eq!(through_cmd.launch.argv, through_script.launch.argv);
+    }
+
+    /// A `cmd` outside a `command-code` package is not matched by its name.
+    #[tokio::test]
+    async fn an_unrelated_cmd_is_not_matched_by_its_file_name() {
+        let root = tempfile::tempdir().unwrap();
+        let cmd = root.path().join("cmd");
+        write_fast_script(&cmd, COMMAND_CODE_FIXTURE_BODY);
+        let registry = Registry::open(root.path().join("registry")).unwrap();
+        assert!(matches!(
+            registry.draft(&cmd).await,
+            Err(RegistryError::UnknownHarnessName { ref name, .. }) if name == "cmd"
+        ));
+    }
+
+    /// The error for a name that matches no recipe says which ones exist.
+    #[test]
+    fn an_unmatched_name_error_lists_the_recognized_names() {
+        let error = generate_manifest("cmd", PathBuf::from("/bin/echo"), "--help").unwrap_err();
+        assert!(matches!(
+            error,
+            RegistryError::UnknownHarnessName { ref name, .. } if name == "cmd"
+        ));
+        let message = error.to_string();
+        for name in ["command-code", "claude", "opencode"] {
+            assert!(message.contains(name), "{message}");
+        }
     }
 
     #[tokio::test]
@@ -3011,19 +3062,87 @@ mod tests {
         }
     }
 
+    /// GJC v0.21.0 help documents `-p` and `--model`; the recipe drafts from it.
+    #[test]
+    fn gjc_v0_21_0_drafts_from_its_own_help() {
+        let manifest = generate_manifest(
+            "gjc",
+            PathBuf::from("/bin/echo"),
+            &help_fixture("gjc-0.21.0.txt"),
+        )
+        .unwrap();
+        manifest.validate().unwrap();
+        assert_eq!(manifest.id, "local.gjc");
+        assert_eq!(
+            manifest.launch.argv,
+            [
+                "-p",
+                "--mode=json",
+                "--no-session",
+                "--no-mcp",
+                "@${input.prompt_file}",
+            ]
+        );
+        assert_eq!(manifest.launch.model_argv, ["--model", "${route.model}"]);
+        assert_eq!(
+            manifest.launch.effort_argv,
+            ["--thinking", "${route.effort}"]
+        );
+        assert_eq!(
+            manifest.launch.interactive.as_ref().unwrap().herdr_kind,
+            "gjc"
+        );
+        assert!(manifest.permission_arguments(None).unwrap().is_empty());
+    }
+
+    /// GJC is a supported tier-3 harness: `--version`/`--help` probe, then one
+    /// bounded fresh run against a fixture executable, not the real `gjc`
+    /// (issue #408).
     #[tokio::test]
-    async fn executable_named_gjc_is_refused_for_add_and_draft() {
+    async fn executable_named_gjc_probes_version_and_help_then_completes_one_bounded_fresh_run() {
         let root = tempfile::tempdir().unwrap();
         let executable = root.path().join("gjc");
-        fixture_executable(&executable);
+        write_fast_script(
+            &executable,
+            "#!/bin/sh\ncase \"$1\" in\n --version) echo 'gjc/0.21.0';;\n --help) echo '--mode=<value> --no-session --no-mcp -p, --print --model=<value> --thinking=<value>';;\n *) printf '%s\\n' '{\"type\":\"message_end\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"ok\"}]}}' '{\"type\":\"agent_end\",\"stopReason\":\"completed\"}';;\nesac\n",
+        );
         let registry = Registry::open(root.path().join("registry")).unwrap();
-        assert!(matches!(
-            registry.draft(&executable).await,
-            Err(RegistryError::RemovedGjcSupport)
-        ));
+        let draft = registry
+            .draft(&executable)
+            .await
+            .expect("gjc must draft, not be refused as removed");
+        assert_eq!(draft.id, "local.gjc");
+        assert_eq!(draft.probe.version_argv, ["--version"]);
+        assert_eq!(draft.probe.help_argv, ["--help"]);
         assert!(matches!(
             registry.add(&executable).await,
-            Err(RegistryError::RemovedGjcSupport)
+            Err(RegistryError::ScratchRunRequired(_))
         ));
+        registry.contract_test(&draft).await.unwrap();
+        let receipt = registry
+            .activate_with_scratch(&draft, &scratch_workspace(&root), "ok", None, None)
+            .await
+            .unwrap();
+        assert!(receipt.scratch_result_digest.is_some());
+        assert_eq!(registry.health(&draft.id).unwrap(), Health::Healthy);
+        let loaded = registry.load_healthy(&draft.id).unwrap();
+        let result = ProcessRunner::run(
+            &loaded,
+            brgr_runner::RunRequest {
+                workspace: root.path(),
+                prompt: "second",
+                criteria: None,
+                instructions: None,
+                model: None,
+                effort: None,
+                permission: None,
+                deadline: Duration::from_mins(1),
+                cancel_path: None,
+                pid_path: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.result, b"ok");
     }
 }
