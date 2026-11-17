@@ -1,6 +1,6 @@
 //! The built-in harness recipes and the process manifests drafted from them.
 
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
 
 use brgr_runner::{
     Capability, CapabilityStatus, ExecutionMode, HarnessManifest, InteractiveSpec, LaunchSpec,
@@ -29,6 +29,9 @@ pub(crate) struct Interactive {
 /// copy-and-edit slip hides.
 pub(crate) struct Recipe {
     pub(crate) names: &'static [&'static str],
+    /// npm package directories that identify the harness when the executable's
+    /// own file name is a wrapper (`cmd`, `index.mjs`).
+    pub(crate) packages: &'static [&'static str],
     pub(crate) id: &'static str,
     pub(crate) adapter: &'static str,
     /// Every one must appear in the help text before anything is drafted.
@@ -110,6 +113,7 @@ pub(crate) const OMP_CATALOG: &[&str] = &["models", "find", "${model.query}", "-
 
 pub(crate) const GENERIC: Recipe = Recipe {
     names: &[],
+    packages: &[],
     id: "",
     adapter: PROCESS_ADAPTER_V1,
     required_flags: &[],
@@ -275,6 +279,7 @@ pub(crate) const RECIPES: &[Recipe] = &[
     },
     Recipe {
         names: &["command-code", "commandcode", "cmdc"],
+        packages: &["command-code"],
         id: "local.command-code",
         required_flags: &[
             "--print [query]",
@@ -713,15 +718,66 @@ pub(crate) const RECIPES: &[Recipe] = &[
     },
 ];
 
+/// The recipe an executable's own file name names.
+pub(crate) fn named(name: &str) -> Option<&'static Recipe> {
+    RECIPES.iter().find(|recipe| recipe.names.contains(&name))
+}
+
+/// The recipe for an executable: its file name first, then the npm package its
+/// resolved path belongs to. Command Code installs `cmd` on PATH and
+/// `dist/index.mjs` in its package, and neither file name is a recipe name.
+pub(crate) fn recipe_for(name: &str, realpath: &Path) -> Option<&'static Recipe> {
+    named(name).or_else(|| RECIPES.iter().find(|recipe| recipe.in_package(realpath)))
+}
+
+impl Recipe {
+    fn in_package(&self, realpath: &Path) -> bool {
+        if self.packages.is_empty() {
+            return false;
+        }
+        let mut components = realpath.components();
+        while let Some(component) = components.next() {
+            if component.as_os_str() == "node_modules"
+                && let Some(Component::Normal(package)) = components.next()
+                && self
+                    .packages
+                    .iter()
+                    .any(|known| package.to_str() == Some(*known))
+            {
+                return true;
+            }
+        }
+        false
+    }
+}
+
+/// Every name a built-in recipe answers to, for an error that says which ones
+/// would have worked.
+fn recipe_names() -> Vec<&'static str> {
+    let mut names: Vec<_> = RECIPES
+        .iter()
+        .flat_map(|recipe| recipe.names.iter().copied())
+        .collect();
+    names.sort_unstable();
+    names
+}
+
+#[cfg(test)]
 pub(crate) fn generate_manifest(
     requested_name: &str,
     executable: PathBuf,
     help: &str,
 ) -> Result<HarnessManifest, RegistryError> {
-    if let Some(recipe) = RECIPES
-        .iter()
-        .find(|recipe| recipe.names.contains(&requested_name))
-    {
+    generate_manifest_from(named(requested_name), requested_name, executable, help)
+}
+
+pub(crate) fn generate_manifest_from(
+    recipe: Option<&Recipe>,
+    requested_name: &str,
+    executable: PathBuf,
+    help: &str,
+) -> Result<HarnessManifest, RegistryError> {
+    if let Some(recipe) = recipe {
         if !recipe
             .required_flags
             .iter()
@@ -740,7 +796,10 @@ pub(crate) fn generate_manifest(
             pair[0] == "--prompt-file" && matches!(pair[1], "<path>" | "<file>" | "PATH" | "FILE")
         })
     }) {
-        return Err(RegistryError::RequiredFlagsMissing);
+        return Err(RegistryError::UnknownHarnessName {
+            name: requested_name.to_owned(),
+            known: recipe_names().join(", "),
+        });
     }
     let id = format!("local.{}", requested_name.to_ascii_lowercase());
     validate_harness_id(&id)?;

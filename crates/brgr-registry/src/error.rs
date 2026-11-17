@@ -31,6 +31,8 @@ pub enum RegistryError {
     UnsupportedHarness,
     #[error("help does not document a supported bounded fresh-run flag contract")]
     RequiredFlagsMissing,
+    #[error("executable name `{name}` matches no harness recipe; recognized names: {known}")]
+    UnknownHarnessName { name: String, known: String },
     #[error("harness id contains unsafe path characters: {0}")]
     InvalidHarnessId(String),
     #[error("harness {0} needs an explicitly authorized scratch run before activation")]

@@ -59,7 +59,7 @@ mod recipe;
 pub use error::RegistryError;
 
 use catalog::{executable_on_path, parse_model_catalog};
-use recipe::{GENERIC, RECIPES, generate_manifest};
+use recipe::{GENERIC, generate_manifest_from, named, recipe_for};
 
 use std::{
     collections::BTreeSet,
@@ -256,8 +256,7 @@ impl Registry {
         executable: &Path,
     ) -> Result<(HarnessManifest, ProbeEvidence), RegistryError> {
         let file_name = executable.file_name().and_then(|value| value.to_str());
-        let known =
-            file_name.is_some_and(|name| RECIPES.iter().any(|recipe| recipe.names.contains(&name)));
+        let known = file_name.is_some_and(|name| named(name).is_some());
         if !known
             && executable.is_absolute()
             && let Some(name) = self.registered_name_for(executable)?
@@ -1217,12 +1216,10 @@ async fn draft_manifest_as(
     }
     // The recipe says where its version and help live; a CLI whose flags
     // belong to a subcommand documents them only there.
-    let recipe = RECIPES
-        .iter()
-        .find(|recipe| recipe.names.contains(&requested_name))
-        .unwrap_or(&GENERIC);
-    let version_argv = vec![recipe.version_argv.to_owned()];
-    let help_argv: Vec<String> = recipe
+    let recipe = recipe_for(requested_name, &realpath);
+    let probe_recipe = recipe.unwrap_or(&GENERIC);
+    let version_argv = vec![probe_recipe.version_argv.to_owned()];
+    let help_argv: Vec<String> = probe_recipe
         .help_argv
         .iter()
         .map(|arg| (*arg).to_owned())
@@ -1239,7 +1236,7 @@ async fn draft_manifest_as(
         return Err(RegistryError::ProbeFailed);
     }
     let help_text = String::from_utf8_lossy(help_output(&help));
-    let manifest = generate_manifest(requested_name, realpath, &help_text)?;
+    let manifest = generate_manifest_from(recipe, requested_name, realpath, &help_text)?;
     manifest.validate()?;
     let executable_digest = digest_file(&manifest.executable)?;
     Ok((
@@ -1405,7 +1402,7 @@ fn write_json_atomic(path: &Path, bytes: &[u8]) -> Result<(), RegistryError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::recipe::{supported, unsupported};
+    use crate::recipe::{generate_manifest, supported, unsupported};
     use brgr_runner::PermissionLevel;
     use brgr_runner::{
         LaunchSpec, MANIFEST_SCHEMA_V1, ModelCatalogSpec, ProbeSpec, ResultSource, ResultSpec,
@@ -2011,7 +2008,10 @@ mod tests {
     #[test]
     fn unknown_harness_is_not_guessed() {
         let error = generate_manifest("mystery", PathBuf::from("/bin/echo"), "--help").unwrap_err();
-        assert!(matches!(error, RegistryError::RequiredFlagsMissing));
+        assert!(matches!(
+            error,
+            RegistryError::UnknownHarnessName { ref name, .. } if name == "mystery"
+        ));
         let error = generate_manifest("omp", PathBuf::from("/bin/echo"), "--prompt-file <path>")
             .unwrap_err();
         assert!(matches!(error, RegistryError::RequiredFlagsMissing));
@@ -2545,7 +2545,7 @@ mod tests {
         // Before anything is registered the file name alone names no recipe.
         assert!(matches!(
             registry.draft(&script).await,
-            Err(RegistryError::RequiredFlagsMissing)
+            Err(RegistryError::UnknownHarnessName { .. })
         ));
         let registered = registry.draft(&link).await.unwrap();
         assert_eq!(registered.id, "local.command-code");
@@ -2558,6 +2558,58 @@ mod tests {
         let redrafted = registry.draft(&script).await.unwrap();
         assert_eq!(redrafted.id, "local.command-code");
         assert_eq!(redrafted.launch.argv, registered.launch.argv);
+    }
+
+    const COMMAND_CODE_FIXTURE_BODY: &str = "#!/bin/sh\ncase \"$1\" in\n  --version) echo '1.89.1';;\n  *) echo '--print [query] --permission-mode <mode> --no-session --no-skills --skip-onboarding --no-auto-update --max-turns <number> --model <model>';;\nesac\n";
+
+    /// Command Code installs `cmd` on PATH and `dist/index.mjs` in its package.
+    /// Neither file name is a recipe name, so the `node_modules/command-code`
+    /// path decides the recipe, with no prior registration.
+    #[tokio::test]
+    async fn command_code_package_drafts_from_cmd_and_index_mjs_paths() {
+        let root = tempfile::tempdir().unwrap();
+        let dist = root.path().join("node_modules/command-code/dist");
+        fs::create_dir_all(&dist).unwrap();
+        let script = dist.join("index.mjs");
+        write_fast_script(&script, COMMAND_CODE_FIXTURE_BODY);
+        let bin = root.path().join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        let cmd = bin.join("cmd");
+        symlink(&script, &cmd).unwrap();
+        let registry = Registry::open(root.path().join("registry")).unwrap();
+
+        let through_cmd = registry.draft(&cmd).await.unwrap();
+        assert_eq!(through_cmd.id, "local.command-code");
+        let through_script = registry.draft(&script).await.unwrap();
+        assert_eq!(through_script.id, "local.command-code");
+        assert_eq!(through_cmd.launch.argv, through_script.launch.argv);
+    }
+
+    /// A `cmd` outside a `command-code` package is not matched by its name.
+    #[tokio::test]
+    async fn an_unrelated_cmd_is_not_matched_by_its_file_name() {
+        let root = tempfile::tempdir().unwrap();
+        let cmd = root.path().join("cmd");
+        write_fast_script(&cmd, COMMAND_CODE_FIXTURE_BODY);
+        let registry = Registry::open(root.path().join("registry")).unwrap();
+        assert!(matches!(
+            registry.draft(&cmd).await,
+            Err(RegistryError::UnknownHarnessName { ref name, .. }) if name == "cmd"
+        ));
+    }
+
+    /// The error for a name that matches no recipe says which ones exist.
+    #[test]
+    fn an_unmatched_name_error_lists_the_recognized_names() {
+        let error = generate_manifest("cmd", PathBuf::from("/bin/echo"), "--help").unwrap_err();
+        assert!(matches!(
+            error,
+            RegistryError::UnknownHarnessName { ref name, .. } if name == "cmd"
+        ));
+        let message = error.to_string();
+        for name in ["command-code", "claude", "opencode"] {
+            assert!(message.contains(name), "{message}");
+        }
     }
 
     #[tokio::test]
