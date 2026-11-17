@@ -1527,6 +1527,23 @@ fn board_rows_carry_requested_model_and_effort() {
 }
 
 #[test]
+fn board_rows_carry_the_recorded_source_checkout() {
+    let root = TempDir::new().unwrap();
+    let mut store = Store::open(root.path()).unwrap();
+    let item = task();
+    store.record_task(&item, "board-checkout").unwrap();
+    store
+        .record_task_checkout(item.task_id, item.revision, "/src/brgr-live3-repo")
+        .unwrap();
+    let rows = BoardStore::open_existing(root.path())
+        .unwrap()
+        .rows(20)
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].checkout.as_deref(), Some("/src/brgr-live3-repo"));
+}
+
+#[test]
 fn board_rows_for_session_match_tasks_for_session() {
     let root = TempDir::new().unwrap();
     let mut store = Store::open(root.path()).unwrap();
@@ -1650,6 +1667,7 @@ fn board_rows_without_owner_bindings_table_still_list_all() {
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].task_id, task_id);
     assert_eq!(rows[0].harness_id, "local.fixture");
+    assert_eq!(rows[0].checkout, None);
 }
 
 #[test]

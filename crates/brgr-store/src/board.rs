@@ -9,7 +9,7 @@ use crate::StoreError;
 use brgr_protocol::{
     AttemptState, DecisionVerdict, OwnerId, ResultId, SCHEMA_V1, TaskId, TerminalOutcome,
 };
-use rusqlite::{Connection, OpenFlags, Params, Transaction, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension as _, Params, Transaction, params};
 
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(1);
 
@@ -73,6 +73,10 @@ pub struct BoardTaskRow {
     pub task_id: TaskId,
     pub revision: u32,
     pub workspace: String,
+    /// The primary checkout brgr recorded for a task worktree, if any. The
+    /// workspace records the worktree brgr created, not the repository it came
+    /// from.
+    pub checkout: Option<String>,
     pub harness_id: String,
     pub requested_model: Option<String>,
     pub requested_effort: Option<String>,
@@ -268,7 +272,43 @@ fn collect_board_rows(
             break;
         }
     }
+    attach_task_checkouts(transaction, &mut rows)?;
     Ok(rows)
+}
+
+/// Fills each row with the primary checkout recorded for its revision.
+///
+/// A store written before `task_checkouts` existed has no such table; the board
+/// still lists every task and leaves the checkout unset.
+fn attach_task_checkouts(
+    transaction: &Transaction<'_>,
+    rows: &mut [BoardTaskRow],
+) -> Result<(), StoreError> {
+    if rows.is_empty() || !table_exists(transaction, "task_checkouts")? {
+        return Ok(());
+    }
+    {
+        let mut statement = transaction.prepare(
+            "SELECT primary_checkout FROM task_checkouts WHERE task_id = ?1 AND revision = ?2",
+        )?;
+        for row in rows {
+            row.checkout = statement
+                .query_row(params![row.task_id.to_string(), row.revision], |value| {
+                    value.get::<_, String>(0)
+                })
+                .optional()?;
+        }
+    }
+    Ok(())
+}
+
+fn table_exists(transaction: &Transaction<'_>, name: &str) -> Result<bool, StoreError> {
+    let exists = transaction.query_row(
+        "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
+        [name],
+        |row| row.get::<_, i64>(0),
+    )?;
+    Ok(exists == 1)
 }
 
 fn map_projected_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ProjectedBoardRow> {
@@ -448,6 +488,7 @@ fn parse_board_row(row: ProjectedBoardRow) -> Option<BoardTaskRow> {
         task_id,
         revision,
         workspace,
+        checkout: None,
         harness_id,
         requested_model: row.requested_model,
         requested_effort: row.requested_effort,

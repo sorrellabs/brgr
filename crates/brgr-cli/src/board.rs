@@ -78,11 +78,7 @@ pub(crate) fn load(paths: &Paths, scope: &Scope) -> Result<BoardModel> {
     let rows = rows
         .into_iter()
         .map(|row| {
-            let project = Path::new(&row.workspace)
-                .file_name()
-                .and_then(|name| name.to_str())
-                .unwrap_or("-")
-                .to_owned();
+            let project = project_name(&row.workspace, row.checkout.as_deref());
             let alias = alias_for(
                 &aliases,
                 &row.harness_id,
@@ -213,6 +209,20 @@ pub(crate) fn render(model: &BoardModel, host: Host, size: Option<(u16, u16)>) -
     lines
 }
 
+/// The PROJECT cell: the source repository brgr recorded for a task worktree,
+/// then the workspace folder when nothing better is recorded.
+fn project_name(workspace: &str, checkout: Option<&str>) -> String {
+    let source = checkout
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(workspace);
+    Path::new(source)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("-")
+        .to_owned()
+}
+
 pub(crate) fn alias_for<'a>(
     aliases: &'a BTreeMap<String, Alias>,
     harness: &str,
@@ -329,6 +339,23 @@ mod tests {
             outcome: "candidate".to_owned(),
             verdict: "-".to_owned(),
         }
+    }
+
+    #[test]
+    fn project_uses_the_recorded_repository_not_the_worktree_folder() {
+        assert_eq!(
+            project_name(
+                "/home/brgr/worktrees/brgr-live3-repo/5b8deeaa",
+                Some("/src/brgr-live3-repo"),
+            ),
+            "brgr-live3-repo"
+        );
+    }
+
+    #[test]
+    fn project_falls_back_to_the_workspace_folder_without_a_checkout() {
+        assert_eq!(project_name("/tmp/work", None), "work");
+        assert_eq!(project_name("/tmp/work", Some("  ")), "work");
     }
 
     #[test]

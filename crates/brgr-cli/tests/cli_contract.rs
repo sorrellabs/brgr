@@ -573,6 +573,77 @@ fn tui_text(home: &Path, args: &[&str], envs: &[(&str, &str)]) -> String {
     String::from_utf8(output.stdout).unwrap()
 }
 
+fn project_cell(text: &str, task_id: &str) -> String {
+    let short = &task_id[..8];
+    let row = text
+        .lines()
+        .find(|line| line.starts_with(short))
+        .unwrap_or_else(|| panic!("no row for {short}: {text}"));
+    row.split_whitespace()
+        .nth(1)
+        .unwrap_or_else(|| panic!("no project cell: {row}"))
+        .to_owned()
+}
+
+#[test]
+fn board_shows_the_source_repository_name_for_a_worktree_task() {
+    let temp = TempDir::new().unwrap();
+    let home = temp.path().join("brgr");
+    let repository = temp.path().join("brgr-live3-repo");
+    fs::create_dir_all(&repository).unwrap();
+    seed_git_repo(&repository);
+    add_fixture(&home, &brgr_fixture(), &temp.path().join("scratch"));
+    let created = json_output(&run(
+        &home,
+        &[
+            "run",
+            "BRGR_FIXTURE_OK",
+            "--workspace",
+            repository.to_str().unwrap(),
+            "--foreground",
+        ],
+        &[("BRGR_OWNER_ID", "codex:board-project")],
+    ));
+    let task_id = created["task_id"].as_str().unwrap();
+    let envs = [
+        ("BRGR_OWNER_ID", "codex:board-project"),
+        ("HERDR_ENV", "1"),
+        ("HERDR_PLUGIN_ID", "brgr"),
+    ];
+    let board =
+        String::from_utf8(run(&home, &["plugin", "board", "--once"], &envs).stdout).unwrap();
+    let tui = tui_text(&home, &["tui", "--once"], &[]);
+    assert_eq!(project_cell(&board, task_id), "brgr-live3-repo", "{board}");
+    assert_eq!(project_cell(&tui, task_id), "brgr-live3-repo", "{tui}");
+}
+
+#[test]
+fn board_keeps_the_workspace_folder_without_a_worktree() {
+    let (_temp, home, workspace) = fixture_home();
+    let created = json_output(&run(
+        &home,
+        &[
+            "run",
+            "BRGR_FIXTURE_OK",
+            "--workspace",
+            workspace.to_str().unwrap(),
+            "--foreground",
+        ],
+        &[("BRGR_OWNER_ID", "codex:board-no-worktree")],
+    ));
+    let task_id = created["task_id"].as_str().unwrap();
+    let envs = [
+        ("BRGR_OWNER_ID", "codex:board-no-worktree"),
+        ("HERDR_ENV", "1"),
+        ("HERDR_PLUGIN_ID", "brgr"),
+    ];
+    let board =
+        String::from_utf8(run(&home, &["plugin", "board", "--once"], &envs).stdout).unwrap();
+    let tui = tui_text(&home, &["tui", "--once"], &[]);
+    assert_eq!(project_cell(&board, task_id), "work", "{board}");
+    assert_eq!(project_cell(&tui, task_id), "work", "{tui}");
+}
+
 #[test]
 fn tui_once_renders_the_board_outside_herdr() {
     let (_temp, home, workspace) = fixture_home();
