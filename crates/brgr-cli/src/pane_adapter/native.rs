@@ -724,6 +724,7 @@ pub(super) fn send_first_prompt(
     run: &PaneRunArgs,
     text: &str,
     paths: &Paths,
+    answers: &mut AnswerMemory,
 ) -> Result<()> {
     let mut watch = ScreenWatch::new(&run.kind);
     retry_unsent(
@@ -732,17 +733,42 @@ pub(super) fn send_first_prompt(
         || send_prompt(herdr, name, pane, run, text, paths),
         || {
             let status = herdr.status(pane).ok();
-            match screens::resolve(herdr, pane, run, paths, status.as_deref(), &mut watch)? {
-                Screen::Resolve { rule, .. } => watch.pressed(rule),
-                Screen::Unknown(text) => watch.observe(&Screen::Unknown(text)),
-                Screen::Clear => {
-                    watch.reset();
-                    Ok(())
-                }
-                Screen::Answered { .. } => Ok(()),
-            }
+            answer_between_attempts(
+                herdr,
+                pane,
+                run,
+                paths,
+                status.as_deref(),
+                &mut watch,
+                answers,
+                "first-prompt",
+            )
+            .map(|_| ())
         },
     )
+}
+
+/// Looks at the screen between prompt attempts. Shared with the test that
+/// hands one pane/run answer from the first prompt to the drive loop.
+#[allow(clippy::too_many_arguments)]
+fn answer_between_attempts(
+    herdr: &Herdr,
+    pane: &str,
+    run: &PaneRunArgs,
+    paths: &Paths,
+    status: Option<&str>,
+    watch: &mut ScreenWatch,
+    answers: &mut AnswerMemory,
+    stage: &str,
+) -> Result<Screen> {
+    let outcome = screens::resolve(herdr, pane, run, paths, status, answers, stage)?;
+    match &outcome {
+        Screen::Resolve { rule, .. } => watch.pressed(rule)?,
+        Screen::Unknown(text) => watch.observe(&Screen::Unknown(text.clone()))?,
+        Screen::Clear => watch.reset(),
+        Screen::Answered { .. } => {}
+    }
+    Ok(outcome)
 }
 
 pub(super) fn start_native(
@@ -750,6 +776,7 @@ pub(super) fn start_native(
     pane: &str,
     run: &PaneRunArgs,
     notices: &mut Notices<'_>,
+    answers: &mut AnswerMemory,
 ) -> Result<()> {
     let paths = notices.paths;
     let (state, config) = prepare_native_config(run, paths)?;
@@ -787,7 +814,15 @@ pub(super) fn start_native(
             bail!("native TUI exited before accepting the task");
         }
         let status = herdr.status(pane).ok();
-        match screens::resolve(herdr, pane, run, paths, status.as_deref(), &mut watch)? {
+        match screens::resolve(
+            herdr,
+            pane,
+            run,
+            paths,
+            status.as_deref(),
+            answers,
+            "start-native",
+        )? {
             Screen::Resolve { rule, .. } => {
                 watch.pressed(rule)?;
                 settle.reset();
@@ -1199,5 +1234,82 @@ esac
             !settle.held(true, start + READY_SETTLE),
             "an unknown screen that keeps resetting never reaches the settle window"
         );
+    }
+
+    /// Sequence B: the first prompt answers the trust screen, then the drive
+    /// loop meets the identical screen with a fresh stage watch. The answer
+    /// made at the first-prompt entry must hold for the drive entry.
+    #[test]
+    fn native_first_prompt_answer_is_held_in_drive() {
+        let screen =
+            "Accessing workspace:\n\n/repo/task\n\n❯ No, exit\n  Yes, I trust this folder\n";
+        let temp = tempfile::tempdir().unwrap();
+        let binary = temp.path().join("herdr");
+        fs::write(temp.path().join("screen"), screen).unwrap();
+        crate::fast_script::write_fast_script(
+            &binary,
+            r#"#!/bin/sh
+d=$(/usr/bin/dirname "$0")
+case "$1 $2" in
+ 'pane read') /bin/cat "$d/screen";;
+ 'pane send-keys') echo "$@" >> "$d/keys";;
+ 'agent get') printf '%s\n' '{"result":{"agent":{"agent":"claude","agent_status":"idle"}}}';;
+ *) exit 8;;
+esac
+"#,
+        );
+        let herdr = Herdr {
+            binary: binary.into_os_string(),
+            session: None,
+        };
+        let paths = Paths::new(Some(temp.path().join("home"))).unwrap();
+        let run = PaneRunArgs {
+            caller: None,
+            native_executable: None,
+            opencode_model: None,
+            prompt_file: PathBuf::new(),
+            workspace: PathBuf::from("/repo/task"),
+            task: TaskId::new(),
+            revision: 1,
+            kind: "claude".to_owned(),
+            agent_args: Vec::new(),
+            keep_pane: false,
+        };
+        let mut answers = AnswerMemory::new();
+        let mut prompt_watch = ScreenWatch::with_limit("claude", Duration::from_hours(1));
+        assert!(matches!(
+            answer_between_attempts(
+                &herdr,
+                "w1:p2",
+                &run,
+                &paths,
+                Some("idle"),
+                &mut prompt_watch,
+                &mut answers,
+                "first-prompt",
+            )
+            .unwrap(),
+            Screen::Resolve { .. }
+        ));
+        // drive creates its own stage watch but keeps the pane/run answers.
+        let mut drive_watch = ScreenWatch::with_limit("claude", Duration::from_hours(1));
+        assert_eq!(
+            answer_between_attempts(
+                &herdr,
+                "w1:p2",
+                &run,
+                &paths,
+                Some("blocked"),
+                &mut drive_watch,
+                &mut answers,
+                "drive-blocked",
+            )
+            .unwrap(),
+            Screen::Answered {
+                rule: "workspace-trust"
+            }
+        );
+        let keys = fs::read_to_string(temp.path().join("keys")).unwrap();
+        assert_eq!(keys.trim(), "pane send-keys w1:p2 down enter");
     }
 }

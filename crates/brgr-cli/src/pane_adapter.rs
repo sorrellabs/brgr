@@ -53,7 +53,7 @@ use native::{
     start_native,
 };
 pub(crate) use screens::LAST_SCREEN as LAST_SCREEN_MARK;
-use screens::{Screen, ScreenWatch};
+use screens::{AnswerMemory, Screen, ScreenWatch};
 
 /// How often the agent's state is read.
 const POLL: Duration = Duration::from_secs(1);
@@ -197,6 +197,8 @@ pub(crate) fn pane_process_manifest(
                         "HERDR_SESSION",
                         "HERDR_SOCKET_PATH",
                         "HERDR_BIN_PATH",
+                        // Opt-in per-resolve screen trace; see `screens::trace`.
+                        "BRGR_SCREEN_TRACE",
                     ]
                     .map(str::to_owned),
                 )
@@ -425,6 +427,7 @@ fn start_agent(
     pane: &str,
     run: &PaneRunArgs,
     notices: &mut Notices<'_>,
+    answers: &mut AnswerMemory,
 ) -> Result<()> {
     let mut start: Vec<String> = [
         "agent",
@@ -469,7 +472,7 @@ fn start_agent(
     }
     // Herdr can call an agent ready while it shows a menu: Codex opened on an
     // update offer and was reported idle. `settle` answers what a rule covers.
-    settle(herdr, name, pane, run, notices)
+    settle(herdr, name, pane, run, notices, answers)
 }
 
 /// Waits until the agent is ready, pressing what the screen rules say and
@@ -481,12 +484,21 @@ fn settle(
     pane: &str,
     run: &PaneRunArgs,
     notices: &mut Notices<'_>,
+    answers: &mut AnswerMemory,
 ) -> Result<()> {
     let mut watch = ScreenWatch::new(&run.kind);
     let mut announced = false;
     loop {
         let status = herdr.status(name)?;
-        match screens::resolve(herdr, pane, run, notices.paths, Some(&status), &mut watch)? {
+        match screens::resolve(
+            herdr,
+            pane,
+            run,
+            notices.paths,
+            Some(&status),
+            answers,
+            "settle",
+        )? {
             Screen::Resolve { rule, .. } => watch.pressed(rule)?,
             Screen::Unknown(text) => {
                 if !announced {
@@ -529,6 +541,7 @@ fn poll_unclassified(
     status: &str,
     still: &mut Stillness,
     watch: &mut ScreenWatch,
+    answers: &mut AnswerMemory,
     blocked: &mut bool,
 ) -> Result<()> {
     if still.see(herdr.screen(pane)) < STILL_POLLS {
@@ -540,7 +553,15 @@ fn poll_unclassified(
         watch.restart_clock();
         return Ok(());
     }
-    match screens::resolve(herdr, pane, run, notices.paths, Some(status), watch)? {
+    match screens::resolve(
+        herdr,
+        pane,
+        run,
+        notices.paths,
+        Some(status),
+        answers,
+        "drive-unclassified",
+    )? {
         Screen::Resolve { rule, .. } => {
             if *blocked {
                 notices.withdraw();
@@ -574,12 +595,13 @@ fn start_worker(
     pane: &str,
     run: &PaneRunArgs,
     notices: &mut Notices<'_>,
+    answers: &mut AnswerMemory,
 ) -> Result<()> {
     screens::settle_shell(herdr, pane, run, notices.paths);
     if run.native_executable.is_some() {
-        start_native(herdr, pane, run, notices)?;
+        start_native(herdr, pane, run, notices, answers)?;
     } else {
-        start_agent(herdr, name, pane, run, notices)?;
+        start_agent(herdr, name, pane, run, notices, answers)?;
     }
     let label = recorded_label(notices.paths, run.task, run.revision);
     let harness = Store::open(&notices.paths.store)
@@ -593,6 +615,7 @@ fn start_worker(
     Ok(())
 }
 
+#[allow(clippy::too_many_lines)]
 fn drive(
     herdr: &Herdr,
     name: &str,
@@ -601,11 +624,23 @@ fn drive(
     report: &Path,
     notices: &mut Notices<'_>,
 ) -> Result<()> {
-    start_worker(herdr, name, pane, run, notices)?;
+    // One answer memory for this pane and run, shared by startup, the first
+    // prompt and every poll: a stage handoff must not press the same dialog
+    // twice.
+    let mut answers = AnswerMemory::new();
+    start_worker(herdr, name, pane, run, notices, &mut answers)?;
 
     let prompt = fs::read_to_string(&run.prompt_file)?;
     let instruction = result_instruction(notices.paths, run, &prompt, report)?;
-    send_first_prompt(herdr, name, pane, run, &instruction, notices.paths)?;
+    send_first_prompt(
+        herdr,
+        name,
+        pane,
+        run,
+        &instruction,
+        notices.paths,
+        &mut answers,
+    )?;
     spawn_session_server(notices.paths, run.task)?;
     set_phase(notices.paths, run, "working");
     eprintln!("brgr pane mode · prompted the agent");
@@ -653,8 +688,15 @@ fn drive(
             // `unknown` for their whole life, and their own output can look
             // like a menu.
             "blocked" => {
-                match screens::resolve(herdr, pane, run, notices.paths, Some(&status), &mut watch)?
-                {
+                match screens::resolve(
+                    herdr,
+                    pane,
+                    run,
+                    notices.paths,
+                    Some(&status),
+                    &mut answers,
+                    "drive-blocked",
+                )? {
                     Screen::Resolve { rule, .. } => {
                         notices.withdraw();
                         blocked = false;
@@ -690,6 +732,9 @@ fn drive(
             "working" => {
                 idle.worked();
                 watch.reset();
+                // drive does not resolve while working, so it invalidates the
+                // answered dialog here.
+                answers.forget();
             }
             "idle" | "done" => {
                 idle.settle(herdr, name, pane, run, report, notices)?;
@@ -707,6 +752,7 @@ fn drive(
                     &status,
                     &mut still,
                     &mut watch,
+                    &mut answers,
                     &mut blocked,
                 )?;
             }

@@ -419,42 +419,112 @@ fn trust_choice(
 /// Presses what the rule table says for this pane, unless the agent is working.
 ///
 /// A working agent's own output can contain `› 1.`-style lines, so nothing is
-/// pressed while Herdr reports `working`.
+/// pressed while Herdr reports `working`. The answered screen lives in the
+/// pane/run [`AnswerMemory`] so every stage of one run shares it.
 pub(super) fn resolve(
     herdr: &Herdr,
     pane: &str,
     run: &PaneRunArgs,
     paths: &Paths,
     status: Option<&str>,
-    watch: &mut ScreenWatch,
+    answers: &mut AnswerMemory,
+    stage: &str,
 ) -> Result<Screen> {
     let workspace = run.workspace.as_path();
     if status == Some("working") {
-        watch.forget_answer();
+        answers.forget();
+        trace(paths, run, pane, stage, status, None, "working", false);
         return Ok(Screen::Clear);
     }
     let Some(screen) = herdr.screen(pane) else {
+        trace(paths, run, pane, stage, status, None, "unreadable", false);
         return Ok(Screen::Clear); // unreadable is not "changed": keep the answer
     };
     let outcome = classify(&screen, workspace);
-    match &outcome {
-        Screen::Resolve { rule, keys } => {
-            if watch.standing(rule, &screen, Instant::now()) {
-                return Ok(Screen::Answered { rule });
-            }
-            let mut call = vec!["pane", "send-keys", pane];
-            call.extend(keys.iter().copied());
-            herdr.call(&call).map_err(|failure| {
-                anyhow::anyhow!("brgr could not answer the {rule} screen: {failure}")
-            })?;
-            eprintln!("brgr pane mode · {rule}: pressed {}", keys.join(" "));
-            record(&log_path(paths, run), pane, rule, keys);
-            std::thread::sleep(REDRAW);
-            watch.note_answer(rule, screen, Instant::now());
+    if let Screen::Resolve { rule, keys } = &outcome {
+        let rule = *rule;
+        let identity = dialog_identity(rule, &screen, workspace);
+        if answers.standing(rule, &identity, Instant::now()) {
+            trace(
+                paths,
+                run,
+                pane,
+                stage,
+                status,
+                Some(&screen),
+                &format!("answered:{rule}"),
+                false,
+            );
+            return Ok(Screen::Answered { rule });
         }
-        _ => watch.forget_answer(), // Clear or Unknown: the screen changed
+        let mut call = vec!["pane", "send-keys", pane];
+        call.extend(keys.iter().copied());
+        if let Err(failure) = herdr.call(&call) {
+            trace(
+                paths,
+                run,
+                pane,
+                stage,
+                status,
+                Some(&screen),
+                &format!("error:{rule}"),
+                false,
+            );
+            return Err(anyhow::anyhow!(
+                "brgr could not answer the {rule} screen: {failure}"
+            ));
+        }
+        eprintln!("brgr pane mode · {rule}: pressed {}", keys.join(" "));
+        record(&log_path(paths, run), pane, rule, keys);
+        trace(
+            paths,
+            run,
+            pane,
+            stage,
+            status,
+            Some(&screen),
+            &format!("resolve:{rule}"),
+            true,
+        );
+        std::thread::sleep(REDRAW);
+        answers.note_answer(rule, identity, Instant::now());
+    } else {
+        // A readable screen that is no longer a dialog invalidates the
+        // answer; an unreadable one returned above and kept it.
+        answers.forget();
+        let label = match &outcome {
+            Screen::Unknown(_) => "unknown",
+            _ => "clear",
+        };
+        trace(paths, run, pane, stage, status, Some(&screen), label, false);
     }
     Ok(outcome)
+}
+
+/// What makes a dialog the same one for the hold. Every rule but
+/// `workspace-trust` compares the exact text, so any changed screen is a new
+/// dialog. `workspace-trust` compares what identifies the prompt itself (the
+/// validated workspace and its trust choices, in order), so an elapsed counter,
+/// a spinner, a redrawn cursor, or refolded text does not answer it twice.
+fn dialog_identity(rule: &str, screen: &str, workspace: &Path) -> String {
+    if rule != "workspace-trust" {
+        return format!("{rule}\n{screen}");
+    }
+    let options = menu_options(screen);
+    let labels: Vec<String> = if options.is_empty() {
+        ["Yes, I trust this folder", "No, exit"]
+            .into_iter()
+            .filter(|label| squash(screen).contains(&squash(label)))
+            .map(squash)
+            .collect()
+    } else {
+        options.iter().map(|option| squash(&option.text)).collect()
+    };
+    format!(
+        "workspace-trust\n{}\n{}",
+        squash(&workspace.to_string_lossy()),
+        labels.join("\u{1f}")
+    )
 }
 
 /// How long a new pane's shell may take to draw anything.
@@ -522,20 +592,125 @@ fn record(path: &Path, pane: &str, rule: &str, keys: &[&str]) {
     }
 }
 
-/// The screen a rule last answered on this pane.
-struct Answer {
-    rule: &'static str,
-    screen: String, // the full text `herdr.screen` returned, compared exactly
-    at: Instant,    // taken after the REDRAW sleep
+/// The opt-in per-resolve trace. `BRGR_SCREEN_TRACE=1` appends one line per
+/// call with the stage, observed Herdr status, a digest of the screen and what
+/// resolve did. The screen text itself is never written.
+#[allow(clippy::too_many_arguments)]
+fn trace(
+    paths: &Paths,
+    run: &PaneRunArgs,
+    pane: &str,
+    stage: &str,
+    status: Option<&str>,
+    screen: Option<&str>,
+    outcome: &str,
+    keys: bool,
+) {
+    if std::env::var("BRGR_SCREEN_TRACE").as_deref() != Ok("1") {
+        return;
+    }
+    let at = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_millis());
+    let digest = screen.map_or_else(|| "unreadable".to_owned(), screen_digest);
+    let line = trace_line(
+        at,
+        pane,
+        stage,
+        status.unwrap_or("none"),
+        &digest,
+        outcome,
+        keys,
+    );
+    let written = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(trace_path(paths, run))
+        .and_then(|mut file| writeln!(file, "{line}"));
+    if let Err(error) = written {
+        eprintln!("brgr pane mode · could not write the screen trace: {error}");
+    }
 }
 
-/// Bounds how long a screen no rule covers may stand.
+fn trace_line(
+    at: u128,
+    pane: &str,
+    stage: &str,
+    status: &str,
+    digest: &str,
+    outcome: &str,
+    keys: bool,
+) -> String {
+    let keys = if keys { "sent" } else { "none" };
+    format!(
+        "{at} pane={pane} stage={stage} status={status} sha256={digest} outcome={outcome} keys={keys}"
+    )
+}
+
+fn trace_path(paths: &Paths, run: &PaneRunArgs) -> PathBuf {
+    paths
+        .runs
+        .join(format!("{}-r{}.screens.trace", run.task, run.revision))
+}
+
+fn screen_digest(screen: &str) -> String {
+    use sha2::{Digest as _, Sha256};
+    use std::fmt::Write as _;
+    let mut digest = String::with_capacity(64);
+    for byte in Sha256::digest(screen.as_bytes()) {
+        let _ = write!(digest, "{byte:02x}");
+    }
+    digest
+}
+
+/// The dialog a rule last answered in this pane and run.
+struct Answer {
+    rule: &'static str,
+    /// What makes a later screen the same dialog: the exact text for every
+    /// rule but `workspace-trust`, which uses its stable identity.
+    identity: String,
+    at: Instant, // taken after the REDRAW sleep
+}
+
+/// A pane/run's memory of the dialog a rule answered. It is shared by every
+/// stage that resolves a screen so a handoff does not press the same dialog
+/// twice; it is never copied or dropped at a stage boundary.
+pub(super) struct AnswerMemory {
+    answer: Option<Answer>,
+}
+
+impl AnswerMemory {
+    pub(super) fn new() -> Self {
+        Self { answer: None }
+    }
+
+    /// True while `identity` is the dialog `rule` answered less than
+    /// [`REPRESS_AFTER`] ago.
+    fn standing(&self, rule: &str, identity: &str, now: Instant) -> bool {
+        self.answer.as_ref().is_some_and(|answer| {
+            answer.rule == rule
+                && answer.identity == identity
+                && now.saturating_duration_since(answer.at) < REPRESS_AFTER
+        })
+    }
+
+    fn note_answer(&mut self, rule: &'static str, identity: String, at: Instant) {
+        self.answer = Some(Answer { rule, identity, at });
+    }
+
+    /// Forgets the answered dialog because it changed or the agent began
+    /// working. Timers and press budgets live in [`ScreenWatch`], not here.
+    pub(super) fn forget(&mut self) {
+        self.answer = None;
+    }
+}
+
+/// Bounds how long a screen no rule covers may stand and counts presses.
 pub(super) struct ScreenWatch {
     kind: String,
     limit: Duration,
     since: Option<Instant>,
     presses: Vec<(&'static str, u32)>,
-    answered: Option<Answer>,
 }
 
 /// How many times one rule may answer the same standing screen before the run
@@ -553,25 +728,7 @@ impl ScreenWatch {
             limit,
             since: None,
             presses: Vec::new(),
-            answered: None,
         }
-    }
-
-    /// True while `screen` is the one `rule` answered less than `REPRESS_AFTER` ago.
-    fn standing(&self, rule: &str, screen: &str, now: Instant) -> bool {
-        self.answered.as_ref().is_some_and(|answer| {
-            answer.rule == rule
-                && answer.screen == screen
-                && now.saturating_duration_since(answer.at) < REPRESS_AFTER
-        })
-    }
-
-    fn note_answer(&mut self, rule: &'static str, screen: String, at: Instant) {
-        self.answered = Some(Answer { rule, screen, at });
-    }
-
-    fn forget_answer(&mut self) {
-        self.answered = None;
     }
 
     /// Records a key press for `rule`. Fails when it keeps being needed.
@@ -600,7 +757,6 @@ impl ScreenWatch {
             Screen::Clear => {
                 self.since = None;
                 self.presses.clear();
-                self.answered = None;
                 Ok(())
             }
             Screen::Resolve { .. } | Screen::Answered { .. } => {
@@ -618,7 +774,6 @@ impl ScreenWatch {
     pub(super) fn reset(&mut self) {
         self.since = None;
         self.presses.clear();
-        self.answered = None;
     }
 
     /// Stops the unknown-screen clock but keeps the press counts, for an
@@ -1420,8 +1575,17 @@ esac
     fn resolve_presses_the_rule_keys_on_the_pane() {
         let (temp, herdr) = fake_herdr(OPENCODE_UPDATED);
         let (paths, run) = run_args(&temp);
-        let mut watch = ScreenWatch::with_limit("claude", Duration::from_hours(1));
-        let outcome = resolve(&herdr, "w1:p2", &run, &paths, Some("idle"), &mut watch).unwrap();
+        let mut answers = AnswerMemory::new();
+        let outcome = resolve(
+            &herdr,
+            "w1:p2",
+            &run,
+            &paths,
+            Some("idle"),
+            &mut answers,
+            "test",
+        )
+        .unwrap();
         assert!(matches!(outcome, Screen::Resolve { .. }));
         let keys = std::fs::read_to_string(temp.path().join("keys")).unwrap();
         assert_eq!(keys.trim(), "pane send-keys w1:p2 esc");
@@ -1437,9 +1601,18 @@ esac
         let screen = "agent output\n› 1. Update now\n  2. Skip\n";
         let (temp, herdr) = fake_herdr(screen);
         let (paths, run) = run_args(&temp);
-        let mut watch = ScreenWatch::with_limit("claude", Duration::from_hours(1));
+        let mut answers = AnswerMemory::new();
         assert_eq!(
-            resolve(&herdr, "w1:p2", &run, &paths, Some("working"), &mut watch).unwrap(),
+            resolve(
+                &herdr,
+                "w1:p2",
+                &run,
+                &paths,
+                Some("working"),
+                &mut answers,
+                "test"
+            )
+            .unwrap(),
             Screen::Clear
         );
         assert!(!temp.path().join("keys").exists());
@@ -1476,9 +1649,27 @@ esac
             "Accessing workspace:\n\n/repo/task\n\n❯ No, exit\n  Yes, I trust this folder\n";
         let (temp, herdr) = fake_herdr(screen);
         let (paths, run) = run_args(&temp);
-        let mut watch = ScreenWatch::with_limit("claude", Duration::from_hours(1));
-        resolve(&herdr, "w1:p2", &run, &paths, Some("idle"), &mut watch).unwrap();
-        let second = resolve(&herdr, "w1:p2", &run, &paths, Some("idle"), &mut watch).unwrap();
+        let mut answers = AnswerMemory::new();
+        resolve(
+            &herdr,
+            "w1:p2",
+            &run,
+            &paths,
+            Some("idle"),
+            &mut answers,
+            "test",
+        )
+        .unwrap();
+        let second = resolve(
+            &herdr,
+            "w1:p2",
+            &run,
+            &paths,
+            Some("idle"),
+            &mut answers,
+            "test",
+        )
+        .unwrap();
         assert_eq!(
             second,
             Screen::Answered {
@@ -1492,23 +1683,39 @@ esac
     }
 
     #[test]
-    fn a_changed_screen_under_the_same_rule_is_answered_again() {
-        let screen =
-            "Accessing workspace:\n\n/repo/task\n\n❯ No, exit\n  Yes, I trust this folder\n";
-        let (temp, herdr) = fake_herdr(screen);
+    fn a_changed_screen_under_another_rule_is_answered_again() {
+        let (temp, herdr) = fake_herdr("Setup done.\nPress Enter to continue\n");
         let (paths, run) = run_args(&temp);
-        let mut watch = ScreenWatch::with_limit("claude", Duration::from_hours(1));
-        resolve(&herdr, "w1:p2", &run, &paths, Some("idle"), &mut watch).unwrap();
-        std::fs::write(
-            temp.path().join("screen"),
-            "Accessing workspace:\n\n/repo/task\n\n  No, exit\n❯ Yes, I trust this folder\n",
+        let mut answers = AnswerMemory::new();
+        resolve(
+            &herdr,
+            "w1:p2",
+            &run,
+            &paths,
+            Some("idle"),
+            &mut answers,
+            "test",
         )
         .unwrap();
-        let second = resolve(&herdr, "w1:p2", &run, &paths, Some("idle"), &mut watch).unwrap();
+        std::fs::write(
+            temp.path().join("screen"),
+            "Welcome to the new release.\nPress Enter to continue\n",
+        )
+        .unwrap();
+        let second = resolve(
+            &herdr,
+            "w1:p2",
+            &run,
+            &paths,
+            Some("idle"),
+            &mut answers,
+            "test",
+        )
+        .unwrap();
         assert_eq!(
             second,
             Screen::Resolve {
-                rule: "workspace-trust",
+                rule: "continue-notice",
                 keys: vec!["enter"],
             }
         );
@@ -1524,11 +1731,38 @@ esac
             "Accessing workspace:\n\n/repo/task\n\n❯ No, exit\n  Yes, I trust this folder\n";
         let (temp, herdr) = fake_herdr(screen);
         let (paths, run) = run_args(&temp);
-        let mut watch = ScreenWatch::with_limit("claude", Duration::from_hours(1));
-        resolve(&herdr, "w1:p2", &run, &paths, Some("idle"), &mut watch).unwrap();
-        let middle = resolve(&herdr, "w1:p2", &run, &paths, Some("working"), &mut watch).unwrap();
+        let mut answers = AnswerMemory::new();
+        resolve(
+            &herdr,
+            "w1:p2",
+            &run,
+            &paths,
+            Some("idle"),
+            &mut answers,
+            "test",
+        )
+        .unwrap();
+        let middle = resolve(
+            &herdr,
+            "w1:p2",
+            &run,
+            &paths,
+            Some("working"),
+            &mut answers,
+            "test",
+        )
+        .unwrap();
         assert_eq!(middle, Screen::Clear);
-        resolve(&herdr, "w1:p2", &run, &paths, Some("idle"), &mut watch).unwrap();
+        resolve(
+            &herdr,
+            "w1:p2",
+            &run,
+            &paths,
+            Some("idle"),
+            &mut answers,
+            "test",
+        )
+        .unwrap();
         let keys = std::fs::read_to_string(temp.path().join("keys")).unwrap();
         assert_eq!(keys.trim().lines().count(), 2);
     }
@@ -1537,16 +1771,17 @@ esac
     fn an_answered_screen_is_pressed_again_only_after_the_hold() {
         let screen =
             "Accessing workspace:\n\n/repo/task\n\n❯ No, exit\n  Yes, I trust this folder\n";
-        let mut watch = ScreenWatch::with_limit("claude", Duration::from_hours(1));
+        let identity = dialog_identity("workspace-trust", screen, work());
+        let mut answers = AnswerMemory::new();
         let t0 = Instant::now();
-        watch.note_answer("workspace-trust", screen.to_owned(), t0);
-        assert!(watch.standing(
+        answers.note_answer("workspace-trust", identity.clone(), t0);
+        assert!(answers.standing(
             "workspace-trust",
-            screen,
+            &identity,
             t0 + REPRESS_AFTER.checked_sub(Duration::from_millis(1)).unwrap()
         ));
-        assert!(!watch.standing("workspace-trust", screen, t0 + REPRESS_AFTER));
-        assert!(!watch.standing("workspace-trust", "other", t0));
+        assert!(!answers.standing("workspace-trust", &identity, t0 + REPRESS_AFTER));
+        assert!(!answers.standing("workspace-trust", "other", t0));
     }
 
     #[test]
@@ -1555,14 +1790,32 @@ esac
             "Accessing workspace:\n\n/repo/task\n\n❯ No, exit\n  Yes, I trust this folder\n";
         let (temp, herdr) = fake_herdr(screen);
         let (paths, run) = run_args(&temp);
-        let mut watch = ScreenWatch::with_limit("claude", Duration::from_hours(1));
-        resolve(&herdr, "w1:p2", &run, &paths, Some("idle"), &mut watch).unwrap();
+        let mut answers = AnswerMemory::new();
+        resolve(
+            &herdr,
+            "w1:p2",
+            &run,
+            &paths,
+            Some("idle"),
+            &mut answers,
+            "test",
+        )
+        .unwrap();
         std::fs::write(
             temp.path().join("screen"),
             "Choose a theme\n› 1. Dark\n  2. Light\n",
         )
         .unwrap();
-        let second = resolve(&herdr, "w1:p2", &run, &paths, Some("idle"), &mut watch).unwrap();
+        let second = resolve(
+            &herdr,
+            "w1:p2",
+            &run,
+            &paths,
+            Some("idle"),
+            &mut answers,
+            "test",
+        )
+        .unwrap();
         assert!(matches!(second, Screen::Unknown(_)));
         let keys = std::fs::read_to_string(temp.path().join("keys")).unwrap();
         assert_eq!(keys.trim().lines().count(), 1);
@@ -1572,14 +1825,32 @@ esac
     fn an_update_menu_after_an_answered_notice_is_skipped_not_confirmed() {
         let (temp, herdr) = fake_herdr("Setup done.\nPress Enter to continue\n");
         let (paths, run) = run_args(&temp);
-        let mut watch = ScreenWatch::with_limit("claude", Duration::from_hours(1));
-        resolve(&herdr, "w1:p2", &run, &paths, Some("idle"), &mut watch).unwrap();
+        let mut answers = AnswerMemory::new();
+        resolve(
+            &herdr,
+            "w1:p2",
+            &run,
+            &paths,
+            Some("idle"),
+            &mut answers,
+            "test",
+        )
+        .unwrap();
         std::fs::write(
             temp.path().join("screen"),
             "Update available\nPress Enter to continue\n› 1. Update now\n  2. Skip\n",
         )
         .unwrap();
-        let second = resolve(&herdr, "w1:p2", &run, &paths, Some("idle"), &mut watch).unwrap();
+        let second = resolve(
+            &herdr,
+            "w1:p2",
+            &run,
+            &paths,
+            Some("idle"),
+            &mut answers,
+            "test",
+        )
+        .unwrap();
         assert_eq!(
             second,
             Screen::Resolve {
@@ -1605,20 +1876,17 @@ esac
     }
 
     #[test]
-    fn a_clear_screen_or_reset_forgets_the_answer() {
+    fn deadline_resets_do_not_forget_the_answer() {
         let screen =
             "Accessing workspace:\n\n/repo/task\n\n❯ No, exit\n  Yes, I trust this folder\n";
+        let identity = dialog_identity("workspace-trust", screen, work());
         let mut watch = ScreenWatch::with_limit("claude", Duration::from_hours(1));
-        let t0 = Instant::now();
-        watch.note_answer("workspace-trust", screen.to_owned(), t0);
+        let mut answers = AnswerMemory::new();
+        answers.note_answer("workspace-trust", identity.clone(), Instant::now());
         watch.observe(&Screen::Clear).unwrap();
-        assert!(!watch.standing("workspace-trust", screen, Instant::now()));
-        watch.note_answer("workspace-trust", screen.to_owned(), Instant::now());
         watch.reset();
-        assert!(!watch.standing("workspace-trust", screen, Instant::now()));
-        watch.note_answer("workspace-trust", screen.to_owned(), Instant::now());
         watch.restart_clock();
-        assert!(watch.standing("workspace-trust", screen, Instant::now()));
+        assert!(answers.standing("workspace-trust", &identity, Instant::now()));
     }
 
     #[test]
@@ -1671,6 +1939,468 @@ esac
                 rule: "update-offer-skip",
                 keys: vec!["down", "enter"],
             }
+        );
+    }
+
+    fn trust() -> &'static str {
+        "Accessing workspace:\n\n/repo/task\n\n❯ No, exit\n  Yes, I trust this folder\n"
+    }
+
+    fn stage_watch() -> ScreenWatch {
+        ScreenWatch::with_limit("claude", Duration::from_hours(1))
+    }
+
+    fn send_keys(temp: &tempfile::TempDir) -> Vec<String> {
+        std::fs::read_to_string(temp.path().join("keys"))
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_owned)
+            .collect()
+    }
+
+    /// One answer value passes through startup, the first prompt and the drive
+    /// loop while only the stage-local watches are recreated. This is the
+    /// lifetime the pane/run memory exists to pin.
+    #[test]
+    fn startup_answer_memory_survives_stage_handoff() {
+        let (temp, herdr) = fake_herdr(trust());
+        let (paths, run) = run_args(&temp);
+        let mut answers = AnswerMemory::new();
+        let mut startup = stage_watch();
+        assert!(matches!(
+            resolve(
+                &herdr,
+                "w1:p2",
+                &run,
+                &paths,
+                Some("idle"),
+                &mut answers,
+                "start-native",
+            )
+            .unwrap(),
+            Screen::Resolve { .. }
+        ));
+        startup.pressed("workspace-trust").unwrap();
+        let mut prompt = stage_watch();
+        assert_eq!(
+            resolve(
+                &herdr,
+                "w1:p2",
+                &run,
+                &paths,
+                Some("idle"),
+                &mut answers,
+                "first-prompt",
+            )
+            .unwrap(),
+            Screen::Answered {
+                rule: "workspace-trust"
+            }
+        );
+        let _ = &mut prompt;
+        assert_eq!(
+            resolve(
+                &herdr,
+                "w1:p2",
+                &run,
+                &paths,
+                Some("blocked"),
+                &mut answers,
+                "drive-blocked",
+            )
+            .unwrap(),
+            Screen::Answered {
+                rule: "workspace-trust"
+            }
+        );
+        assert_eq!(send_keys(&temp), ["pane send-keys w1:p2 down enter"]);
+    }
+
+    /// Sequence A: an elapsed/spinner row or trailing whitespace changes the
+    /// bytes while the trust choice is unchanged. It is the same dialog.
+    #[test]
+    fn trust_decoration_change_does_not_repress_within_hold() {
+        let (temp, herdr) = fake_herdr(trust());
+        let (paths, run) = run_args(&temp);
+        let mut answers = AnswerMemory::new();
+        assert!(matches!(
+            resolve(
+                &herdr,
+                "w1:p2",
+                &run,
+                &paths,
+                Some("idle"),
+                &mut answers,
+                "start-native",
+            )
+            .unwrap(),
+            Screen::Resolve { .. }
+        ));
+        std::thread::sleep(Duration::from_secs(1));
+        std::fs::write(
+            temp.path().join("screen"),
+            "Accessing workspace:\n\n/repo/task\n\n❯ No, exit\n  Yes, I trust this folder\n  ⎿ elapsed 2s\n\n",
+        )
+        .unwrap();
+        assert_eq!(
+            resolve(
+                &herdr,
+                "w1:p2",
+                &run,
+                &paths,
+                Some("idle"),
+                &mut answers,
+                "start-native",
+            )
+            .unwrap(),
+            Screen::Answered {
+                rule: "workspace-trust"
+            }
+        );
+        assert_eq!(send_keys(&temp), ["pane send-keys w1:p2 down enter"]);
+    }
+
+    /// The selection cursor moving is a redraw, not a new dialog: the choice
+    /// labels and their order are unchanged.
+    #[test]
+    fn trust_selection_redraw_does_not_repress_within_hold() {
+        let (temp, herdr) = fake_herdr(trust());
+        let (paths, run) = run_args(&temp);
+        let mut answers = AnswerMemory::new();
+        resolve(
+            &herdr,
+            "w1:p2",
+            &run,
+            &paths,
+            Some("idle"),
+            &mut answers,
+            "start-native",
+        )
+        .unwrap();
+        std::fs::write(
+            temp.path().join("screen"),
+            "Accessing workspace:\n\n/repo/task\n\n  No, exit\n❯ Yes, I trust this folder\n",
+        )
+        .unwrap();
+        assert_eq!(
+            resolve(
+                &herdr,
+                "w1:p2",
+                &run,
+                &paths,
+                Some("idle"),
+                &mut answers,
+                "start-native",
+            )
+            .unwrap(),
+            Screen::Answered {
+                rule: "workspace-trust"
+            }
+        );
+        assert_eq!(send_keys(&temp), ["pane send-keys w1:p2 down enter"]);
+    }
+
+    #[test]
+    fn unreadable_screen_and_idle_deadline_reset_preserve_answer() {
+        let (temp, herdr) = fake_herdr(trust());
+        let (paths, run) = run_args(&temp);
+        let mut answers = AnswerMemory::new();
+        let mut watch = stage_watch();
+        resolve(
+            &herdr,
+            "w1:p2",
+            &run,
+            &paths,
+            Some("blocked"),
+            &mut answers,
+            "drive-blocked",
+        )
+        .unwrap();
+        std::fs::remove_file(temp.path().join("screen")).unwrap();
+        assert_eq!(
+            resolve(
+                &herdr,
+                "w1:p2",
+                &run,
+                &paths,
+                Some("blocked"),
+                &mut answers,
+                "drive-blocked",
+            )
+            .unwrap(),
+            Screen::Clear
+        );
+        watch.reset(); // idle/done resets the stage timers only
+        watch.restart_clock();
+        std::fs::write(temp.path().join("screen"), trust()).unwrap();
+        assert_eq!(
+            resolve(
+                &herdr,
+                "w1:p2",
+                &run,
+                &paths,
+                Some("blocked"),
+                &mut answers,
+                "drive-blocked",
+            )
+            .unwrap(),
+            Screen::Answered {
+                rule: "workspace-trust"
+            }
+        );
+        assert_eq!(send_keys(&temp).len(), 1);
+    }
+
+    #[test]
+    fn working_never_presses_and_allows_a_later_trust_answer() {
+        let (temp, herdr) = fake_herdr(trust());
+        let (paths, run) = run_args(&temp);
+        let mut answers = AnswerMemory::new();
+        resolve(
+            &herdr,
+            "w1:p2",
+            &run,
+            &paths,
+            Some("blocked"),
+            &mut answers,
+            "drive-blocked",
+        )
+        .unwrap();
+        assert_eq!(
+            resolve(
+                &herdr,
+                "w1:p2",
+                &run,
+                &paths,
+                Some("working"),
+                &mut answers,
+                "drive-blocked",
+            )
+            .unwrap(),
+            Screen::Clear
+        );
+        assert_eq!(
+            send_keys(&temp).len(),
+            1,
+            "nothing is pressed while working"
+        );
+        // drive does not resolve while working, so it invalidates directly.
+        answers.forget();
+        resolve(
+            &herdr,
+            "w1:p2",
+            &run,
+            &paths,
+            Some("blocked"),
+            &mut answers,
+            "drive-blocked",
+        )
+        .unwrap();
+        assert_eq!(send_keys(&temp).len(), 2);
+    }
+
+    #[test]
+    fn different_dialog_and_wrong_workspace_are_not_hidden_by_trust_hold() {
+        let (temp, herdr) = fake_herdr(trust());
+        let (paths, run) = run_args(&temp);
+        let mut answers = AnswerMemory::new();
+        resolve(
+            &herdr,
+            "w1:p2",
+            &run,
+            &paths,
+            Some("blocked"),
+            &mut answers,
+            "drive-blocked",
+        )
+        .unwrap();
+        std::fs::write(
+            temp.path().join("screen"),
+            "Choose a theme\n› 1. Dark\n  2. Light\n",
+        )
+        .unwrap();
+        assert!(matches!(
+            resolve(
+                &herdr,
+                "w1:p2",
+                &run,
+                &paths,
+                Some("blocked"),
+                &mut answers,
+                "drive-blocked",
+            )
+            .unwrap(),
+            Screen::Unknown(_)
+        ));
+        std::fs::write(
+            temp.path().join("screen"),
+            "Accessing workspace:\n\n/elsewhere\n\n❯ No, exit\n  Yes, I trust this folder\n",
+        )
+        .unwrap();
+        assert!(matches!(
+            resolve(
+                &herdr,
+                "w1:p2",
+                &run,
+                &paths,
+                Some("blocked"),
+                &mut answers,
+                "drive-blocked",
+            )
+            .unwrap(),
+            Screen::Unknown(_)
+        ));
+        std::fs::write(
+            temp.path().join("screen"),
+            "Update available\nPress Enter to continue\n› 1. Update now\n  2. Skip\n",
+        )
+        .unwrap();
+        assert_eq!(
+            resolve(
+                &herdr,
+                "w1:p2",
+                &run,
+                &paths,
+                Some("blocked"),
+                &mut answers,
+                "drive-blocked",
+            )
+            .unwrap(),
+            Screen::Resolve {
+                rule: "update-offer-skip",
+                keys: vec!["down", "enter"],
+            }
+        );
+        let keys = send_keys(&temp);
+        assert_eq!(keys.len(), 2, "{keys:?}");
+        assert_eq!(keys[1], "pane send-keys w1:p2 down enter", "{keys:?}");
+    }
+
+    #[test]
+    fn standing_trust_represses_only_after_thirty_seconds() {
+        let screen = trust();
+        let identity = dialog_identity("workspace-trust", screen, work());
+        let mut answers = AnswerMemory::new();
+        let t0 = Instant::now();
+        answers.note_answer("workspace-trust", identity.clone(), t0);
+        let just_before = REPRESS_AFTER.checked_sub(Duration::from_millis(1)).unwrap();
+        assert!(answers.standing("workspace-trust", &identity, t0 + just_before));
+        assert!(!answers.standing("workspace-trust", &identity, t0 + REPRESS_AFTER));
+    }
+
+    #[test]
+    fn a_cosmetic_trust_redraw_does_not_extend_the_hold() {
+        let (temp, herdr) = fake_herdr(trust());
+        let (paths, run) = run_args(&temp);
+        let mut answers = AnswerMemory::new();
+        resolve(
+            &herdr,
+            "w1:p2",
+            &run,
+            &paths,
+            Some("blocked"),
+            &mut answers,
+            "drive-blocked",
+        )
+        .unwrap();
+        let first_at = answers.answer.as_ref().unwrap().at;
+        std::thread::sleep(Duration::from_millis(10));
+        std::fs::write(
+            temp.path().join("screen"),
+            "Accessing workspace:\n\n/repo/task\n\n❯ No, exit\n  Yes, I trust this folder\n  working… 1s\n",
+        )
+        .unwrap();
+        assert_eq!(
+            resolve(
+                &herdr,
+                "w1:p2",
+                &run,
+                &paths,
+                Some("blocked"),
+                &mut answers,
+                "drive-blocked",
+            )
+            .unwrap(),
+            Screen::Answered {
+                rule: "workspace-trust"
+            }
+        );
+        assert_eq!(answers.answer.as_ref().unwrap().at, first_at);
+    }
+
+    #[test]
+    fn answer_memory_is_isolated_by_pane_and_run() {
+        let (temp, herdr) = fake_herdr(trust());
+        let (paths, mut run) = run_args(&temp);
+        let mut one = AnswerMemory::new();
+        let mut another = AnswerMemory::new();
+        resolve(
+            &herdr,
+            "w1:p2",
+            &run,
+            &paths,
+            Some("blocked"),
+            &mut one,
+            "drive-blocked",
+        )
+        .unwrap();
+        resolve(
+            &herdr,
+            "w1:p3",
+            &run,
+            &paths,
+            Some("blocked"),
+            &mut another,
+            "drive-blocked",
+        )
+        .unwrap();
+        assert_eq!(send_keys(&temp).len(), 2, "each pane answers once");
+        run.revision = 2;
+        let mut next_revision = AnswerMemory::new();
+        resolve(
+            &herdr,
+            "w1:p2",
+            &run,
+            &paths,
+            Some("blocked"),
+            &mut next_revision,
+            "drive-blocked",
+        )
+        .unwrap();
+        assert_eq!(
+            send_keys(&temp).len(),
+            3,
+            "a new revision does not inherit it"
+        );
+    }
+
+    #[test]
+    fn screen_trace_line_carries_fields_never_screen_text() {
+        let digest = screen_digest("Accessing workspace: secret text");
+        assert_eq!(digest.len(), 64);
+        let line = trace_line(
+            1_700_000_000_123,
+            "w1:p2",
+            "drive-blocked",
+            "blocked",
+            &digest,
+            "resolve:workspace-trust",
+            true,
+        );
+        assert!(
+            line.starts_with("1700000000123 pane=w1:p2 stage=drive-blocked status=blocked sha256="),
+            "{line}"
+        );
+        assert!(
+            line.contains("outcome=resolve:workspace-trust keys=sent"),
+            "{line}"
+        );
+        assert!(
+            !line.contains("Accessing") && !line.contains("secret"),
+            "{line}"
+        );
+        assert!(
+            trace_line(0, "p", "s", "idle", "unreadable", "clear", false).ends_with("keys=none")
         );
     }
 }
