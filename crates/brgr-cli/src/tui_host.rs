@@ -233,24 +233,82 @@ pub(crate) fn stop_descendants(path: &Path) {
     else {
         return;
     };
-    let Ok(output) = std::process::Command::new("/bin/ps")
-        .args(["-A", "-o", "pid=,ppid="])
-        .output()
-    else {
+    let Some(table) = process_parent_table() else {
         return;
     };
-    let table = String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .filter_map(|line| {
-            let mut fields = line.split_whitespace();
-            Some((fields.next()?.parse().ok()?, fields.next()?.parse().ok()?))
-        })
-        .collect::<Vec<(u32, u32)>>();
     for pid in descendants(&table, state.pid) {
-        let _ = std::process::Command::new("/bin/kill")
-            .args(["-TERM", &pid.to_string()])
-            .status();
+        let _ = terminate_if_verified_descendant(state.pid, &state.birth, pid);
     }
+}
+
+fn process_parent_table() -> Option<Vec<(u32, u32)>> {
+    let output = Command::new("/bin/ps")
+        .args(["-A", "-o", "pid=,ppid="])
+        .output()
+        .ok()?;
+    Some(
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter_map(|line| {
+                let mut fields = line.split_whitespace();
+                Some((fields.next()?.parse().ok()?, fields.next()?.parse().ok()?))
+            })
+            .collect(),
+    )
+}
+
+fn host_birth_matches(pid: u32, birth: &str) -> bool {
+    crate::supervision::ps_field(&pid.to_string(), "lstart").is_ok_and(|actual| actual == birth)
+}
+
+fn pid_ppid(pid: u32) -> Option<u32> {
+    crate::supervision::ps_field(&pid.to_string(), "ppid")
+        .ok()?
+        .parse()
+        .ok()
+}
+
+/// Whether `pid` still has `host` as an ancestor. A gone pid is not a descendant.
+fn is_current_descendant(pid: u32, host: u32) -> bool {
+    let mut current = pid;
+    for _ in 0..128 {
+        if current <= 1 || current == host {
+            return false;
+        }
+        let Some(parent) = pid_ppid(current) else {
+            return false;
+        };
+        if parent == host {
+            return true;
+        }
+        if parent <= 1 || parent == current {
+            return false;
+        }
+        current = parent;
+    }
+    false
+}
+
+/// SIGTERM `pid` only when it is still a descendant of the verified host.
+///
+/// A pid from a process-table snapshot can exit (or be reused) before the
+/// signal. `kill` then prints `No such process`, or worse, hits an unrelated
+/// process. If identity cannot be verified, nothing is signalled and nothing
+/// is printed. Returns whether the signal was sent.
+fn terminate_if_verified_descendant(host: u32, host_birth: &str, pid: u32) -> bool {
+    if pid <= 1 || pid == host || !host_birth_matches(host, host_birth) {
+        return false;
+    }
+    if !is_current_descendant(pid, host) {
+        return false;
+    }
+    let _ = Command::new("/bin/kill")
+        .args(["-TERM", "--", &pid.to_string()])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+    true
 }
 
 /// Every process below `root` in a `(pid, parent)` table, children before
@@ -283,6 +341,67 @@ mod tests {
         found.sort_unstable();
         assert_eq!(found, vec![11, 12, 13]);
         assert!(descendants(&table, 13).is_empty());
+    }
+
+    fn spawn_sleep() -> std::process::Child {
+        Command::new("/bin/sleep").arg("300").spawn().unwrap()
+    }
+
+    fn host_birth(child: &std::process::Child) -> String {
+        crate::supervision::ps_field(&child.id().to_string(), "lstart").unwrap()
+    }
+
+    fn still_alive(pid: u32) -> bool {
+        Command::new("/bin/kill")
+            .args(["-0", "--", &pid.to_string()])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
+    }
+
+    fn stop(child: &mut std::process::Child) {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    /// `/bin/kill -TERM` of a reaped pid prints `kill: <pid>: No such process`.
+    /// After accept, that was emitted once per descendant that had already
+    /// exited. A gone pid must not be signalled, and nothing is printed.
+    #[test]
+    fn an_already_exited_pid_is_not_signalled_and_prints_nothing() {
+        let mut host = spawn_sleep();
+        let birth = host_birth(&host);
+        let mut child = spawn_sleep();
+        let pid = child.id();
+        stop(&mut child);
+        assert!(!still_alive(pid));
+
+        let signalled = terminate_if_verified_descendant(host.id(), &birth, pid);
+        stop(&mut host);
+        assert!(!signalled, "signalled exited pid {pid}");
+    }
+
+    /// A pid from a stale snapshot may have been reused by an unrelated
+    /// process. Only a pid that is still under the verified host is signalled.
+    #[test]
+    fn a_pid_that_is_not_still_a_descendant_is_not_signalled() {
+        let mut host = spawn_sleep();
+        let birth = host_birth(&host);
+        let mut unrelated = spawn_sleep();
+        let pid = unrelated.id();
+        assert!(still_alive(pid));
+
+        let signalled = terminate_if_verified_descendant(host.id(), &birth, pid);
+        let survived = still_alive(pid);
+        stop(&mut unrelated);
+        stop(&mut host);
+        assert!(
+            survived,
+            "signalled unrelated pid {pid} that was not a descendant of the host"
+        );
+        assert!(!signalled, "kill was invoked for unrelated pid {pid}");
     }
 
     #[test]
